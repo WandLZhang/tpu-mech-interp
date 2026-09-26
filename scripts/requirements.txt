@@ -1,0 +1,3 @@
+# peak_hbm.py reads HBM through tpu-info's Python API, and test_peak_hbm.py calls that API on a
+# host with no TPU. The engine's own imports are in upstream/models/requirements.txt.
+tpu-info

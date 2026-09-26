@@ -1,0 +1,29 @@
+# flax 0.12.9 reads jax.experimental.hijax.HiPrimitive, which jax 0.11.2 moved.
+# Pin the pair that imports.
+jax[cpu]==0.11.1
+numpy
+flax==0.12.9
+safetensors
+torch
+transformers>=5.17
+numba
+xxhash
+# Import-time dependencies of the sgl_jax modules the tests pull in.
+fastapi
+huggingface-hub
+orjson
+partial_json_parser
+psutil
+pydantic
+pyzmq
+# The engine's ModelRunner, which test_inkling.py and Kimi check 10 run, imports these.
+pybase64
+llguidance~=1.3.0
+# The full Engine and its HTTP server, which the capture-hook, steering and scripts/ gates start,
+# import these too. The pins follow python/pyproject.toml in sglang-jax at eb061d8.
+pathwaysutils>=0.1.7,<0.1.9
+pillow~=11.3.0
+python-multipart>=0.0.20
+requests~=2.32.4
+setproctitle~=1.3.6
+uvicorn~=0.35.0

@@ -1,0 +1,101 @@
+Subject: [PATCH] feat(glm5): add layers_to_capture hook to Glm5Model
+
+GLM-5 and GLM-5.3 have no layers_to_capture hook, so
+--enable-return-hidden-states refuses to start on them. Adds the same hook
+gemma4.py, llama.py and qwen3.py already carry.
+
+Glm5Model accumulates aux_hidden_states for layers in layers_to_capture and
+returns them; Glm5ForCausalLM gates on capture_aux_hidden_states and forwards
+them to the logits processor. GlmMoeDsaForCausalLM inherits it, since it only
+overrides patch_model_config.
+
+Uses the None-residual form. GLM5 carries residual separately, and it's None
+on layer 0. EAGLE3 never captures layer 0, but the hidden-states flag does.
+
+Depends on #877 for the flag and the output reshape.
+---
+ python/sgl_jax/srt/models/glm5_moe.py | 37 ++++++++++++++++++++++++++++-------
+ 1 file changed, 30 insertions(+), 7 deletions(-)
+
+diff --git a/python/sgl_jax/srt/models/glm5_moe.py b/python/sgl_jax/srt/models/glm5_moe.py
+index 4ecda04e..21e4fba5 100644
+--- a/python/sgl_jax/srt/models/glm5_moe.py
++++ b/python/sgl_jax/srt/models/glm5_moe.py
+@@ -1034,6 +1034,7 @@ class Glm5Model(nnx.Module):
+         self.norm = RMSNorm(
+             config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="norm"
+         )
++        self.layers_to_capture = []
+ 
+     def __call__(
+         self,
+@@ -1047,9 +1048,16 @@ class Glm5Model(nnx.Module):
+         layers_kv_fused = []
+         layers_idx_fused = []
+         layers_topk_ids = []
++        aux_hidden_states = []
+         dsa_topk = None
+         dsa_topk_pages = None
+-        for layer in self.layers:
++        for layer_id, layer in enumerate(self.layers):
++            if layer_id in self.layers_to_capture:
++                # residual is None on layer 0, and --enable-return-hidden-states
++                # captures every layer, so this has to tolerate it.
++                aux_hidden_states.append(
++                    hidden_states + residual if residual is not None else hidden_states
++                )
+             hidden_states, residual, kv_fused, topk_ids = layer(
+                 forward_batch.positions,
+                 hidden_states,
+@@ -1076,7 +1084,7 @@ class Glm5Model(nnx.Module):
+             hidden_states += residual
+ 
+         hidden_states = self.norm(hidden_states)
+-        return hidden_states, layers_kv_fused, layers_idx_fused, layers_topk_ids
++        return hidden_states, aux_hidden_states, layers_kv_fused, layers_idx_fused, layers_topk_ids
+ 
+ 
+ class Glm5ForCausalLM(nnx.Module):
+@@ -1105,6 +1113,7 @@ class Glm5ForCausalLM(nnx.Module):
+             soft_cap=getattr(config, "final_logit_softcapping", None),
+             enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+         )
++        self.capture_aux_hidden_states = False
+ 
+     def __call__(
+         self,
+@@ -1113,15 +1122,29 @@ class Glm5ForCausalLM(nnx.Module):
+         logits_metadata: LogitsMetadata,
+     ):
+         kv_pool = memory_pools.token_to_kv_pool
+-        hidden_states, layers_kv_fused, layers_idx_fused, layers_topk_ids = self.model(
+-            forward_batch,
+-            kv_pool,
++        hidden_states, aux_hidden_states, layers_kv_fused, layers_idx_fused, layers_topk_ids = (
++            self.model(
++                forward_batch,
++                kv_pool,
++            )
+         )
++        if not self.capture_aux_hidden_states:
++            aux_hidden_states = None
+ 
+         if not getattr(self.config, "tie_word_embeddings", False):
+-            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
++            output = self.logits_processor(
++                hidden_states,
++                self.lm_head,
++                logits_metadata,
++                aux_hidden_states=aux_hidden_states,
++            )
+         else:
+-            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
++            output = self.logits_processor(
++                hidden_states,
++                self.model.embed_tokens,
++                logits_metadata,
++                aux_hidden_states=aux_hidden_states,
++            )
+ 
+         kv_update = (layers_kv_fused, layers_idx_fused) if layers_idx_fused else layers_kv_fused
+         return output, {"token_to_kv_pool": kv_update}, True, layers_topk_ids

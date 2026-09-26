@@ -1,0 +1,2730 @@
+ python/sgl_jax/srt/configs/inkling.py              |   41 +
+ python/sgl_jax/srt/hf_transformers_utils.py        |   11 +
+ .../srt/layers/attention/base_attn_backend.py      |    6 +
+ .../sgl_jax/srt/layers/attention/native_backend.py |  222 ++-
+ python/sgl_jax/srt/managers/tp_worker.py           |   29 +-
+ .../sgl_jax/srt/mem_cache/short_conv_state_pool.py |  225 +++
+ .../model_executor/model_runner_kv_cache_mixin.py  |   70 +-
+ python/sgl_jax/srt/models/inkling.py               | 1835 ++++++++++++++++++++
+ python/sgl_jax/srt/utils/weight_utils.py           |   13 +-
+ 9 files changed, 2428 insertions(+), 24 deletions(-)
+
+diff --git a/python/sgl_jax/srt/configs/inkling.py b/python/sgl_jax/srt/configs/inkling.py
+new file mode 100644
+index 00000000..7a2b6220
+--- /dev/null
++++ b/python/sgl_jax/srt/configs/inkling.py
+@@ -0,0 +1,41 @@
++"""Serving config for `thinkingmachines/Inkling` and `Inkling-Small`.
++
++The published `config.json` writes two MLP widths into its `text_config`.
++`intermediate_size` is the width of one routed expert and
++`dense_intermediate_size` is the width of the dense MLP the layers below
++`dense_mlp_idx` run. The stock `InklingTextConfig.__post_init__` moves the
++dense width onto `intermediate_size` and leaves `moe_intermediate_size` at its
++class default of 3072, so the published expert width is gone by the time the
++model reads it. That default happens to be right for Inkling and wrong for
++Inkling-Small, whose experts are 2048 wide.
++
++`InklingServingConfig` reads the expert width off the raw text block before the
++base class rewrites the field.
++"""
++
++from __future__ import annotations
++
++from huggingface_hub.dataclasses import strict
++from transformers.models.inkling import InklingConfig as HFInklingConfig
++
++
++@strict
++class InklingServingConfig(HFInklingConfig):
++    """`InklingConfig` that keeps the published expert width."""
++
++    model_type = "inkling_mm_model"
++
++    def __post_init__(self, **kwargs):
++        text = self.text_config
++        # A checkpoint that carries `dense_intermediate_size` writes the expert
++        # width as `intermediate_size`. One that carries only
++        # `intermediate_size` means the dense width, which is what the base
++        # class already reads.
++        if isinstance(text, dict) and text.get("dense_intermediate_size") is not None:
++            expert_width = text.get("intermediate_size")
++            if expert_width is not None:
++                text.setdefault("moe_intermediate_size", expert_width)
++        super().__post_init__(**kwargs)
++
++
++__all__ = ["InklingServingConfig"]
+diff --git a/python/sgl_jax/srt/hf_transformers_utils.py b/python/sgl_jax/srt/hf_transformers_utils.py
+index 51805fa2..7cba2a91 100644
+--- a/python/sgl_jax/srt/hf_transformers_utils.py
++++ b/python/sgl_jax/srt/hf_transformers_utils.py
+@@ -28,6 +28,14 @@ from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
+ from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
+ from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
+ 
++try:
++    from sgl_jax.srt.configs.inkling import InklingServingConfig
++except ImportError:
++    # transformers carries Inkling from 5.14. An older install still serves
++    # every other model, and an Inkling checkpoint stops in AutoConfig, which
++    # names the model type it doesn't know.
++    InklingServingConfig = None
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -40,6 +48,9 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+         Qwen3_5DenseConfig,
+         Qwen4ExpConfig,
+         Gemma4Config,
++        # Stock transformers owns `inkling_mm_model` too. Ours replaces it,
++        # because the stock config drops the published routed-expert width.
++        *([InklingServingConfig] if InklingServingConfig is not None else []),
+     ]
+ }
+ 
+diff --git a/python/sgl_jax/srt/layers/attention/base_attn_backend.py b/python/sgl_jax/srt/layers/attention/base_attn_backend.py
+index 6dacad38..087a6507 100644
+--- a/python/sgl_jax/srt/layers/attention/base_attn_backend.py
++++ b/python/sgl_jax/srt/layers/attention/base_attn_backend.py
+@@ -35,6 +35,12 @@ class AttentionBackendMetadata:
+ class AttentionBackend(nnx.Module):
+     """The base class of attention backends"""
+ 
++    # A model that adds a learned bias to its logits (Inkling) passes a
++    # `position_bias` profile through RadixAttention. A backend that reads the
++    # kwarg sets this True. A backend that leaves it False makes the model raise
++    # rather than serve logits that silently drop the bias.
++    supports_position_bias: bool = False
++
+     @abstractmethod
+     def get_forward_metadata(self, batch: ModelWorkerBatch):
+         """Init the metadata for a forward pass and return it"""
+diff --git a/python/sgl_jax/srt/layers/attention/native_backend.py b/python/sgl_jax/srt/layers/attention/native_backend.py
+index d5ae17e9..b2a04db0 100644
+--- a/python/sgl_jax/srt/layers/attention/native_backend.py
++++ b/python/sgl_jax/srt/layers/attention/native_backend.py
+@@ -1,20 +1,65 @@
++from dataclasses import dataclass
++
+ import jax
+ import jax.numpy as jnp
++import numpy as np
++from flax import nnx
+ from jax.sharding import Mesh, NamedSharding
+ from jax.sharding import PartitionSpec as P
++from jax.tree_util import register_pytree_node_class
+ 
+ from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
+ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
+-from sgl_jax.srt.mem_cache.memory_pool import KVCache
++from sgl_jax.srt.mem_cache.memory_pool import KVCache, SWAKVPool
+ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+-from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
++from sgl_jax.srt.utils.jax_utils import device_array, is_tpu_runtime
+ from sgl_jax.srt.utils.profiling_utils import named_scope
+ 
+ 
++@register_pytree_node_class
++@dataclass
++class NativeAttentionMetadata:
++    """The batch's cache slots in the sliding-window pool of an `SWAKVPool`.
++
++    `SWAKVPool` keeps its sliding-window layers in a second, smaller pool, and
++    `SWATokenToKVPoolAllocator` maps each full-pool slot to a slot there. The
++    scheduler hands out full-pool slots, so `get_forward_metadata` maps them on
++    the host, the way the FA backend builds `swa_page_indices`.
++    """
++
++    swa_cache_loc: jax.Array | None = None
++    swa_out_cache_loc: jax.Array | None = None
++
++    def tree_flatten(self):
++        return (self.swa_cache_loc, self.swa_out_cache_loc), {}
++
++    @classmethod
++    def tree_unflatten(cls, aux_data, children):
++        return cls(*children)
++
++
++def map_to_swa_slots(loc: np.ndarray, mapping, dp_size: int) -> np.ndarray:
++    """Full-pool slots to sliding-window slots, one mapping per data rank.
++
++    Negative slots mark padding tokens and stay negative. A slot the allocator
++    has freed maps to 0, the pool's padding slot, which the read fills with zeros.
++    """
++    loc = np.asarray(loc, dtype=np.int32)
++    sections = loc.reshape(dp_size, -1)
++    mapped = np.empty_like(sections)
++    for rank in range(dp_size):
++        table = np.asarray(mapping[rank] if isinstance(mapping, list) else mapping)
++        section = sections[rank]
++        mapped[rank] = np.where(section >= 0, table[np.maximum(section, 0)], section)
++    return mapped.reshape(-1)
++
++
+ class NativeAttention(AttentionBackend):
+     """Native Attention layer for variable-length sequences using ForwardBatch."""
+ 
++    supports_position_bias = True
++
+     def __init__(
+         self,
+         num_attn_heads,
+@@ -28,6 +73,7 @@ class NativeAttention(AttentionBackend):
+             self.num_kv_heads = num_attn_heads
+         self.mesh = mesh
+         self.kv_sharding = NamedSharding(self.mesh, P(None, "tensor", None))
++        self.forward_metadata = nnx.data(NativeAttentionMetadata())
+ 
+     def tree_flatten(self):
+         children = ()
+@@ -47,8 +93,24 @@ class NativeAttention(AttentionBackend):
+         )
+ 
+     def get_forward_metadata(self, batch: ModelWorkerBatch):
+-        """Init the metadata for a forward pass and return it."""
+-        return None
++        """Init the metadata for a forward pass and return it.
++
++        The runner sets `swa_index_mapping` when it builds an `SWAKVPool`, and
++        then the metadata carries the batch's slots in the sliding-window pool.
++        """
++        metadata = NativeAttentionMetadata()
++        mapping = getattr(self, "swa_index_mapping", None)
++        if mapping is None:
++            return metadata
++        dp_size = getattr(batch, "dp_size", 1)
++        metadata.swa_cache_loc, metadata.swa_out_cache_loc = device_array(
++            (
++                map_to_swa_slots(batch.cache_loc, mapping, dp_size),
++                map_to_swa_slots(batch.out_cache_loc, mapping, dp_size),
++            ),
++            sharding=NamedSharding(self.mesh, P("data")),
++        )
++        return metadata
+ 
+     @named_scope
+     def __call__(
+@@ -70,8 +132,11 @@ class NativeAttention(AttentionBackend):
+             Tuple of (output tensor of shape [total_tokens, hidden_size], kv_fused 5D)
+         """
+         # TODO(pc) support tree based native attention backend
++        pool, pool_layer_id, out_cache_loc, cache_loc = self._layer_slots(
++            token_to_kv_pool, layer.layer_id, forward_batch
++        )
+         k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache(
+-            k, v, forward_batch, token_to_kv_pool, layer.layer_id
++            k, v, forward_batch, pool, pool_layer_id, out_cache_loc
+         )
+ 
+         scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
+@@ -91,12 +156,15 @@ class NativeAttention(AttentionBackend):
+         if attention_sink is not None and hasattr(attention_sink, "value"):
+             attention_sink = attention_sink.value
+ 
++        # Per-token bias-vs-distance profile [tokens, heads, extent] (Inkling).
++        position_bias = kwargs.get("position_bias")
++
+         attn_output = forward_attention(
+             q,
+             k_buffer,
+             v_buffer,
+             forward_batch.seq_lens,
+-            forward_batch.cache_loc,
++            cache_loc,
+             forward_batch.extend_prefix_lens,
+             forward_batch.extend_seq_lens,
+             layer.q_head_num,
+@@ -111,11 +179,47 @@ class NativeAttention(AttentionBackend):
+             attention_sink=attention_sink,
+             sliding_window_size=layer.sliding_window_size,
+             softmax_dtype=layer.softmax_dtype,
++            position_bias=position_bias,
+         )
+ 
+         # Return full fused KV buffer for this layer so that caller can persist it outside JIT
+         return attn_output, kv_fused
+ 
++    def _layer_slots(
++        self,
++        token_to_kv_pool: KVCache,
++        layer_id: int,
++        forward_batch: ForwardBatch,
++    ) -> tuple[KVCache, int, jax.Array, jax.Array]:
++        """The pool, pool layer id and slots one layer writes and reads.
++
++        An `SWAKVPool` keeps its sliding-window layers in a second pool with its
++        own slot numbering. Those layers write and read at the mapped slots the
++        forward metadata carries, and every other layer at the batch's own.
++        """
++        out_cache_loc, cache_loc = forward_batch.out_cache_loc, forward_batch.cache_loc
++        if not isinstance(token_to_kv_pool, SWAKVPool):
++            return token_to_kv_pool, layer_id, out_cache_loc, cache_loc
++        pool_layer_id, is_swa = token_to_kv_pool.layers_mapping[layer_id]
++        if not is_swa:
++            return token_to_kv_pool.full_kv_pool, pool_layer_id, out_cache_loc, cache_loc
++        metadata = getattr(self, "forward_metadata", None)
++        if metadata is not None and metadata.swa_cache_loc is not None:
++            return (
++                token_to_kv_pool.swa_kv_pool,
++                pool_layer_id,
++                metadata.swa_out_cache_loc,
++                metadata.swa_cache_loc,
++            )
++        if token_to_kv_pool.full_to_swa_index_mapping is None:
++            # No allocator maps the slots, so both pools number them alike.
++            return token_to_kv_pool.swa_kv_pool, pool_layer_id, out_cache_loc, cache_loc
++        raise ValueError(
++            f"layer {layer_id} keeps its KV in the sliding-window pool, and the forward "
++            "metadata carries no slots there. Set swa_index_mapping on the backend and "
++            "build the metadata with get_forward_metadata for each batch."
++        )
++
+     def _get_and_update_kv_cache(
+         self,
+         k: jax.Array,
+@@ -123,27 +227,28 @@ class NativeAttention(AttentionBackend):
+         forward_batch: ForwardBatch,
+         token_to_kv_pool: KVCache,
+         layer_id: int,
++        out_cache_loc: jax.Array,
+     ) -> tuple[jax.Array, jax.Array, jax.Array]:
+         """
+         Update KV cache and return (k_3d, v_3d, fused_5d).
+ 
+         The 5D fused buffer is persisted outside JIT. The 3D k/v views are
+         used by forward_attention for the actual attention computation.
++        `token_to_kv_pool`, `layer_id` and `out_cache_loc` come from
++        `_layer_slots`, so an `SWAKVPool` layer arrives as its own sub-pool,
++        its index there and its slots there.
+         """
+         if is_tpu_runtime(self.mesh):
+-            if forward_batch.forward_mode.is_extend():
+-                token_to_kv_pool.set_kv_buffer(
+-                    layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
+-                )
+-            else:
+-                token_to_kv_pool.set_kv_buffer(
+-                    layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
+-                )
++            token_to_kv_pool.set_kv_buffer(
++                layer_id,
++                out_cache_loc,
++                k,
++                v,
++                is_decode=not forward_batch.forward_mode.is_extend(),
++            )
+             fused_5d = token_to_kv_pool.get_fused_kv_buffer(layer_id)
+         else:
+-            fused_5d = token_to_kv_pool.set_kv_buffer_legacy(
+-                layer_id, forward_batch.out_cache_loc, k, v
+-            )
++            fused_5d = token_to_kv_pool.set_kv_buffer_legacy(layer_id, out_cache_loc, k, v)
+ 
+         # Flatten 5D -> 3D: [pages, page_size, heads_x2_per_pack, pack, hdim] -> [tokens, heads_x2, hdim]
+         num_pages, page_size, heads_x2_per_pack, packing, head_dim = fused_5d.shape
+@@ -188,6 +293,7 @@ def forward_attention(
+     attention_sink: jax.Array | None = None,
+     sliding_window_size: int | None = None,
+     softmax_dtype: jnp.dtype | None = None,
++    position_bias: jax.Array | None = None,
+ ):
+     """
+     Forward pass using native JAX implementation with block-diagonal attention.
+@@ -208,6 +314,9 @@ def forward_attention(
+         xai_temperature_len: length of the xai temperature
+         attention_sink: per-head bias for phantom attention sink token
+         sliding_window_size: sliding window size for attention
++        position_bias: [num_tokens, num_heads, extent] bias-vs-backward-distance
++            profile. Each logit picks the entry at its own query-key distance,
++            and a distance at or past the extent picks zero.
+ 
+     Returns:
+         Output tensor of shape[batch_size, hidden_size]
+@@ -264,6 +373,18 @@ def forward_attention(
+     is_valid = jax.sharding.reshard(loc, NamedSharding(mesh, P())) > 0
+     attn_logits = jnp.where(is_valid[jnp.newaxis, jnp.newaxis, :], attn_logits, neg_inf)
+ 
++    if position_bias is not None:
++        attn_logits = _apply_position_bias(
++            attn_logits,
++            position_bias,
++            seq_lengths,
++            extend_prefix_lens,
++            extend_seq_lens,
++            mode=mode,
++            mesh=mesh,
++            page_size=page_size,
++        )
++
+     # ** Apply XAI temperature scaling if specified **
+     if xai_temperature_len is not None and xai_temperature_len > 0:
+         query_len = q_heads.shape[0]
+@@ -334,6 +455,73 @@ def forward_attention(
+     return attn_output.reshape(num_tokens, num_heads * v_head_dim)
+ 
+ 
++def _key_positions(
++    key_len: int,
++    seq_lengths: jax.Array,
++    page_size: int,
++) -> jax.Array:
++    """Position of every cache column inside its own request.
++
++    `cache_loc` blocks are page-aligned per request, so the block offsets step
++    by the aligned lengths while each block's valid span stays at the real
++    length.
++    """
++    aligned_lengths = ((seq_lengths + page_size - 1) // page_size) * page_size
++    k_starts = jnp.cumsum(aligned_lengths, dtype=jnp.int32) - aligned_lengths
++    k_batch_indicators = jnp.zeros(key_len, dtype=jnp.int32).at[k_starts].set(1)
++    k_batch_ids = jnp.cumsum(k_batch_indicators, dtype=jnp.int32) - 1
++    return jnp.arange(key_len, dtype=jnp.int32) - k_starts[k_batch_ids]
++
++
++def _apply_position_bias(
++    attn_logits: jax.Array,
++    position_bias: jax.Array,
++    seq_lengths: jax.Array,
++    extend_prefix_lens: jax.Array,
++    extend_seq_lens: jax.Array,
++    *,
++    mode: ForwardMode,
++    mesh: Mesh | None,
++    page_size: int,
++):
++    """Add a learned bias that depends on the query-key distance.
++
++    `position_bias` holds one profile per token per head, indexed by backward
++    distance. A distance outside `[0, extent)` contributes zero, so causality
++    and padding stay with the mask.
++    """
++    query_len, _, key_len = attn_logits.shape
++    extent = position_bias.shape[-1]
++
++    replicated = NamedSharding(mesh, P())
++    seq_lengths = jax.sharding.reshard(seq_lengths, replicated)
++    k_positions = _key_positions(key_len, seq_lengths, page_size)
++
++    if mode == ForwardMode.EXTEND:
++        extend_seq_lens = jax.sharding.reshard(extend_seq_lens, replicated)
++        extend_prefix_lens = jax.sharding.reshard(extend_prefix_lens, replicated)
++        q_starts = jnp.cumsum(extend_seq_lens, dtype=jnp.int32) - extend_seq_lens
++        q_batch_indicators = jnp.zeros(query_len, dtype=jnp.int32).at[q_starts].set(1)
++        q_batch_ids = jnp.cumsum(q_batch_indicators, dtype=jnp.int32) - 1
++        q_positions = (
++            extend_prefix_lens[q_batch_ids]
++            + jnp.arange(query_len, dtype=jnp.int32)
++            - q_starts[q_batch_ids]
++        )
++    else:
++        # One query row per request, at the end of its sequence. Rows past the
++        # real batch are padding; the mask drops them.
++        last = (seq_lengths - 1).astype(jnp.int32)
++        q_positions = jnp.zeros(query_len, dtype=jnp.int32).at[: last.shape[0]].set(last)
++
++    distance = q_positions[:, None] - k_positions[None, :]
++    index = jnp.clip(distance, 0, extent - 1)
++    bias = jnp.take_along_axis(position_bias, index[:, None, :], axis=-1)
++    in_range = ((distance >= 0) & (distance < extent))[:, None, :]
++    bias = jnp.where(in_range, bias, jnp.zeros((), bias.dtype))
++    return attn_logits + bias.astype(attn_logits.dtype)
++
++
+ def _apply_extend_mask(
+     attn_weights: jax.Array,
+     seq_lengths: jax.Array,
+diff --git a/python/sgl_jax/srt/managers/tp_worker.py b/python/sgl_jax/srt/managers/tp_worker.py
+index 3ec0c5fb..d5061c8f 100644
+--- a/python/sgl_jax/srt/managers/tp_worker.py
++++ b/python/sgl_jax/srt/managers/tp_worker.py
+@@ -22,7 +22,7 @@ from sgl_jax.srt.managers.schedule_batch import (
+     ModelWorkerBatch,
+     global_server_args_dict,
+ )
+-from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
++from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+ from sgl_jax.srt.model_executor.model_runner import MockModelRunner, ModelRunner
+ from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
+@@ -57,6 +57,24 @@ def _iter_padded_input_logprob_reqs(model_worker_batch, padded_rows: int):
+             cum += plen
+ 
+ 
++def check_model_server_args(model_config, server_args, model_class=None) -> None:
++    """Let the model class refuse flags it can't serve.
++
++    A model class that defines `check_server_args(server_args, model_config)`
++    raises there, so a launch it can't serve stops before the checkpoint loads.
++    The class is the one the loader builds.
++    """
++    if model_class is not None:
++        model_class = getattr(model_config, "model_class", None) or model_class
++    else:
++        from sgl_jax.srt.model_loader.arch import get_model_architecture
++
++        model_class, _ = get_model_architecture(model_config)
++    check = getattr(model_class, "check_server_args", None)
++    if check is not None:
++        check(server_args, model_config)
++
++
+ class ModelWorker:
+     """A tensor parallel model worker."""
+ 
+@@ -105,6 +123,8 @@ class ModelWorker:
+             ),
+             is_draft_model=is_draft_worker,
+         )
++        # Before the runner downloads or reads a single weight.
++        check_model_server_args(self.model_config, server_args, model_class)
+ 
+         self.mesh = mesh
+         self.page_size = server_args.page_size
+@@ -261,6 +281,11 @@ class ModelWorker:
+         from sgl_jax.srt.models.registry import ModelRegistry
+ 
+         has_recurrent_state = self.model_runner.linear_recurrent_config is not None
++        # The scheduler hands every batch recurrent_indices when the request
++        # pool gives each request a state slot, which Inkling's short-convolution
++        # pool does too. The precompile's dummies carry them as well, so serving
++        # runs the programs it built.
++        has_state_slots = isinstance(self.model_runner.req_to_token_pool, HybridReqToTokenPool)
+         use_multistage_multimodal = server_args.multimodal
+         use_in_model_multimodal = (
+             self.model_config.is_multimodal
+@@ -289,7 +314,7 @@ class ModelWorker:
+             # --multimodal selects the standalone multistage pipeline instead.
+             precompile_in_model_multimodal=use_in_model_multimodal,
+             capture_hidden_states=use_multistage_multimodal,
+-            has_recurrent_state=has_recurrent_state,
++            has_recurrent_state=has_state_slots,
+             supports_recurrent_cow=(
+                 has_recurrent_state
+                 and server_args.enable_unified_radix_tree
+diff --git a/python/sgl_jax/srt/mem_cache/short_conv_state_pool.py b/python/sgl_jax/srt/mem_cache/short_conv_state_pool.py
+new file mode 100644
+index 00000000..8ca668b6
+--- /dev/null
++++ b/python/sgl_jax/srt/mem_cache/short_conv_state_pool.py
+@@ -0,0 +1,225 @@
++"""Per-request windows of a model's short causal convolutions.
++
++A short convolution with kernel K reads the K - 1 tokens before its input, so a
++sequence that continues across prefill chunks or decode steps needs the window
++its previous step left. `ShortConvStatePool` keeps one slot of windows per
++request. It takes its slots from `HybridReqToTokenPool`, so the scheduler's
++`recurrent_indices` address it the way they address a `RecurrentStatePool`.
++
++The model reports what it holds through `get_conv_state_spec()`, one
++`(name, channels, tokens)` list per layer. Each layer's windows live in a dict
++keyed by name, each one `[slots, channels, tokens]`. The channel axis shards
++over `tensor` when it splits evenly, because a depthwise convolution never mixes
++channels. Each data-parallel rank owns `size // dp_size` slots plus a dummy slot
++0, the layout `RecurrentStatePool` uses.
++"""
++
++from __future__ import annotations
++
++import jax
++import jax.numpy as jnp
++from jax.sharding import Mesh, NamedSharding
++from jax.sharding import PartitionSpec as P
++from jax.tree_util import register_pytree_node_class
++
++from sgl_jax.srt.mem_cache.recurrent_state_pool import _get_recurrent_zero_allocator
++
++ConvStateSpec = list[list[tuple[str, int, int]]]
++
++# The name the runner gives the pool inside `MemoryPools`.
++CONV_STATE_POOL_KEY = "conv_state_pool"
++
++
++def conv_state_serving_problems(server_args) -> list[str]:
++    """The flags a per-request window pool can't serve correctly, one line each.
++
++    A model that keeps windows checks them from its `check_server_args`, which
++    `ModelWorker` calls before it reads any weight. The runner checks them again
++    when it builds the pool.
++    """
++    problems = []
++    if not server_args.disable_radix_cache:
++        problems.append(
++            "the radix cache would hand a request another request's prefix with no "
++            "windows at its end; serve with --disable-radix-cache"
++        )
++    if server_args.speculative_algorithm is not None:
++        problems.append("speculative decoding would leave rejected draft tokens in the windows")
++    if server_args.enable_recurrent_extra_buffer:
++        problems.append("--enable-recurrent-extra-buffer snapshots recurrent state only")
++    # PD hands a request's KV to the decode side and leaves its windows behind, so
++    # every decode step would convolve over zeros.
++    if server_args.pd_disaggregation:
++        problems.append("--pd-disaggregation moves a request's KV to decode but not its windows")
++    if server_args.disaggregation_mode != "null":
++        problems.append(
++            f"--disaggregation-mode {server_args.disaggregation_mode} moves a request's KV "
++            "between servers but not its windows"
++        )
++    return problems
++
++
++def window_channel_axis(channels: int, mesh: Mesh) -> str | None:
++    """`tensor` when the channels split evenly over it, None when they don't."""
++    tensor = mesh.shape.get("tensor", 1)
++    return "tensor" if tensor > 1 and channels % tensor == 0 else None
++
++
++def window_spec(channels: int, mesh: Mesh) -> P:
++    """Sharding of one window buffer: slots over `data`, channels over `tensor`."""
++    return P("data", window_channel_axis(channels, mesh), None)
++
++
++def read_windows(buffer: jax.Array, indices: jax.Array, mesh: Mesh) -> jax.Array:
++    """The windows of the requests at `indices`, `[batch, channels, tokens]`.
++
++    `indices` are rank-local slots, so each data shard gathers from its own
++    slots.
++    """
++    spec = window_spec(buffer.shape[1], mesh)
++    return jax.shard_map(
++        lambda buf, idx: buf[idx],
++        mesh=mesh,
++        in_specs=(spec, P("data")),
++        out_specs=spec,
++        check_vma=False,
++    )(buffer, indices)
++
++
++def write_windows(
++    buffer: jax.Array, indices: jax.Array, windows: jax.Array, mesh: Mesh
++) -> jax.Array:
++    """`buffer` with each request's slot set to its new window.
++
++    Padding rows carry slot 0, the dummy slot. They write back what the slot
++    already holds, so it stays at zeros and never reaches a real request.
++    """
++    spec = window_spec(buffer.shape[1], mesh)
++
++    def scatter(buf, idx, val):
++        keep = (idx == 0).reshape(-1, 1, 1)
++        return buf.at[idx].set(jnp.where(keep, buf[idx], val.astype(buf.dtype)))
++
++    return jax.shard_map(
++        scatter,
++        mesh=mesh,
++        in_specs=(spec, P("data"), spec),
++        out_specs=spec,
++        check_vma=False,
++    )(buffer, indices, windows)
++
++
++def _zeros(shape: tuple[int, ...], dtype, sharding: NamedSharding) -> jax.Array:
++    """Zeros placed at `sharding`, from the allocator cache `RecurrentStatePool` keeps.
++
++    The cache holds one jit per shape, dtype and sharding. Inkling's 66 layers hold
++    264 windows in 3 shapes, so a fresh jit per window compiled 264 programs at
++    every create and every flush.
++    """
++    return _get_recurrent_zero_allocator(shape, dtype, sharding)()
++
++
++@register_pytree_node_class
++class ShortConvStatePool:
++    """One slot of short-convolution windows per request.
++
++    `size` counts the valid slots across every data-parallel rank, the way
++    `RecurrentStatePool.size` does.
++    """
++
++    def __init__(
++        self,
++        spec: ConvStateSpec,
++        size: int,
++        mesh: Mesh,
++        dp_size: int = 1,
++        dtype=jnp.float32,
++        *,
++        abstract: bool = False,
++    ):
++        if size % dp_size:
++            raise ValueError(f"ShortConvStatePool size {size} must divide by dp_size {dp_size}")
++        self.spec = tuple(
++            tuple((str(name), int(channels), int(tokens)) for name, channels, tokens in layer)
++            for layer in spec
++        )
++        self.size = size
++        self.dp_size = dp_size
++        self.total_slots = size + dp_size
++        self.mesh = mesh
++        self.dtype = jnp.dtype(dtype)
++        self.buffers = self._create_buffers(abstract)
++
++    def sharding(self, channels: int) -> NamedSharding:
++        return NamedSharding(self.mesh, window_spec(channels, self.mesh))
++
++    def _create_buffers(self, abstract: bool) -> list[dict[str, jax.Array]]:
++        layers = []
++        for layer in self.spec:
++            windows = {}
++            for name, channels, tokens in layer:
++                shape = (self.total_slots, channels, tokens)
++                sharding = self.sharding(channels)
++                if abstract:
++                    windows[name] = jax.ShapeDtypeStruct(shape, self.dtype, sharding=sharding)
++                else:
++                    windows[name] = _zeros(shape, self.dtype, sharding)
++            layers.append(windows)
++        return layers
++
++    def layer(self, layer_id: int) -> dict[str, jax.Array]:
++        return self.buffers[layer_id]
++
++    def replace_buffer(self, layers: list[dict[str, jax.Array]]) -> None:
++        if len(layers) != len(self.spec):
++            raise ValueError(
++                f"ShortConvStatePool holds {len(self.spec)} layers, and the update has "
++                f"{len(layers)}"
++            )
++        # A one-way tensor axis loses the output sharding after jit, the case
++        # MHATokenToKVPool.replace_buffer notes, so put each window back.
++        tp_degenerate = self.mesh.shape.get("tensor", 1) == 1
++        updated = []
++        for layer, layer_spec in zip(layers, self.spec):
++            names = sorted(name for name, _, _ in layer_spec)
++            if sorted(layer) != names:
++                raise ValueError(
++                    f"a layer update carries windows {sorted(layer)}, and the pool holds {names}"
++                )
++            windows = {}
++            for name, channels, _ in layer_spec:
++                array = layer[name]
++                if tp_degenerate:
++                    array = jax.device_put(array, self.sharding(channels))
++                windows[name] = array
++            updated.append(windows)
++        self.buffers = updated
++
++    def clear(self) -> None:
++        self.buffers = self._create_buffers(abstract=False)
++
++    @staticmethod
++    def bytes_per_device(
++        spec: ConvStateSpec, size: int, mesh: Mesh, dp_size: int = 1, dtype=jnp.float32
++    ) -> int:
++        """HBM one device spends on the pool."""
++        slots = (size + dp_size) // dp_size
++        tensor = mesh.shape.get("tensor", 1)
++        itemsize = jnp.dtype(dtype).itemsize
++        total = 0
++        for layer in spec:
++            for _, channels, tokens in layer:
++                local = channels // tensor if window_channel_axis(channels, mesh) else channels
++                total += slots * local * tokens * itemsize
++        return total
++
++    def tree_flatten(self):
++        return (self.buffers,), (self.spec, self.size, self.dp_size, self.mesh, self.dtype)
++
++    @classmethod
++    def tree_unflatten(cls, aux_data, children):
++        obj = object.__new__(cls)
++        obj.spec, obj.size, obj.dp_size, obj.mesh, obj.dtype = aux_data
++        obj.total_slots = obj.size + obj.dp_size
++        obj.buffers = [dict(layer) for layer in children[0]]
++        return obj
+diff --git a/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py
+index f44322a8..e88c5411 100644
+--- a/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -22,6 +22,11 @@ from sgl_jax.srt.mem_cache.memory_pool import (
+     MLATokenToKVPool,
+ )
+ from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
++from sgl_jax.srt.mem_cache.short_conv_state_pool import (
++    CONV_STATE_POOL_KEY,
++    ShortConvStatePool,
++    conv_state_serving_problems,
++)
+ 
+ if TYPE_CHECKING:
+     from sgl_jax.srt.model_executor.model_runner import ModelRunner
+@@ -752,9 +757,10 @@ class ModelRunnerKVCacheMixin:
+         from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
+ 
+         has_recurrent_state = self.linear_recurrent_config is not None
++        conv_spec = self._conv_state_spec()
+ 
+         # --- ReqToTokenPool (non-hybrid only; hybrid defers to after KV pool) ---
+-        if self.req_to_token_pool is None and not has_recurrent_state:
++        if self.req_to_token_pool is None and not has_recurrent_state and not conv_spec:
+             self.req_to_token_pool = ReqToTokenPool(
+                 size=max_num_reqs,
+                 max_context_len=self.model_config.context_len + 4,
+@@ -764,7 +770,25 @@ class ModelRunnerKVCacheMixin:
+         self.token_to_kv_pool = self._create_token_to_kv_pool(dp_size)
+ 
+         # --- MemoryPools wrapper (+ hybrid ReqToTokenPool) ---
+-        if has_recurrent_state:
++        if conv_spec:
++            # Short-convolution windows (Inkling), one slot per request. The
++            # slots come from HybridReqToTokenPool, so the scheduler hands every
++            # batch recurrent_indices, the way it does for KDA state.
++            self.conv_state_pool = ShortConvStatePool(
++                conv_spec, size=max_num_reqs, mesh=self.mesh, dp_size=dp_size
++            )
++            self.req_to_token_pool = HybridReqToTokenPool(
++                size=max_num_reqs,
++                max_context_len=self.model_config.context_len + 4,
++                dtype=np.int32,
++                recurrent_state_pool=self.conv_state_pool,
++                dp_size=dp_size,
++            )
++            self.memory_pools = MemoryPools(
++                token_to_kv_pool=self.token_to_kv_pool,
++                **{CONV_STATE_POOL_KEY: self.conv_state_pool},
++            )
++        elif has_recurrent_state:
+             state_size = self.server_args.max_recurrent_state_size
+             _, self.req_to_token_pool, self.memory_pools = _build_hybrid_pools(
+                 cfg=self.linear_recurrent_config,
+@@ -833,6 +857,23 @@ class ModelRunnerKVCacheMixin:
+         # 4. Resolve max_num_reqs (needed for spec dec headroom)
+         max_num_reqs = self._resolve_max_num_reqs(max_num_reqs)
+ 
++        # 4b. Short-convolution windows hold one slot per request, so their
++        # bytes come out of the KV budget before the token count is final.
++        conv_spec = self._conv_state_spec()
++        if conv_spec:
++            self._check_conv_state_serving()
++            conv_bytes = ShortConvStatePool.bytes_per_device(
++                conv_spec, max_num_reqs, self.mesh, dp_size
++            )
++            conv_tokens = -(-conv_bytes // self._compute_cell_size())
++            self.max_total_num_tokens -= conv_tokens
++            logger.info(
++                "Short-convolution state: %d slots, %.1f MB per device, %d KV tokens fewer",
++                max_num_reqs,
++                conv_bytes / 1e6,
++                conv_tokens,
++            )
++
+         # 5. Speculative decoding: resolve draft/target cache sizes.
+         # Headroom added to max_total_num_tokens BEFORE _apply_token_constraints
+         # so it goes through page_align * dp_size naturally.
+@@ -917,6 +958,31 @@ class ModelRunnerKVCacheMixin:
+             return self.qwen4_exp_config.text_config
+         return self.lightning_config
+ 
++    def _conv_state_spec(self: ModelRunner):
++        """Short-convolution windows the model keeps per request, or None.
++
++        A model that holds them reports one `(name, channels, tokens)` list per
++        layer through `get_conv_state_spec()`.
++        """
++        report = getattr(getattr(self, "model", None), "get_conv_state_spec", None)
++        return report() if report is not None else None
++
++    def _check_conv_state_serving(self: ModelRunner) -> None:
++        """Refuse the flags a short-convolution pool can't serve correctly.
++
++        `ModelWorker` asks the model class the same before it reads any weight.
++        This covers a runner built some other way.
++        """
++        problems = conv_state_serving_problems(self.server_args)
++        if self.linear_recurrent_config is not None:
++            problems.insert(0, "the model also reports linear-recurrent state")
++        if problems:
++            raise ValueError(
++                f"{type(self.model).__name__} keeps short-convolution windows per request: "
++                + "; ".join(problems)
++                + "."
++            )
++
+     def _kv_pool_layer_count(self: ModelRunner):
+         """Layer count for KV pool sizing.
+ 
+diff --git a/python/sgl_jax/srt/models/inkling.py b/python/sgl_jax/srt/models/inkling.py
+new file mode 100644
+index 00000000..42f0b241
+--- /dev/null
++++ b/python/sgl_jax/srt/models/inkling.py
+@@ -0,0 +1,1835 @@
++"""Inkling text decoder.
++
++`thinkingmachines/Inkling` and `thinkingmachines/Inkling-Small` run the same
++stack at two widths. Four things separate it from a Llama-shaped decoder.
++
++1. There's no rotary table. Attention runs four separate projections of the
++   hidden state, `q`, `k`, `v` and a fourth stream `r` of width `d_rel` per
++   head. The checkpoint stores them as four tensors, `attn.wq_du.weight`,
++   `attn.wk_dv.weight`, `attn.wv_dv.weight` and `attn.wr_du.weight`. A
++   `[d_rel, extent]` matrix turns `r` into one bias per backward distance, and
++   attention adds that bias to its logits. Distances at or past the extent get
++   zero. A global layer runs the extent at `rel_extent`, a local layer at
++   `sliding_window_size`. Above `log_scaling_n_floor` tokens a global layer
++   scales both its queries and its bias by
++   `1 + log_scaling_alpha * ln(max(1, (pos + 1) / n_floor))`.
++
++   `q` and `k` are RMS-normalized per head after the head reshape, so the
++   attention scale is `1 / head_dim` rather than `1 / sqrt(head_dim)`.
++
++2. Four depthwise causal convolutions sit in every layer: one on `k`, one on
++   `v`, one on the attention output and one on the MLP output. Each adds its
++   input back, so it's a residual convolution rather than a filter. Each holds
++   `sconv_kernel_size - 1` tokens of state per sequence. The windows live in
++   the engine's `ShortConvStatePool`, one slot per request, so a sequence
++   carries them across prefill chunks and decode steps.
++
++3. The stack breaks twice, and the two breaks don't line up. `dense_mlp_idx`
++   splits the MLPs: layers below the index run one dense MLP, the rest route to
++   experts. `local_layer_ids` gives the local-to-global attention cycle, and the
++   two attention kinds carry different KV head counts.
++
++4. `shared_expert_sink` puts the shared experts in the router. The gate emits
++   `n_routed_experts + n_shared_experts` logits, the top-k routed logits and all
++   shared logits normalize together, and the shared experts get their gates from
++   that same normalization.
++
++`InklingMTPForCausalLM` builds one layer of the multi-token-prediction head as
++a draft model. `mtp_layer_idx` picks the layer, and `mtp_local_layer_ids`
++decides whether that layer runs the sliding window. No speculative path serves
++it yet: `check_server_args` refuses speculative decoding, because nothing rolls
++a convolution window back past a rejected draft token.
++
++`ModelWorker` calls `check_server_args` before it reads any weight. It refuses
++the radix cache, speculative decoding, the recurrent extra buffer, PD
++disaggregation in either mode, data parallelism, the EPLB flags, and any
++attention backend but the native one.
++
++Weight keys follow the published checkpoint, which stores the decoder under
++`model.llm.` and the draft head under `model.mtp.`.
++"""
++
++import logging
++from functools import partial
++from typing import Any
++
++import jax
++import jax.numpy as jnp
++import numpy as np
++import safetensors
++from flax import nnx
++from jax.sharding import NamedSharding
++from jax.sharding import PartitionSpec as P
++from transformers import PretrainedConfig
++
++from sgl_jax.srt.configs.model_config import ModelConfig
++from sgl_jax.srt.layers.attention.linear.short_convolution import short_convolution
++from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
++from sgl_jax.srt.layers.gate import GateLogit
++from sgl_jax.srt.layers.layernorm import RMSNorm
++from sgl_jax.srt.layers.linear import LinearBase
++from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
++from sgl_jax.srt.layers.moe import EPMoE
++from sgl_jax.srt.layers.radix_attention import RadixAttention
++from sgl_jax.srt.mem_cache.memory_pool import KVCache
++from sgl_jax.srt.mem_cache.short_conv_state_pool import (
++    CONV_STATE_POOL_KEY,
++    conv_state_serving_problems,
++    read_windows,
++    window_channel_axis,
++    window_spec,
++    write_windows,
++)
++from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
++from sgl_jax.srt.precision_tracer import precision_tracer
++from sgl_jax.srt.utils.profiling_utils import named_scope
++from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
++
++logger = logging.getLogger(__name__)
++
++# Pool key the four short-convolution windows per layer ride on. The runner
++# builds the pool under this name, the model reads each request's windows from
++# it and returns the updated buffers under the same name.
++CONV_POOL_KEY = CONV_STATE_POOL_KEY
++
++# Fields `ModelRunner.load_model` and `ModelConfig` write onto the config the
++# loader hands the model. The published config nests the decoder under
++# `text_config` and the model reads that block, so these follow it there, or
++# `EPMoE` and the LM head read their defaults.
++RUNTIME_FIELDS = ("ep_size", "moe_dp_size", "enable_dp_lm_head", "quantization_config")
++
++
++def forward_runtime_fields(source: PretrainedConfig, target: PretrainedConfig) -> None:
++    """Copy the runner's fields from the config it wrote them on."""
++    for name in RUNTIME_FIELDS:
++        if hasattr(source, name):
++            setattr(target, name, getattr(source, name))
++
++
++def text_config(config: PretrainedConfig) -> PretrainedConfig:
++    """The text block of a published config, or the block itself.
++
++    The runner's own fields come along onto the text block.
++    """
++    text = getattr(config, "text_config", None)
++    if text is None:
++        return config
++    forward_runtime_fields(config, text)
++    return text
++
++
++def is_local_layer(config: PretrainedConfig, layer_id: int) -> bool:
++    """True when this layer runs the sliding window."""
++    layer_types = getattr(config, "layer_types", None)
++    if layer_types is not None:
++        return layer_types[layer_id] == "hybrid_sliding"
++    local_layer_ids = getattr(config, "local_layer_ids", None)
++    if local_layer_ids is None:
++        return (layer_id + 1) % 6 != 0
++    return layer_id in set(local_layer_ids)
++
++
++def is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
++    """True when this layer routes to experts instead of one dense MLP."""
++    mlp_layer_types = getattr(config, "mlp_layer_types", None)
++    if mlp_layer_types is not None:
++        return mlp_layer_types[layer_id] == "sparse"
++    return layer_id >= int(getattr(config, "dense_mlp_idx", 0))
++
++
++def sconv_kernel_size(config: PretrainedConfig) -> int:
++    """Kernel of the four short convolutions, 0 when they're turned off."""
++    if not getattr(config, "use_sconv", True):
++        return 0
++    return int(getattr(config, "sconv_kernel_size", getattr(config, "conv_kernel_size", 4)))
++
++
++def moe_intermediate_size(config: PretrainedConfig) -> int:
++    """Width of one routed expert.
++
++    The published `config.json` writes it as `intermediate_size` and writes the
++    dense width as `dense_intermediate_size`. `transformers` moves the dense
++    width onto `intermediate_size` and keeps the expert width under
++    `moe_intermediate_size`, so read that first and fall back to the raw field.
++    """
++    config = text_config(config)
++    width = getattr(config, "moe_intermediate_size", None)
++    if width is None:
++        width = config.intermediate_size
++    return int(width)
++
++
++def kv_head_count(config: PretrainedConfig, layer_id: int) -> int:
++    """KV heads this layer writes.
++
++    A local layer and a global layer carry different counts. The model runner
++    reads `sliding_window_size` off each layer and gives the two kinds separate
++    KV pools, so neither kind pads up to the other.
++    """
++    if is_local_layer(config, layer_id):
++        return int(getattr(config, "swa_num_key_value_heads", config.num_key_value_heads))
++    return int(config.num_key_value_heads)
++
++
++def layer_conv_widths(config: PretrainedConfig, layer_id: int) -> dict[str, int]:
++    """Channels each of this layer's four convolutions runs on.
++
++    `k` and `v` convolve before the pool padding, so they run at the layer's own
++    KV width. A local layer and a global layer therefore hold different amounts
++    of conv state.
++    """
++    config = text_config(config)
++    hidden = int(config.hidden_size)
++    head_dim = int(
++        getattr(config, "swa_head_dim", config.head_dim)
++        if is_local_layer(config, layer_id)
++        else config.head_dim
++    )
++    kv_width = kv_head_count(config, layer_id) * head_dim
++    return {
++        "k_sconv": kv_width,
++        "v_sconv": kv_width,
++        "attn_sconv": hidden,
++        "mlp_sconv": hidden,
++    }
++
++
++def conv_state_spec(config: PretrainedConfig) -> list[list[tuple[str, int, int]]]:
++    """What the cache manager holds, one list of `(name, channels, tokens)` per layer.
++
++    Four convolutions per layer, not one. Two run on the residual stream at
++    `hidden_size`, and two run on `k` and `v` at that layer's KV width. Each
++    holds `sconv_kernel_size - 1` tokens per sequence, in float32.
++    """
++    config = text_config(config)
++    kernel = sconv_kernel_size(config)
++    if kernel == 0:
++        return []
++    tokens = kernel - 1
++    return [
++        [(name, channels, tokens) for name, channels in layer_conv_widths(config, layer_id).items()]
++        for layer_id in range(int(config.num_hidden_layers))
++    ]
++
++
++def cumulative_sequence_lengths(forward_batch: ForwardBatch) -> jax.Array | None:
++    """`[N + 1]` token offsets the short convolution indexes sequences by.
++
++    `ForwardBatch.init_new` places `extend_seq_lens` on `P("data")`. The
++    engine's mesh is Explicit, where a cumsum with no axis needs a replicated
++    input, so the lengths reshard first.
++    """
++    lengths = forward_batch.extend_seq_lens
++    if lengths is None:
++        return None
++    lengths = jax.sharding.reshard(lengths.astype(jnp.int32), P())
++    zero = jnp.zeros((1,), dtype=jnp.int32)
++    return jnp.concatenate([zero, jnp.cumsum(lengths)])
++
++
++def window_keep(forward_batch: ForwardBatch) -> jax.Array | None:
++    """Which rows continue a sequence, so their convolutions open on its window.
++
++    A decode row always does. An extend row does when it has a prefix, which is
++    a later chunk of a chunked prompt or a decode row mixed into a prefill. A
++    row with no prefix opens on zeros whatever its slot held before, the
++    `has_initial_state` rule the scheduler applies to recurrent state.
++    """
++    if forward_batch.forward_mode == ForwardMode.DECODE:
++        return None
++    return forward_batch.extend_prefix_lens > 0
++
++
++class InklingShortConvolution(nnx.Module):
++    """One depthwise causal convolution that adds its input back.
++
++    The state is the `kernel - 1` tokens before the current one. The reference
++    implementation runs this path in float32 whatever the model dtype, so the
++    cast is part of the layer rather than a debugging aid.
++    """
++
++    def __init__(
++        self,
++        channels: int,
++        kernel: int,
++        mesh: jax.sharding.Mesh,
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        self.channels = channels
++        self.kernel = kernel
++        self.mesh = mesh
++        self.state_tokens = max(kernel - 1, 0)
++        # `channels * kernel` values, so the weight stays replicated. The
++        # forward slices it to the channels each device runs.
++        self.weight = nnx.Param(
++            jnp.zeros((channels, 1, kernel), dtype=dtype, out_sharding=P(None, None, None)),
++        )
++
++    @named_scope
++    def __call__(
++        self,
++        x: jax.Array,
++        cache: jax.Array,
++        cu_seqlens: jax.Array | None,
++        forward_mode: ForwardMode,
++    ) -> tuple[jax.Array, jax.Array]:
++        """`(output, new_window)` for `x` and the window each sequence opens on.
++
++        A causal convolution reads across tokens, so the token axis enters
++        whole. A depthwise one never mixes channels, so each device runs its
++        own slice of them, the slice `ShortConvStatePool` stores it at, and no
++        window crosses devices.
++        """
++        residual = x
++        in_spec = jax.typeof(x).sharding.spec
++        axis = window_channel_axis(self.channels, self.mesh)
++        inputs = [
++            jax.sharding.reshard(x.astype(jnp.float32), P(None, axis)),
++            jax.sharding.reshard(self.weight.value.astype(jnp.float32), P(axis, None, None)),
++            jax.sharding.reshard(cache.astype(jnp.float32), P(None, axis, None)),
++        ]
++        in_specs = [P(None, axis), P(axis, None, None), P(None, axis, None)]
++        if forward_mode != ForwardMode.DECODE:
++            inputs.append(jax.sharding.reshard(cu_seqlens, P()))
++            in_specs.append(P())
++
++        def convolve(x_local, weight_local, cache_local, *cu_local):
++            return short_convolution(
++                x_local,
++                weight_local,
++                cache_local,
++                cu_local[0] if cu_local else None,
++                forward_mode,
++                bias=None,
++                activation=None,
++            )
++
++        y, new_cache = jax.shard_map(
++            convolve,
++            mesh=self.mesh,
++            in_specs=tuple(in_specs),
++            out_specs=(P(None, axis), P(None, axis, None)),
++            check_vma=False,
++        )(*inputs)
++        y = jax.sharding.reshard(y, in_spec)
++        return (y + residual.astype(jnp.float32)).astype(residual.dtype), new_cache
++
++
++class InklingRelativeLogits(nnx.Module):
++    """A trained bank of bias-vs-distance profiles, in place of a rotary table.
++
++    One token's `r` stream mixes the bank into one bias per backward distance.
++    The result is `[tokens, heads, extent]`. Attention reads it by distance and
++    treats everything at or past the extent as zero.
++    """
++
++    def __init__(self, d_rel: int, extent: int, dtype: jnp.dtype = jnp.bfloat16):
++        self.d_rel = d_rel
++        self.extent = extent
++        self.proj = nnx.Param(
++            jnp.zeros((d_rel, extent), dtype=dtype, out_sharding=P(None, None)),
++        )
++
++    @named_scope
++    def __call__(self, relative_states: jax.Array) -> jax.Array:
++        # relative_states: [tokens, heads, d_rel] -> [tokens, heads, extent]
++        return jnp.einsum(
++            "thc,ce->the", relative_states, self.proj.value.astype(relative_states.dtype)
++        )
++
++
++def log_scaling(
++    positions: jax.Array,
++    n_floor: int | None,
++    alpha: float,
++) -> jax.Array | None:
++    """`1 + alpha * ln(max(1, (pos + 1) / n_floor))`, one value per token.
++
++    It's one below the floor, so a short sequence is untouched. `None` means
++    the config turns the scaling off.
++    """
++    if n_floor is None:
++        return None
++    effective = (positions.astype(jnp.float32) + 1.0) / float(n_floor)
++    return 1.0 + alpha * jnp.log(jnp.maximum(effective, 1.0))
++
++
++class InklingAttention(nnx.Module):
++    """Attention with a learned relative bias and two short convolutions."""
++
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        layer_id: int,
++        mesh: jax.sharding.Mesh,
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        self.layer_id = layer_id
++        self.mesh = mesh
++        self.is_local = is_local_layer(config, layer_id)
++
++        hidden_size = int(config.hidden_size)
++        rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
++
++        if self.is_local:
++            self.head_dim = int(getattr(config, "swa_head_dim", config.head_dim))
++            self.q_head_num = int(
++                getattr(config, "swa_num_attention_heads", config.num_attention_heads)
++            )
++            own_kv_heads = kv_head_count(config, layer_id)
++            self.sliding_window_size = int(getattr(config, "sliding_window_size", 0))
++            self.rel_extent = self.sliding_window_size
++        else:
++            self.head_dim = int(config.head_dim)
++            self.q_head_num = int(config.num_attention_heads)
++            own_kv_heads = kv_head_count(config, layer_id)
++            self.sliding_window_size = 0
++            self.rel_extent = int(getattr(config, "rel_extent", 1024))
++
++        self.kv_head_num = own_kv_heads
++
++        self.d_rel = int(getattr(config, "d_rel", 16))
++        self.log_scaling_n_floor = getattr(config, "log_scaling_n_floor", None)
++        if self.log_scaling_n_floor is not None:
++            self.log_scaling_n_floor = int(self.log_scaling_n_floor)
++        self.log_scaling_alpha = float(getattr(config, "log_scaling_alpha", 0.1))
++
++        # q and k are RMS-normalized per head, so the scale is 1/d rather than
++        # 1/sqrt(d).
++        self.scaling = 1.0 / self.head_dim
++
++        q_bias = bool(getattr(config, "q_bias", False))
++        o_bias = bool(getattr(config, "o_bias", False))
++
++        self.q_proj = LinearBase(
++            input_size=hidden_size,
++            output_size=self.q_head_num * self.head_dim,
++            use_bias=q_bias,
++            kernel_axes=(None, "tensor"),
++            params_dtype=dtype,
++            mesh=mesh,
++            scope_name="q_proj",
++        )
++        self.k_proj = LinearBase(
++            input_size=hidden_size,
++            output_size=own_kv_heads * self.head_dim,
++            use_bias=False,
++            kernel_axes=(None, "tensor"),
++            params_dtype=dtype,
++            mesh=mesh,
++            scope_name="k_proj",
++        )
++        self.v_proj = LinearBase(
++            input_size=hidden_size,
++            output_size=own_kv_heads * self.head_dim,
++            use_bias=False,
++            kernel_axes=(None, "tensor"),
++            params_dtype=dtype,
++            mesh=mesh,
++            scope_name="v_proj",
++        )
++        self.r_proj = LinearBase(
++            input_size=hidden_size,
++            output_size=self.q_head_num * self.d_rel,
++            use_bias=False,
++            kernel_axes=(None, "tensor"),
++            params_dtype=dtype,
++            mesh=mesh,
++            scope_name="r_proj",
++        )
++        self.o_proj = LinearBase(
++            input_size=self.q_head_num * self.head_dim,
++            output_size=hidden_size,
++            use_bias=o_bias,
++            kernel_axes=("tensor", None),
++            params_dtype=dtype,
++            mesh=mesh,
++            scope_name="o_proj",
++        )
++
++        self.q_norm = RMSNorm(
++            self.head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_norm"
++        )
++        self.k_norm = RMSNorm(
++            self.head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="k_norm"
++        )
++
++        # Past the layer's own KV head count, tensor parallel replicates the
++        # heads, and `own_kv_heads` counts the replicas. k and v run their
++        # convolutions at that width, and `widen_kv_convolutions` repeats the
++        # checkpoint's rows to match.
++        kernel = sconv_kernel_size(config)
++        kv_width = own_kv_heads * self.head_dim
++        if kernel:
++            self.k_sconv = InklingShortConvolution(kv_width, kernel, mesh=mesh, dtype=dtype)
++            self.v_sconv = InklingShortConvolution(kv_width, kernel, mesh=mesh, dtype=dtype)
++        else:
++            self.k_sconv = None
++            self.v_sconv = None
++
++        self.rel_logits_proj = InklingRelativeLogits(self.d_rel, self.rel_extent, dtype=dtype)
++
++        self.attn = RadixAttention(
++            num_heads=self.q_head_num,
++            head_dim=self.head_dim,
++            scaling=self.scaling,
++            num_kv_heads=self.kv_head_num,
++            layer_id=layer_id,
++            sliding_window_size=self.sliding_window_size,
++        )
++
++    @named_scope
++    def __call__(
++        self,
++        positions: jax.Array,
++        hidden_states: jax.Array,
++        forward_batch: ForwardBatch,
++        token_to_kv_pool: KVCache,
++        conv_states: dict[str, jax.Array],
++        cu_seqlens: jax.Array | None,
++    ) -> tuple[jax.Array, jax.Array, dict[str, jax.Array]]:
++        tokens = hidden_states.shape[0]
++        new_conv_states = {}
++
++        q, _ = self.q_proj(hidden_states)
++        k, _ = self.k_proj(hidden_states)
++        v, _ = self.v_proj(hidden_states)
++        r, _ = self.r_proj(hidden_states)
++
++        if self.k_sconv is not None:
++            k, new_conv_states["k_sconv"] = self.k_sconv(
++                k, conv_states["k_sconv"], cu_seqlens, forward_batch.forward_mode
++            )
++            v, new_conv_states["v_sconv"] = self.v_sconv(
++                v, conv_states["v_sconv"], cu_seqlens, forward_batch.forward_mode
++            )
++
++        q = q.reshape(
++            tokens,
++            self.q_head_num,
++            self.head_dim,
++            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
++        )
++        k = k.reshape(
++            tokens,
++            self.kv_head_num,
++            self.head_dim,
++            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
++        )
++        v = v.reshape(
++            tokens,
++            self.kv_head_num,
++            self.head_dim,
++            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
++        )
++
++        q = self.q_norm(q)
++        k = self.k_norm(k)
++
++        position_bias = self.rel_logits_proj(r.reshape(tokens, self.q_head_num, self.d_rel))
++
++        tau = None
++        if not self.is_local:
++            tau = log_scaling(positions, self.log_scaling_n_floor, self.log_scaling_alpha)
++        if tau is not None:
++            scale = tau[:, None, None]
++            q = (q.astype(jnp.float32) * scale).astype(q.dtype)
++            position_bias = (position_bias.astype(jnp.float32) * scale).astype(position_bias.dtype)
++
++        backend = forward_batch.attn_backend
++        if not getattr(backend, "supports_position_bias", False):
++            raise NotImplementedError(
++                f"{type(backend).__name__} drops the position_bias kwarg, and Inkling's "
++                "logits carry a learned relative bias instead of a rotary table. Serve it "
++                "with an attention backend that reads the kwarg."
++            )
++
++        attn_output, kv_fused = self.attn(
++            q,
++            k,
++            v,
++            forward_batch,
++            token_to_kv_pool,
++            position_bias=position_bias,
++        )
++
++        output, _ = self.o_proj(attn_output)
++        return output, kv_fused, new_conv_states
++
++
++class InklingMLP(nnx.Module):
++    """The dense MLP, with the trained output scalar the checkpoint carries."""
++
++    def __init__(
++        self,
++        hidden_size: int,
++        intermediate_size: int,
++        mesh: jax.sharding.Mesh,
++        layer_id: int = 0,
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        self.layer_id = layer_id
++        self.gate_proj = LinearBase(
++            input_size=hidden_size,
++            output_size=intermediate_size,
++            kernel_axes=(None, "tensor"),
++            use_bias=False,
++            params_dtype=dtype,
++            mesh=mesh,
++            scope_name="gate_proj",
++        )
++        self.up_proj = LinearBase(
++            input_size=hidden_size,
++            output_size=intermediate_size,
++            kernel_axes=(None, "tensor"),
++            use_bias=False,
++            params_dtype=dtype,
++            mesh=mesh,
++            scope_name="up_proj",
++        )
++        self.down_proj = LinearBase(
++            input_size=intermediate_size,
++            output_size=hidden_size,
++            kernel_axes=("tensor", None),
++            use_bias=False,
++            params_dtype=dtype,
++            mesh=mesh,
++            scope_name="down_proj",
++        )
++        self.global_scale = nnx.Param(jnp.ones((1,), dtype=dtype, out_sharding=P(None)))
++
++    @named_scope
++    def __call__(self, hidden_states: jax.Array) -> jax.Array:
++        gate, _ = self.gate_proj(hidden_states)
++        up, _ = self.up_proj(hidden_states)
++        output, _ = self.down_proj(jax.nn.silu(gate) * up)
++        return output * self.global_scale.value.astype(output.dtype)
++
++
++class InklingTopkRouter(nnx.Module):
++    """The gate, with the shared experts sitting inside the normalization.
++
++    The gate emits one logit per routed expert and one per shared expert. The
++    routed logits pick the top k, and then the chosen routed logits and every
++    shared logit normalize together. A shared expert therefore takes weight away
++    from the routed ones, which is what `shared_expert_sink` means.
++    """
++
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        mesh: jax.sharding.Mesh,
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        self.num_experts = int(config.n_routed_experts)
++        self.n_shared_experts = int(config.n_shared_experts)
++        self.top_k = int(config.num_experts_per_tok)
++        self.route_scale = float(getattr(config, "route_scale", 1.0))
++        self.shared_expert_sink = bool(getattr(config, "shared_expert_sink", True))
++        self.mesh = mesh
++
++        total = self.num_experts + (self.n_shared_experts if self.shared_expert_sink else 0)
++        self.total_experts = total
++        self.gate = GateLogit(
++            input_size=int(config.hidden_size),
++            num_experts=total,
++            weight_dtype=dtype,
++            kernel_dtype=jnp.float32,
++            compute_dtype=jnp.float32,
++            score_func=None,
++        )
++        self.bias = nnx.Param(
++            jnp.zeros((self.num_experts,), dtype=jnp.float32, out_sharding=P(None))
++        )
++        self.global_scale = nnx.Param(jnp.ones((1,), dtype=jnp.float32, out_sharding=P(None)))
++
++    @named_scope
++    def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
++        logits = self.gate(hidden_states)
++        if isinstance(logits, tuple):
++            logits = logits[0]
++        logits = logits.astype(jnp.float32)
++
++        routed_logits = logits[:, : self.num_experts]
++        scores = jax.nn.sigmoid(routed_logits) + self.bias.value
++        topk_ids = jax.lax.top_k(scores, self.top_k)[1].astype(jnp.int32)
++
++        chosen = jnp.take_along_axis(routed_logits, topk_ids, axis=-1)
++        if self.shared_expert_sink:
++            shared_logits = logits[:, self.num_experts :]
++            chosen = jnp.concatenate([chosen, shared_logits], axis=-1)
++
++        log_probs = jax.nn.log_sigmoid(chosen)
++        weights = jnp.exp(log_probs - jax.nn.logsumexp(log_probs, axis=-1, keepdims=True))
++        weights = weights * self.route_scale * self.global_scale.value
++
++        shared_gammas = weights[:, self.top_k :]
++        topk_weights = weights[:, : self.top_k]
++        return topk_weights, topk_ids, shared_gammas
++
++
++class InklingSharedExperts(nnx.Module):
++    """The always-on experts, gated by the weights the router hands them."""
++
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        mesh: jax.sharding.Mesh,
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        self.n_shared_experts = int(config.n_shared_experts)
++        self.mesh = mesh
++        hidden_size = int(config.hidden_size)
++        intermediate = moe_intermediate_size(config)
++        self.hidden_size = hidden_size
++        self.intermediate = intermediate
++        shape_in = (self.n_shared_experts, hidden_size, intermediate)
++        shape_out = (self.n_shared_experts, intermediate, hidden_size)
++        self.gate_proj = nnx.Param(
++            jnp.zeros(shape_in, dtype=dtype, out_sharding=P(None, None, "tensor"))
++        )
++        self.up_proj = nnx.Param(
++            jnp.zeros(shape_in, dtype=dtype, out_sharding=P(None, None, "tensor"))
++        )
++        self.down_proj = nnx.Param(
++            jnp.zeros(shape_out, dtype=dtype, out_sharding=P(None, "tensor", None))
++        )
++
++    @named_scope
++    def __call__(self, hidden_states: jax.Array, gammas: jax.Array) -> jax.Array:
++        gate = jnp.einsum(
++            "td,sdi->sti",
++            hidden_states,
++            self.gate_proj.value.astype(hidden_states.dtype),
++            out_sharding=NamedSharding(self.mesh, P(None, "data", "tensor")),
++        )
++        up = jnp.einsum(
++            "td,sdi->sti",
++            hidden_states,
++            self.up_proj.value.astype(hidden_states.dtype),
++            out_sharding=NamedSharding(self.mesh, P(None, "data", "tensor")),
++        )
++        activated = jax.nn.silu(gate) * up * gammas.T[:, :, None].astype(gate.dtype)
++        down = jnp.einsum(
++            "sti,sid->std",
++            activated,
++            self.down_proj.value.astype(activated.dtype),
++            out_sharding=NamedSharding(self.mesh, P(None, "data", None)),
++        )
++        return down.astype(jnp.float32).sum(axis=0).astype(hidden_states.dtype)
++
++
++class InklingMoE(nnx.Module):
++    """Router, routed experts and shared experts."""
++
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        mesh: jax.sharding.Mesh,
++        layer_id: int = 0,
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        self.layer_id = layer_id
++        self.mesh = mesh
++        self.router = InklingTopkRouter(config, mesh=mesh, dtype=dtype)
++        self.experts = EPMoE(
++            hidden_size=int(config.hidden_size),
++            num_experts=int(config.n_routed_experts),
++            num_experts_per_tok=int(config.num_experts_per_tok),
++            intermediate_dim=moe_intermediate_size(config),
++            mesh=mesh,
++            ep_size=int(getattr(config, "ep_size", 1)),
++            weight_dtype=dtype,
++            dtype=dtype,
++            activation="silu",
++            layer_id=layer_id,
++            quantization_config=getattr(config, "quantization_config", None),
++            moe_dp_size=int(getattr(config, "moe_dp_size", 1)),
++        )
++        self.shared_experts = (
++            InklingSharedExperts(config, mesh=mesh, dtype=dtype)
++            if int(config.n_shared_experts) > 0
++            else None
++        )
++
++    @named_scope
++    def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array]:
++        topk_weights, topk_ids, shared_gammas = self.router(hidden_states)
++        output = self.experts(hidden_states, topk_weights, topk_ids)
++        if self.shared_experts is not None:
++            output = output + self.shared_experts(hidden_states, shared_gammas)
++        return output, jax.sharding.reshard(topk_ids, P(None))
++
++
++class InklingDecoderLayer(nnx.Module):
++    """One layer: attention then MLP, each followed by its own convolution."""
++
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        mesh: jax.sharding.Mesh,
++        layer_id: int = 0,
++        dtype: jnp.dtype = jnp.bfloat16,
++        force_dense_mlp: bool = False,
++    ):
++        self.layer_id = layer_id
++        self.mesh = mesh
++        hidden_size = int(config.hidden_size)
++        rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
++
++        self.self_attn = InklingAttention(config, layer_id, mesh=mesh, dtype=dtype)
++        self.is_moe = (not force_dense_mlp) and is_moe_layer(config, layer_id)
++        if self.is_moe:
++            self.mlp = InklingMoE(config, mesh=mesh, layer_id=layer_id, dtype=dtype)
++        else:
++            self.mlp = InklingMLP(
++                hidden_size=hidden_size,
++                intermediate_size=int(
++                    getattr(config, "dense_intermediate_size", config.intermediate_size)
++                ),
++                mesh=mesh,
++                layer_id=layer_id,
++                dtype=dtype,
++            )
++
++        self.input_layernorm = RMSNorm(
++            hidden_size, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="input_layernorm"
++        )
++        self.post_attention_layernorm = RMSNorm(
++            hidden_size,
++            epsilon=rms_norm_eps,
++            param_dtype=dtype,
++            scope_name="post_attention_layernorm",
++        )
++
++        kernel = sconv_kernel_size(config)
++        if kernel:
++            self.attn_sconv = InklingShortConvolution(hidden_size, kernel, mesh=mesh, dtype=dtype)
++            self.mlp_sconv = InklingShortConvolution(hidden_size, kernel, mesh=mesh, dtype=dtype)
++        else:
++            self.attn_sconv = None
++            self.mlp_sconv = None
++
++    def __call__(
++        self,
++        positions: jax.Array,
++        hidden_states: jax.Array,
++        forward_batch: ForwardBatch,
++        token_to_kv_pool: KVCache,
++        conv_states: dict[str, jax.Array],
++        cu_seqlens: jax.Array | None,
++    ):
++        layer_callback_flag = []
++        new_conv_states = {}
++
++        residual = hidden_states
++        hidden_states = self.input_layernorm(hidden_states)
++        layer_callback_flag.append(
++            precision_tracer.jit_pure_callback_record(
++                hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", self.layer_id
++            )
++        )
++
++        hidden_states, kv_fused, attn_conv_states = self.self_attn(
++            positions=positions,
++            hidden_states=hidden_states,
++            forward_batch=forward_batch,
++            token_to_kv_pool=token_to_kv_pool,
++            conv_states=conv_states,
++            cu_seqlens=cu_seqlens,
++        )
++        new_conv_states.update(attn_conv_states)
++
++        if self.attn_sconv is not None:
++            hidden_states, new_conv_states["attn_sconv"] = self.attn_sconv(
++                hidden_states,
++                conv_states["attn_sconv"],
++                cu_seqlens,
++                forward_batch.forward_mode,
++            )
++        layer_callback_flag.append(
++            precision_tracer.jit_pure_callback_record(
++                hidden_states, "self_attn_output", "SELF_ATTN", self.layer_id
++            )
++        )
++        hidden_states = residual + hidden_states
++
++        residual = hidden_states
++        hidden_states = self.post_attention_layernorm(hidden_states)
++        topk_ids = None
++        if self.is_moe:
++            hidden_states, topk_ids = self.mlp(hidden_states)
++        else:
++            hidden_states = self.mlp(hidden_states)
++
++        if self.mlp_sconv is not None:
++            hidden_states, new_conv_states["mlp_sconv"] = self.mlp_sconv(
++                hidden_states,
++                conv_states["mlp_sconv"],
++                cu_seqlens,
++                forward_batch.forward_mode,
++            )
++        layer_callback_flag.append(
++            precision_tracer.jit_pure_callback_record(
++                hidden_states, "mlp_output", "MLP", self.layer_id
++            )
++        )
++        hidden_states = residual + hidden_states
++
++        return hidden_states, kv_fused, new_conv_states, layer_callback_flag, topk_ids
++
++
++class InklingTextModel(nnx.Module):
++    """Embedding, the layer stack and the final norm."""
++
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        mesh: jax.sharding.Mesh,
++        dtype: jnp.dtype = jnp.bfloat16,
++        num_layers: int | None = None,
++    ):
++        self.config = config
++        self.mesh = mesh
++        self.hidden_size = int(config.hidden_size)
++        rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
++
++        self.embed_tokens = Embed(
++            num_embeddings=int(config.vocab_size),
++            features=self.hidden_size,
++            dtype=dtype,
++            kernel_axes=("tensor", None),
++            param_dtype=dtype,
++            mesh=mesh,
++        )
++        self.embed_norm = RMSNorm(
++            self.hidden_size, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="embed_norm"
++        )
++
++        count = int(config.num_hidden_layers) if num_layers is None else num_layers
++        self.layers = nnx.data(
++            [
++                InklingDecoderLayer(config=config, mesh=mesh, layer_id=i, dtype=dtype)
++                for i in range(count)
++            ]
++        )
++        self.norm = RMSNorm(
++            self.hidden_size, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="norm"
++        )
++
++        self.sconv_state_tokens = max(sconv_kernel_size(config) - 1, 0)
++        self.layers_to_capture = []
++
++    def read_layer_windows(
++        self,
++        layer_id: int,
++        conv_pool,
++        indices: jax.Array | None,
++        keep: jax.Array | None,
++    ) -> dict[str, jax.Array]:
++        """This layer's windows for every row of the batch, `[batch, channels, tokens]`.
++
++        Rows that start a sequence get zeros, whatever their slot held.
++        """
++        if conv_pool is None:
++            return {}
++        windows = {}
++        for name, buffer in conv_pool.layer(layer_id).items():
++            rows = read_windows(buffer, indices, self.mesh)
++            if keep is not None:
++                rows = jnp.where(keep[:, None, None], rows, jnp.zeros((), rows.dtype))
++            windows[name] = rows
++        return windows
++
++    def write_layer_windows(
++        self,
++        layer_id: int,
++        conv_pool,
++        indices: jax.Array,
++        windows: dict[str, jax.Array],
++    ) -> dict[str, jax.Array]:
++        """The layer's pool buffers with each row's new window in its slot."""
++        buffers = {}
++        for name, buffer in conv_pool.layer(layer_id).items():
++            if name not in windows:
++                # A layer built without this convolution leaves its slot alone.
++                buffers[name] = buffer
++                continue
++            spec = window_spec(buffer.shape[1], self.mesh)
++            rows = jax.sharding.reshard(windows[name], spec)
++            buffers[name] = write_windows(buffer, indices, rows, self.mesh)
++        return buffers
++
++    def __call__(
++        self,
++        forward_batch: ForwardBatch,
++        token_to_kv_pool: KVCache,
++        conv_pool=None,
++        positions: jax.Array | None = None,
++        input_embeds: jax.Array | None = None,
++    ):
++        """Run the stack.
++
++        `conv_pool` is the engine's `ShortConvStatePool`, addressed by
++        `forward_batch.recurrent_indices`. The caller passes None only when the
++        config turns the convolutions off.
++        """
++        if input_embeds is not None:
++            # Already in the decoder's space. The MTP head arrives here.
++            hidden_states = input_embeds
++        else:
++            hidden_states = (
++                self.embed_tokens(forward_batch.input_ids)
++                if forward_batch.input_embedding is None
++                else forward_batch.input_embedding
++            )
++            hidden_states = self.embed_norm(hidden_states)
++
++        positions = forward_batch.positions if positions is None else positions
++        cu_seqlens = cumulative_sequence_lengths(forward_batch)
++        indices = forward_batch.recurrent_indices if conv_pool is not None else None
++        keep = window_keep(forward_batch) if conv_pool is not None else None
++
++        layers_kv_fused = []
++        layers_conv_buffers = []
++        layers_callback_flag = []
++        layers_topk_ids = []
++        aux_hidden_states = []
++
++        for layer_id, layer in enumerate(self.layers):
++            if layer_id in self.layers_to_capture:
++                aux_hidden_states.append(hidden_states)
++            conv_states = self.read_layer_windows(layer_id, conv_pool, indices, keep)
++            hidden_states, kv_fused, new_conv_states, callback_flag, topk_ids = layer(
++                positions,
++                hidden_states,
++                forward_batch,
++                token_to_kv_pool,
++                conv_states,
++                cu_seqlens,
++            )
++            layers_kv_fused.append(kv_fused)
++            if conv_pool is not None:
++                layers_conv_buffers.append(
++                    self.write_layer_windows(layer_id, conv_pool, indices, new_conv_states)
++                )
++            layers_callback_flag.extend(callback_flag)
++            layers_topk_ids.append(topk_ids)
++
++        hidden_states = self.norm(hidden_states)
++        layers_callback_flag.append(
++            precision_tracer.jit_pure_callback_record(
++                hidden_states, "transformer_output", "TRANSFORMER"
++            )
++        )
++        return (
++            hidden_states,
++            aux_hidden_states,
++            layers_kv_fused,
++            layers_conv_buffers,
++            layers_callback_flag,
++            layers_topk_ids,
++        )
++
++
++def decoder_layer_mappings(
++    source_prefix: str,
++    target_prefix: str,
++    config: PretrainedConfig,
++    layer_id: int,
++    is_moe: bool,
++) -> dict:
++    """Checkpoint keys of one decoder layer, minus the stacked expert tensors.
++
++    The stacked tensors (`w13_dn`, `w13_weight`, `w2_weight`, the shared pair)
++    hold two or more targets inside one array, so `load_stacked_weights` reads
++    them directly.
++    """
++    mappings = {
++        f"{source_prefix}.attn_norm.weight": WeightMapping(
++            target_path=f"{target_prefix}.input_layernorm.scale",
++            sharding=(None,),
++            transpose=False,
++        ),
++        f"{source_prefix}.mlp_norm.weight": WeightMapping(
++            target_path=f"{target_prefix}.post_attention_layernorm.scale",
++            sharding=(None,),
++            transpose=False,
++        ),
++        f"{source_prefix}.attn.wq_du.weight": WeightMapping(
++            target_path=f"{target_prefix}.self_attn.q_proj.weight",
++            sharding=(None, "tensor"),
++            transpose=True,
++        ),
++        # `kv_head_padding` replicates the checkpoint's KV heads when tensor
++        # parallel runs wider than the layer's own count. Inkling runs 8 global
++        # and 16 local, so both kinds need it past their own width, and
++        # `swa_head_dim` is what tells the loader which of the two a tensor is.
++        f"{source_prefix}.attn.wk_dv.weight": WeightMapping(
++            target_path=f"{target_prefix}.self_attn.k_proj.weight",
++            sharding=(None, "tensor"),
++            transpose=True,
++            kv_head_padding=True,
++        ),
++        f"{source_prefix}.attn.wv_dv.weight": WeightMapping(
++            target_path=f"{target_prefix}.self_attn.v_proj.weight",
++            sharding=(None, "tensor"),
++            transpose=True,
++            kv_head_padding=True,
++        ),
++        f"{source_prefix}.attn.wr_du.weight": WeightMapping(
++            target_path=f"{target_prefix}.self_attn.r_proj.weight",
++            sharding=(None, "tensor"),
++            transpose=True,
++        ),
++        f"{source_prefix}.attn.wo_ud.weight": WeightMapping(
++            target_path=f"{target_prefix}.self_attn.o_proj.weight",
++            sharding=("tensor", None),
++            transpose=True,
++        ),
++        f"{source_prefix}.attn.q_norm.weight": WeightMapping(
++            target_path=f"{target_prefix}.self_attn.q_norm.scale",
++            sharding=(None,),
++            transpose=False,
++        ),
++        f"{source_prefix}.attn.k_norm.weight": WeightMapping(
++            target_path=f"{target_prefix}.self_attn.k_norm.scale",
++            sharding=(None,),
++            transpose=False,
++        ),
++        f"{source_prefix}.attn.rel_logits_proj.proj": WeightMapping(
++            target_path=f"{target_prefix}.self_attn.rel_logits_proj.proj",
++            sharding=(None, None),
++            transpose=False,
++        ),
++    }
++
++    if sconv_kernel_size(config):
++        for source_name, target_name in (
++            ("attn.k_sconv", "self_attn.k_sconv"),
++            ("attn.v_sconv", "self_attn.v_sconv"),
++            ("attn_sconv", "attn_sconv"),
++            ("mlp_sconv", "mlp_sconv"),
++        ):
++            mappings[f"{source_prefix}.{source_name}.weight"] = WeightMapping(
++                target_path=f"{target_prefix}.{target_name}.weight",
++                sharding=(None, None, None),
++                transpose=False,
++            )
++
++    if is_moe:
++        mappings[f"{source_prefix}.mlp.gate.weight"] = WeightMapping(
++            target_path=f"{target_prefix}.mlp.router.gate.kernel",
++            sharding=(None, None),
++            transpose=True,
++        )
++        mappings[f"{source_prefix}.mlp.gate.bias"] = WeightMapping(
++            target_path=f"{target_prefix}.mlp.router.bias",
++            sharding=(None,),
++            transpose=False,
++        )
++        mappings[f"{source_prefix}.mlp.gate.global_scale"] = WeightMapping(
++            target_path=f"{target_prefix}.mlp.router.global_scale",
++            sharding=(None,),
++            transpose=False,
++        )
++    else:
++        mappings[f"{source_prefix}.mlp.global_scale"] = WeightMapping(
++            target_path=f"{target_prefix}.mlp.global_scale",
++            sharding=(None,),
++            transpose=False,
++        )
++
++    return mappings
++
++
++def split_gate_up(fused: np.ndarray, axis: int) -> tuple[np.ndarray, np.ndarray]:
++    """Split a fused gate/up tensor into its gate and up halves along `axis`.
++
++    The published checkpoint interleaves the two: gate on the even rows, up on
++    the odd ones. `transformers` reads it the same way, through `Interleave` in
++    its Inkling conversion mapping, and `save_pretrained` writes it back so.
++    """
++    rows = np.moveaxis(fused, axis, 0)
++    return np.moveaxis(rows[0::2], 0, axis), np.moveaxis(rows[1::2], 0, axis)
++
++
++def mask_padded_vocab(logits: jax.Array, unpadded: int | None) -> jax.Array:
++    """Push the head rows the checkpoint pads out to a round vocabulary to the floor."""
++    if unpadded is None or unpadded >= logits.shape[-1]:
++        return logits
++    floor = jnp.finfo(logits.dtype).min
++    keep = jnp.arange(logits.shape[-1]) < unpadded
++    return jnp.where(keep, logits, floor)
++
++
++class InklingLogitsProcessor(LogitsProcessor):
++    """`LogitsProcessor` that drops the head rows past `unpadded_vocab_size`.
++
++    The mask sits on the logits every output reads, so the prompt logprobs and
++    their top-k normalize over the real vocabulary, as the sampled token does.
++    """
++
++    def __init__(self, vocab_size: int, mesh, *, unpadded_vocab_size: int | None, **kwargs):
++        super().__init__(vocab_size, mesh, **kwargs)
++        self.unpadded_vocab_size = unpadded_vocab_size
++
++    def _get_logits(self, hidden_states, lm_head, *, preserve_vocab_sharding: bool = False):
++        logits = super()._get_logits(
++            hidden_states, lm_head, preserve_vocab_sharding=preserve_vocab_sharding
++        )
++        return mask_padded_vocab(logits, self.unpadded_vocab_size)
++
++
++class InklingForCausalLM(nnx.Module):
++    """The text decoder, with the language modeling head."""
++
++    source_root = "model.llm"
++
++    @classmethod
++    def check_server_args(cls, server_args, model_config: ModelConfig) -> None:
++        """Refuse the flags Inkling can't serve, before any weight loads.
++
++        `ModelWorker` calls this before it builds the runner, so a launch
++        without the flags stops in seconds rather than after it reads the
++        checkpoint. The model, the runner and the first forward check again, for
++        a path that skips the worker.
++        """
++        problems = []
++        if server_args.dp_size > 1:
++            problems.append(
++                f"--dp-size {server_args.dp_size} splits the batch into per-rank sections, "
++                "and the short convolutions and the relative bias read it as one packed "
++                "token list; serve with --dp-size 1"
++            )
++        # Only the native backend reads the bias. On CPU the runner builds it for fa
++        # and fa_mha too, but the flag has to name it, so one rule holds on every
++        # device and this check doesn't copy the runner's fallback.
++        if server_args.attention_backend != "native":
++            problems.append(
++                f"--attention-backend {server_args.attention_backend} doesn't read the learned "
++                "relative bias the logits carry in place of a rotary table; serve with "
++                "--attention-backend native"
++            )
++        # EPLB sizes the experts and routes through a map of physical slots. This
++        # router picks logical experts with its own top-k, and the loader fills
++        # one slot per expert, so the three flags would change nothing.
++        eplb = [
++            flag
++            for flag, is_set in (
++                ("--ep-dispatch-algorithm", server_args.ep_dispatch_algorithm is not None),
++                ("--ep-num-redundant-experts", server_args.ep_num_redundant_experts != 0),
++                ("--init-expert-location", server_args.init_expert_location != "trivial"),
++            )
++            if is_set
++        ]
++        if eplb:
++            problems.append(
++                f"{', '.join(eplb)} place experts through a map Inkling's router never reads; "
++                "serve without them"
++            )
++        # The runner builds a window pool whenever conv_state_spec() isn't empty,
++        # so the same test decides here.
++        hf_config = model_config.hf_config
++        if sconv_kernel_size(getattr(hf_config, "text_config", None) or hf_config):
++            problems += conv_state_serving_problems(server_args)
++        if problems:
++            raise ValueError(
++                f"{cls.__name__} can't serve with these flags: " + "; ".join(problems) + "."
++            )
++
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        mesh: jax.sharding.Mesh,
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        if mesh.shape.get("data", 1) > 1:
++            raise ValueError(
++                f"Inkling serves with --dp-size 1, and this mesh has data={mesh.shape['data']}. "
++                "Its short convolutions and relative bias read the batch as one packed "
++                "token list, and data parallelism splits it into per-rank sections."
++            )
++        self.mesh = mesh
++        self.config = text_config(config)
++        self.dtype = dtype
++        logger.info("InklingForCausalLM config dtype: %s", self.dtype)
++
++        unpadded = getattr(self.config, "unpadded_vocab_size", None)
++        self.unpadded_vocab_size = int(unpadded) if unpadded else None
++        self.model = InklingTextModel(self.config, mesh=mesh, dtype=dtype)
++        self.lm_head = ParallelLMHead(
++            int(self.config.vocab_size),
++            int(self.config.hidden_size),
++            dtype=dtype,
++            param_dtype=dtype,
++            mesh=mesh,
++            enable_dp_lm_head=getattr(self.config, "enable_dp_lm_head", False),
++        )
++        self.logits_processor = InklingLogitsProcessor(
++            int(self.config.vocab_size),
++            mesh,
++            unpadded_vocab_size=self.unpadded_vocab_size,
++            soft_cap=getattr(self.config, "final_logit_softcapping", None) or 0.0,
++            enable_dp_lm_head=getattr(self.config, "enable_dp_lm_head", False),
++        )
++
++        self.mup_width_multiplier = float(
++            getattr(self.config, "logits_mup_width_multiplier", 1.0) or 1.0
++        )
++        self.capture_aux_hidden_states = False
++
++    # --- what the cache manager holds --------------------------------------
++
++    def get_conv_state_spec(self) -> list[list[tuple[str, int, int]]]:
++        """Per-layer conv state, as `(name, channels, tokens)`."""
++        return conv_state_spec(self.config)
++
++    # --- capture -----------------------------------------------------------
++
++    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
++        self.capture_aux_hidden_states = True
++        if layer_ids is None:
++            num_layers = int(self.config.num_hidden_layers)
++            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
++        else:
++            self.model.layers_to_capture = [val + 1 for val in layer_ids]
++
++    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
++        if layer_ids is None:
++            raise ValueError("DFLASH requires explicit target layer ids.")
++        self.capture_aux_hidden_states = True
++        self.model.layers_to_capture = [val + 1 for val in layer_ids]
++
++    # --- forward -----------------------------------------------------------
++
++    def __call__(
++        self,
++        forward_batch: ForwardBatch,
++        memory_pools: Any,
++        logits_metadata: LogitsMetadata,
++        input_embeds: jax.Array | None = None,
++    ):
++        kv_pool = memory_pools.token_to_kv_pool
++        conv_pool = self.conv_pool(memory_pools, forward_batch)
++        (
++            hidden_states,
++            aux_hidden_states,
++            layers_kv_fused,
++            layers_conv_buffers,
++            layers_callback_flag,
++            layers_topk_ids,
++        ) = self.model(forward_batch, kv_pool, conv_pool, input_embeds=input_embeds)
++
++        if not self.capture_aux_hidden_states:
++            aux_hidden_states = None
++
++        hidden_states = hidden_states / self.mup_width_multiplier
++        output = self.logits_processor(
++            hidden_states, self.lm_head, logits_metadata, aux_hidden_states=aux_hidden_states
++        )
++
++        updates = {"token_to_kv_pool": layers_kv_fused}
++        if conv_pool is not None:
++            updates[CONV_POOL_KEY] = layers_conv_buffers
++        return output, updates, layers_callback_flag, layers_topk_ids
++
++    def conv_pool(self, memory_pools: Any, forward_batch: ForwardBatch):
++        """The engine's `ShortConvStatePool`, or None when the convolutions are off.
++
++        Every step reads the windows the request's previous step left: a decode
++        step, a later chunk of a chunked prompt, a decode row mixed into a
++        prefill. A step handed no pool would restart them from zeros and serve
++        logits computed on a truncated history, so it raises instead.
++        """
++        if not self.model.sconv_state_tokens:
++            return None
++        pool = getattr(memory_pools, CONV_POOL_KEY, None)
++        if pool is None:
++            raise ValueError(
++                f"memory_pools carries no '{CONV_POOL_KEY}'. Inkling holds four short "
++                "convolutions per layer, and each step reads the windows the request's "
++                "previous step left. ModelRunner builds a ShortConvStatePool for a model "
++                "that reports get_conv_state_spec()."
++            )
++        if forward_batch.recurrent_indices is None:
++            raise ValueError(
++                f"the batch carries no recurrent_indices, the per-request slots "
++                f"'{CONV_POOL_KEY}' is addressed by. The scheduler sets them when the "
++                "request pool is a HybridReqToTokenPool, which ModelRunner builds beside "
++                "the ShortConvStatePool."
++            )
++        return pool
++
++    # --- weights -----------------------------------------------------------
++
++    def load_weights(self, model_config: ModelConfig):
++        loader = WeightLoader(
++            model=self,
++            model_config=model_config,
++            mesh=self.mesh,
++            dtype=self.dtype,
++        )
++        if loader.dummy_mode:
++            self.place_dummy_experts(loader)
++        loader.load_weights_from_safetensors(self.create_weight_mappings())
++        if not loader.dummy_mode:
++            self.load_stacked_weights(loader)
++        self.widen_kv_convolutions()
++        logger.info("Inkling weights loaded successfully!")
++
++    def widen_kv_convolutions(self) -> None:
++        """Repeat the k and v convolution rows out to the replicated KV width.
++
++        Past a layer's own KV head count, `configure_for_tensor_parallel`
++        raises the head count to the tensor-parallel width, and `kv_head_padding`
++        repeats each checkpoint head of `wk_dv` and `wv_dv` in place. The layer
++        builds `k_sconv` and `v_sconv` at that width too, so their rows repeat
++        the same way, one head's `head_dim` rows at a time. The mapping table
++        reads them at the checkpoint's width.
++        """
++        for layer in self.model.layers:
++            attention = layer.self_attn
++            for conv in (attention.k_sconv, attention.v_sconv):
++                if conv is None:
++                    continue
++                loaded = conv.weight.value.shape[0]
++                if loaded == conv.channels:
++                    continue
++                head_dim = attention.head_dim
++                if conv.channels % loaded or loaded % head_dim:
++                    raise ValueError(
++                        f"layer {attention.layer_id} builds its k and v convolutions "
++                        f"{conv.channels} wide, and the checkpoint holds {loaded}. That "
++                        f"isn't a whole number of {head_dim}-wide heads repeated."
++                    )
++                weight = np.asarray(jax.device_get(conv.weight.value))
++                heads = weight.reshape(loaded // head_dim, head_dim, *weight.shape[1:])
++                widened = np.repeat(heads, conv.channels // loaded, axis=0)
++                conv.weight.value = self.put(
++                    widened.reshape(conv.channels, *weight.shape[1:]), P(None, None, None)
++                )
++
++    def put(self, array: np.ndarray, spec: P) -> jax.Array:
++        """A host array placed straight into its target sharding.
++
++        `load_weights` runs outside the mesh, where `jnp.asarray` would land
++        the whole array on device 0, and every forward would then copy it back
++        out to the layout the executable wants. Here each device receives only
++        its own block.
++        """
++        array = np.ascontiguousarray(array.astype(jax.dtypes.canonicalize_dtype(self.dtype)))
++        return jax.make_array_from_callback(
++            array.shape, NamedSharding(self.mesh, spec), lambda index: array[index]
++        )
++
++    def create_weight_mappings(self) -> dict:
++        root = self.source_root
++        mappings = {
++            f"{root}.embed.weight": WeightMapping(
++                target_path="model.embed_tokens.embedding",
++                sharding=("tensor", None),
++                transpose=False,
++            ),
++            f"{root}.embed_norm.weight": WeightMapping(
++                target_path="model.embed_norm.scale", sharding=(None,), transpose=False
++            ),
++            f"{root}.norm.weight": WeightMapping(
++                target_path="model.norm.scale", sharding=(None,), transpose=False
++            ),
++            f"{root}.unembed.weight": WeightMapping(
++                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
++            ),
++        }
++        for layer_id in range(int(self.config.num_hidden_layers)):
++            mappings.update(
++                decoder_layer_mappings(
++                    f"{root}.layers.{layer_id}",
++                    f"model.layers.{layer_id}",
++                    self.config,
++                    layer_id,
++                    is_moe_layer(self.config, layer_id),
++                )
++            )
++        return mappings
++
++    def load_stacked_weights(self, loader: WeightLoader):
++        """Read the tensors that hold more than one target.
++
++        The dense MLP fuses gate and up into `w13_dn`. The experts stack every
++        expert into one array, and the shared experts stack the shared pair.
++        """
++        weight_info = loader._scan_weight_info()
++        for layer_id, layer in enumerate(self.model.layers):
++            prefix = f"{self.source_root}.layers.{layer_id}.mlp"
++            if layer.is_moe:
++                self.load_expert_weights(layer, prefix, weight_info)
++            else:
++                self.load_dense_mlp_weights(layer, prefix, weight_info)
++
++    def tensor_file(self, weight_info: dict, key: str) -> str:
++        """The safetensors file holding `key`.
++
++        Six families of stacked tensor carry nearly all the parameter bytes and
++        none of them goes through the mapping table, so a missing one has to
++        stop the load rather than leave a zeroed array behind.
++        """
++        if key not in weight_info:
++            raise ValueError(
++                f"{key} is missing from the checkpoint. It holds more than one "
++                "target, so the mapping table never reads it and the parameters "
++                "it fills would stay at their initial values."
++            )
++        return weight_info[key][0]["file"]
++
++    def read_tensor(self, weight_info: dict, key: str) -> np.ndarray:
++        path = self.tensor_file(weight_info, key)
++        with safetensors.safe_open(path, framework="np", device="cpu") as handle:
++            return handle.get_tensor(key)
++
++    def tensor_shape(self, weight_info: dict, key: str) -> tuple[int, ...]:
++        """The shape in the file header, without reading the tensor."""
++        path = self.tensor_file(weight_info, key)
++        with safetensors.safe_open(path, framework="np", device="cpu") as handle:
++            return tuple(handle.get_slice(key).get_shape())
++
++    def load_dense_mlp_weights(self, layer, prefix: str, weight_info: dict):
++        fused = self.read_tensor(weight_info, f"{prefix}.w13_dn.weight")
++        gate, up = split_gate_up(fused, axis=0)
++        layer.mlp.gate_proj.weight.value = self.put(gate.T, P(None, "tensor"))
++        layer.mlp.up_proj.weight.value = self.put(up.T, P(None, "tensor"))
++        down = self.read_tensor(weight_info, f"{prefix}.w2_md.weight")
++        layer.mlp.down_proj.weight.value = self.put(down.T, P("tensor", None))
++
++    def stacked_expert_array(
++        self,
++        weight_info: dict,
++        key: str,
++        sharding: NamedSharding,
++    ) -> jax.Array:
++        """One stacked expert tensor, read straight into its target sharding.
++
++        The checkpoint stores `[experts, out, in]` and the kernel wants
++        `[experts, in, out]`. Each device pulls only the block it owns, so a
++        19 GB tensor never lands whole on one device and never lands in float32
++        on the way.
++        """
++        path = self.tensor_file(weight_info, key)
++        experts, out_rows, in_rows = self.tensor_shape(weight_info, key)
++        shape = (experts, in_rows, out_rows)
++
++        def fetch(index):
++            expert_slice, in_slice, out_slice = index
++            with safetensors.safe_open(path, framework="np", device="cpu") as handle:
++                block = handle.get_slice(key)[expert_slice, out_slice, in_slice]
++            return np.transpose(block, (0, 2, 1)).astype(
++                jax.dtypes.canonicalize_dtype(self.dtype)
++            )
++
++        return jax.make_array_from_callback(shape, sharding, fetch)
++
++    def load_routed_gate_up(
++        self, experts, weight_info: dict, key: str, sharding: NamedSharding
++    ) -> None:
++        """`wi_0` and `wi_1` out of one interleaved `[experts, 2 * width, hidden]` tensor.
++
++        Gate sits on the even rows of `w13_weight` and up on the odd ones. Each
++        device reads the file rows its block covers in one contiguous slice,
++        keeps its half and holds the other half back for the second array, so
++        each row comes off disk once. A safetensors slice with a step would
++        read fewer bytes, but the numpy reader in 0.6 drops the step and returns
++        the contiguous rows.
++        """
++        path = self.tensor_file(weight_info, key)
++        num_experts, fused_rows, hidden = self.tensor_shape(weight_info, key)
++        width = fused_rows // 2
++        shape = (num_experts, hidden, width)
++        dtype = jax.dtypes.canonicalize_dtype(self.dtype)
++        held = {}
++
++        def fetch(parity, index):
++            expert_part, hidden_part, width_part = index
++            e0, e1, _ = expert_part.indices(num_experts)
++            h0, h1, _ = hidden_part.indices(hidden)
++            w0, w1, _ = width_part.indices(width)
++            block_key = (e0, e1, h0, h1, w0, w1)
++            if parity == 1 and block_key in held:
++                return held.pop(block_key)
++            with safetensors.safe_open(path, framework="np", device="cpu") as handle:
++                block = handle.get_slice(key)[e0:e1, 2 * w0 : 2 * w1, h0:h1]
++            halves = [np.transpose(block[:, p::2, :], (0, 2, 1)).astype(dtype) for p in (0, 1)]
++            if parity == 0:
++                held[block_key] = halves[1]
++            return halves[parity]
++
++        experts.wi_0.value = jax.make_array_from_callback(shape, sharding, partial(fetch, 0))
++        experts.wi_1.value = jax.make_array_from_callback(shape, sharding, partial(fetch, 1))
++
++    @staticmethod
++    def expert_shardings(experts) -> tuple[NamedSharding, NamedSharding]:
++        """The layouts `EPMoE` declares for `wi_0`/`wi_1` and for `wo`.
++
++        Experts shard over the `expert` axis of `EPMoE`'s own mesh, unless
++        `--moe-dp-size` replicates them.
++        """
++        if getattr(experts, "replicate_experts", False):
++            wi, wo = P(None, None, "tensor"), P(None, "tensor", None)
++        else:
++            wi, wo = P("expert", None, "tensor"), P("expert", "tensor", None)
++        return NamedSharding(experts.moe_mesh, wi), NamedSharding(experts.moe_mesh, wo)
++
++    def load_expert_weights(self, layer, prefix: str, weight_info: dict):
++        experts = layer.mlp.experts
++        wi_sharding, wo_sharding = self.expert_shardings(experts)
++
++        fused_key = f"{prefix}.experts.w13_weight"
++        down_key = f"{prefix}.experts.w2_weight"
++        self.check_expert_width(self.tensor_shape(weight_info, fused_key)[1] // 2, fused_key)
++        self.load_routed_gate_up(experts, weight_info, fused_key, wi_sharding)
++        experts.wo.value = self.stacked_expert_array(weight_info, down_key, wo_sharding)
++
++        shared = layer.mlp.shared_experts
++        if shared is None:
++            return
++        shared_key = f"{prefix}.shared_experts.shared_w13_weight"
++        gate, up = split_gate_up(self.read_tensor(weight_info, shared_key), axis=1)
++        self.check_expert_width(gate.shape[1], shared_key)
++        shared.gate_proj.value = self.put(np.transpose(gate, (0, 2, 1)), P(None, None, "tensor"))
++        shared.up_proj.value = self.put(np.transpose(up, (0, 2, 1)), P(None, None, "tensor"))
++        down = self.read_tensor(weight_info, f"{prefix}.shared_experts.shared_w2_weight")
++        shared.down_proj.value = self.put(np.transpose(down, (0, 2, 1)), P(None, "tensor", None))
++
++    def place_dummy_experts(self, loader: WeightLoader) -> None:
++        """Put the routed experts on `EPMoE`'s mesh in dummy mode.
++
++        `load_weights` calls this before the loader's dummy pass. That pass fills
++        every parameter the mapping table misses, and it places them on the model
++        mesh and drops the `expert` axis the mesh doesn't carry. A stack it filled
++        would sit whole on every chip, 29.0 GB a layer on Inkling, and `EPMoE`'s
++        `shard_map` would refuse the layout on the first forward. A stack placed
++        here first is already an array, and the pass skips it.
++        """
++        for layer in self.model.layers:
++            if not layer.is_moe:
++                continue
++            experts = layer.mlp.experts
++            wi_sharding, wo_sharding = self.expert_shardings(experts)
++            for param, sharding in (
++                (experts.wi_0, wi_sharding),
++                (experts.wi_1, wi_sharding),
++                (experts.wo, wo_sharding),
++            ):
++                param.value = loader._dummy_array(param.value.shape, param.value.dtype, sharding)
++
++    def check_expert_width(self, width: int, key: str) -> None:
++        """The checkpoint's expert width has to match the one the config gave.
++
++        The published `config.json` writes the routed-expert width as
++        `intermediate_size` and the dense width as `dense_intermediate_size`.
++        A config class that moves the dense width onto `intermediate_size` and
++        leaves `moe_intermediate_size` at its class default hands this model a
++        width the checkpoint doesn't carry, and every expert GEMM then runs at
++        the wrong shape.
++        """
++        expected = moe_intermediate_size(self.config)
++        if width != expected:
++            raise ValueError(
++                f"{key} holds experts {width} wide, and the config says "
++                f"moe_intermediate_size={expected}. Serve this checkpoint with "
++                "a config that reports the published routed-expert width."
++            )
++
++    def get_embed_and_head(self):
++        return (self.model.embed_tokens.embedding.value, self.lm_head.embedding.value)
++
++    def set_embed_and_head(
++        self,
++        embed_weight: jax.Array | None = None,
++        head_weight: jax.Array | None = None,
++    ) -> None:
++        if embed_weight is not None:
++            self.model.embed_tokens.embedding.value = embed_weight
++        if head_weight is not None:
++            self.lm_head.embedding.value = head_weight
++
++
++class InklingForConditionalGeneration(InklingForCausalLM):
++    """Text serving of the published multimodal checkpoint.
++
++    The checkpoint carries a vision tower and an audio tower alongside the
++    decoder. This class serves the text path and leaves the tower weights on
++    disk.
++    """
++
++
++class InklingMTPForCausalLM(InklingForCausalLM):
++    """One layer of the multi-token-prediction head, served as a draft model.
++
++    `mtp_layer_idx` picks the layer. It norms the incoming hidden state and the
++    next token's embedding, concatenates them hidden-state first, projects back
++    to the hidden width, and runs one dense-MLP decoder layer. The layer shares
++    the decoder's final norm and unembedding.
++
++    `mtp_local_layer_ids` decides which layers of the head run the sliding
++    window, and the two kinds carry different KV head counts and different
++    relative extents. The published list is `[0, 2, 4, 5, 6, 7]` over eight
++    layers, so layers 1 and 3 run full attention.
++    """
++
++    source_root = "model.mtp"
++
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        mesh: jax.sharding.Mesh,
++        dtype: jnp.dtype = jnp.bfloat16,
++        mtp_layer_idx: int = 0,
++    ):
++        self.mtp_layer_idx = mtp_layer_idx
++        # The draft config goes through `to_dict`, so it's built from the bare
++        # text block and takes the runner's fields afterwards.
++        base = getattr(config, "text_config", config)
++        draft_config = self.draft_config(base, mtp_layer_idx, config)
++        forward_runtime_fields(config, draft_config)
++        super().__init__(draft_config, mesh=mesh, dtype=dtype)
++
++        hidden_size = int(base.hidden_size)
++        rms_norm_eps = float(getattr(base, "rms_norm_eps", 1e-6))
++        self.hidden_states_first = bool(getattr(base, "mtp_hidden_states_first", True))
++
++        self.embed_norm = RMSNorm(
++            hidden_size, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="mtp_embed_norm"
++        )
++        self.hidden_norm = RMSNorm(
++            hidden_size, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="mtp_hidden_norm"
++        )
++        self.input_proj = LinearBase(
++            input_size=2 * hidden_size,
++            output_size=hidden_size,
++            use_bias=False,
++            kernel_axes=(None, "tensor"),
++            params_dtype=dtype,
++            mesh=mesh,
++            scope_name="input_proj",
++        )
++
++    @staticmethod
++    def mtp_local_layer_ids(
++        base: PretrainedConfig,
++        outer: PretrainedConfig | None = None,
++    ) -> list[int]:
++        """Layers of the MTP head that run the sliding window.
++
++        A config parsed by `transformers` carries the list on the text block as
++        `mtp_local_layer_ids`. The published `config.json` writes it at the top
++        level, under `mtp_config.local_layer_ids`, so a raw text block reached
++        straight from the file has neither. Read both. An absent list means
++        every MTP layer runs full attention, which is what the reference
++        `mtp_layer_types` returns.
++        """
++        local_ids = getattr(base, "mtp_local_layer_ids", None)
++        if local_ids is None and outer is not None:
++            local_ids = getattr(outer, "mtp_local_layer_ids", None)
++        if local_ids is None:
++            for source in (base, outer):
++                mtp_config = getattr(source, "mtp_config", None) or {}
++                if isinstance(mtp_config, dict):
++                    local_ids = mtp_config.get("local_layer_ids")
++                else:
++                    local_ids = getattr(mtp_config, "local_layer_ids", None)
++                if local_ids is not None:
++                    break
++        return [int(i) for i in local_ids or []]
++
++    @classmethod
++    def draft_config(
++        cls,
++        base: PretrainedConfig,
++        mtp_layer_idx: int = 0,
++        outer: PretrainedConfig | None = None,
++    ) -> PretrainedConfig:
++        """One MTP layer, always dense, on the MTP local-global cycle.
++
++        The layer built is `mtp_layer_idx`, so it's that index the local list
++        decides, not index 0. A sliding-window MTP layer carries
++        `swa_num_key_value_heads` and a `sliding_window_size` relative extent; a
++        full-attention one carries `num_key_value_heads` and `rel_extent`.
++        """
++        draft = PretrainedConfig.from_dict(base.to_dict())
++        draft.num_hidden_layers = 1
++        local_ids = cls.mtp_local_layer_ids(base, outer)
++        is_local = int(mtp_layer_idx) in set(local_ids)
++        draft.layer_types = ["hybrid_sliding" if is_local else "hybrid"]
++        draft.mlp_layer_types = ["dense"]
++        return draft
++
++    def mtp_source_prefix(self) -> str:
++        return f"{self.source_root}.layers.{self.mtp_layer_idx}"
++
++    def create_weight_mappings(self) -> dict:
++        prefix = self.mtp_source_prefix()
++        mappings = {
++            "model.llm.embed.weight": WeightMapping(
++                target_path="model.embed_tokens.embedding",
++                sharding=("tensor", None),
++                transpose=False,
++            ),
++            "model.llm.embed_norm.weight": WeightMapping(
++                target_path="model.embed_norm.scale", sharding=(None,), transpose=False
++            ),
++            "model.llm.norm.weight": WeightMapping(
++                target_path="model.norm.scale", sharding=(None,), transpose=False
++            ),
++            "model.llm.unembed.weight": WeightMapping(
++                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
++            ),
++            f"{prefix}.embed_norm.weight": WeightMapping(
++                target_path="embed_norm.scale", sharding=(None,), transpose=False
++            ),
++            f"{prefix}.hidden_norm.weight": WeightMapping(
++                target_path="hidden_norm.scale", sharding=(None,), transpose=False
++            ),
++            f"{prefix}.input_proj.weight": WeightMapping(
++                target_path="input_proj.weight", sharding=(None, "tensor"), transpose=True
++            ),
++        }
++        mappings.update(
++            decoder_layer_mappings(
++                f"{prefix}.transformer_block",
++                "model.layers.0",
++                self.config,
++                0,
++                is_moe=False,
++            )
++        )
++        return mappings
++
++    def load_stacked_weights(self, loader: WeightLoader):
++        weight_info = loader._scan_weight_info()
++        prefix = f"{self.mtp_source_prefix()}.transformer_block.mlp"
++        self.load_dense_mlp_weights(self.model.layers[0], prefix, weight_info)
++
++    def __call__(
++        self,
++        forward_batch: ForwardBatch,
++        memory_pools: Any,
++        logits_metadata: LogitsMetadata,
++    ):
++        # The MTP layer carries its own `embed_norm`, so it reads the embedding
++        # table directly rather than the decoder's normalized embedding.
++        embeddings = self.model.embed_tokens(forward_batch.input_ids)
++        hidden = forward_batch.spec_info.hidden_states
++        parts = [self.hidden_norm(hidden), self.embed_norm(embeddings)]
++        if not self.hidden_states_first:
++            parts = parts[::-1]
++        projected, _ = self.input_proj(jnp.concatenate(parts, axis=-1))
++        return super().__call__(
++            forward_batch, memory_pools, logits_metadata, input_embeds=projected
++        )
++
++
++EntryClass = [
++    InklingForCausalLM,
++    InklingForConditionalGeneration,
++    InklingMTPForCausalLM,
++]
+diff --git a/python/sgl_jax/srt/utils/weight_utils.py b/python/sgl_jax/srt/utils/weight_utils.py
+index be2dbfa0..c28c11df 100644
+--- a/python/sgl_jax/srt/utils/weight_utils.py
++++ b/python/sgl_jax/srt/utils/weight_utils.py
+@@ -2651,7 +2651,7 @@ class WeightLoader:
+             axis, times = mapping.repeat
+             processed_weight = jnp.repeat(processed_weight, times, axis=axis)
+         if mapping.kv_head_padding:
+-            processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
++            processed_weight = self._apply_kv_head_padding(processed_weight, hf_key, jax_path)
+ 
+         if mapping.pad_width is not None:
+             processed_weight = jnp.pad(processed_weight, mapping.pad_width)
+@@ -2952,16 +2952,23 @@ class WeightLoader:
+ 
+         return cast(nnx.Variable[jax.Array], current_level)
+ 
+-    def _apply_kv_head_padding(self, weight: jax.Array, hf_key: str) -> jax.Array:
++    def _apply_kv_head_padding(
++        self, weight: jax.Array, hf_key: str, jax_path: str | None = None
++    ) -> jax.Array:
+         """Apply KV head padding/replication when tp_size > total_kv_heads.
+ 
+         Handles:
+         1. Bias/Scale (1D or 2D with shape[0]=heads) -> Pad Axis 0
+         2. Standard Weight (2D with shape[1]=heads*dim) -> Pad Axis 1
+         3. Static Quant Weight (2D with shape[0]=heads*dim) -> Pad Axis 0
++
++        The k/v test reads the target path as well as the checkpoint key, so a
++        checkpoint that names its projections something other than `k_proj` and
++        `v_proj` still gets the replication its mapping asked for.
+         """
++        names = [hf_key] if jax_path is None else [hf_key, jax_path]
+         if not (
+-            any(proj in hf_key for proj in ["k_proj", "v_proj"])
++            any(proj in name for name in names for proj in ["k_proj", "v_proj"])
+             and self.model_config.needs_kv_head_replication(self.sharding_size)
+         ):
+             return weight

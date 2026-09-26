@@ -1,0 +1,90 @@
+Subject: [PATCH] feat(kimi_k3): add layers_to_capture hook to KimiK3Model
+
+Adds the four parts gemma4.py, llama.py and qwen3.py already carry: the list on
+the inner model, the append in the layer loop, the capture_aux_hidden_states
+flag on the entry class, and aux_hidden_states threaded into the logits
+processor. Without them --enable-return-hidden-states refuses to start.
+
+One difference from every other model with this hook. K3 carries no separate
+`residual`, so nothing is None on layer 0. The layer takes and returns one
+running prefix sum, and the append reads it directly.
+
+What lands in aux_hidden_states is that prefix sum, which is the layer input.
+attn_res_block_size is 12, so the sum restarts every 12 layers and the value a
+layer conditions on is a softmax mixture of the sum and up to 8 stashed block
+entries. Capture the sum, because that's what composes additively and what the
+other models' hooks return.
+---
+ python/sgl_jax/srt/models/kimi_k3.py | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/python/sgl_jax/srt/models/kimi_k3.py b/python/sgl_jax/srt/models/kimi_k3.py
+index 766a25d6..3296e1dd 100644
+--- a/python/sgl_jax/srt/models/kimi_k3.py
++++ b/python/sgl_jax/srt/models/kimi_k3.py
+@@ -800,6 +800,9 @@ class KimiK3Model(nnx.Module):
+                 scope_name="output_attn_res_proj",
+             )
+ 
++        # For EAGLE3 and --enable-return-hidden-states.
++        self.layers_to_capture = []
++
+     def __call__(self, forward_batch: ForwardBatch, memory_pools):
+         hidden_states = (
+             self.embed_tokens(forward_batch.input_ids)
+@@ -818,8 +821,13 @@ class KimiK3Model(nnx.Module):
+         layers_recurrent_buffers = []
+         layers_conv_buffers = []
+         layers_topk_ids = []
++        aux_hidden_states = []
+ 
+-        for layer in self.layers:
++        for layer_id, layer in enumerate(self.layers):
++            if layer_id in self.layers_to_capture:
++                # `hidden_states` is the running prefix sum. K3 keeps no
++                # separate `residual`, so it's never None on layer 0.
++                aux_hidden_states.append(hidden_states)
+             hidden_states, block_residual, attn_state, topk_ids = layer(
+                 forward_batch.positions,
+                 hidden_states,
+@@ -848,6 +856,7 @@ class KimiK3Model(nnx.Module):
+ 
+         return (
+             hidden_states,
++            aux_hidden_states,
+             layers_kv_fused,
+             (layers_recurrent_buffers, layers_conv_buffers),
+             layers_topk_ids,
+@@ -917,6 +926,7 @@ class KimiK3ForCausalLM(nnx.Module):
+             mesh=mesh,
+             enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+         )
++        self.capture_aux_hidden_states = False
+ 
+     def __call__(
+         self,
+@@ -926,17 +936,23 @@ class KimiK3ForCausalLM(nnx.Module):
+     ):
+         (
+             hidden_states,
++            aux_hidden_states,
+             layers_kv_fused,
+             layers_recurrent_state,
+             layers_topk_ids,
+         ) = self.model(forward_batch, memory_pools)
+ 
++        if not self.capture_aux_hidden_states:
++            aux_hidden_states = None
++
+         head = (
+             self.model.embed_tokens
+             if getattr(self.config, "tie_word_embeddings", False)
+             else self.lm_head
+         )
+-        output = self.logits_processor(hidden_states, head, logits_metadata)
++        output = self.logits_processor(
++            hidden_states, head, logits_metadata, aux_hidden_states=aux_hidden_states
++        )
+         return (
+             output,
+             {

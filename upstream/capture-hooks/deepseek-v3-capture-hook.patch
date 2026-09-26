@@ -1,0 +1,123 @@
+Subject: [PATCH] feat(deepseek_v3): add layers_to_capture hook to
+ DeepseekV3Model
+
+DeepSeek V3 has no layers_to_capture hook, so --enable-return-hidden-states
+refuses to start on it. Adds the same hook gemma4.py, llama.py and qwen3.py
+already carry.
+
+DeepseekV3Model accumulates aux_hidden_states for layers in layers_to_capture
+and returns them. DeepseekV3ForCausalLM gates on capture_aux_hidden_states and
+forwards them to the logits processor. DeepseekV2ForCausalLM inherits it.
+
+KimiK25ForConditionalGeneration subclasses DeepseekV3ForCausalLM and overrides
+__call__, so it unpacks the backbone tuple itself. The patch updates it to
+match, which gives the K2.5 VL generation path the hook too.
+
+Uses the None-residual form. DeepSeek V3 carries residual separately, and it's
+None on layer 0. EAGLE3 never captures layer 0, but the hidden-states flag
+does.
+---
+ python/sgl_jax/srt/models/deepseek_v3.py           | 31 +++++++++++++++++-----
+ .../models/kimi_k25/kimi_k25_vl_generation.py      | 11 ++++++--
+ 2 files changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/python/sgl_jax/srt/models/deepseek_v3.py b/python/sgl_jax/srt/models/deepseek_v3.py
+index 9be090d0..a05438e2 100644
+--- a/python/sgl_jax/srt/models/deepseek_v3.py
++++ b/python/sgl_jax/srt/models/deepseek_v3.py
+@@ -688,12 +688,13 @@ class DeepseekV3Model(nnx.Module):
+             param_dtype=dtype,
+             scope_name="norm",
+         )
++        self.layers_to_capture = []
+ 
+     def __call__(
+         self,
+         forward_batch: ForwardBatch,
+         token_to_kv_pool: KVCache,
+-    ) -> tuple[jax.Array, list, list]:
++    ) -> tuple[jax.Array, list, list, list]:
+ 
+         residual = None
+         input_embeds = (
+@@ -708,8 +709,15 @@ class DeepseekV3Model(nnx.Module):
+ 
+         layers_kv_fused = []
+         layers_topk_ids = []
+-
+-        for layer in self.layers:
++        aux_hidden_states = []
++
++        for layer_id, layer in enumerate(self.layers):
++            if layer_id in self.layers_to_capture:
++                # residual is None on layer 0, and the hidden-states flag marks
++                # every layer, so this has to tolerate it.
++                aux_hidden_states.append(
++                    hidden_states + residual if residual is not None else hidden_states
++                )
+             hidden_states, residual, kv_fused, topk_ids = layer(
+                 forward_batch.positions,
+                 hidden_states,
+@@ -725,7 +733,7 @@ class DeepseekV3Model(nnx.Module):
+             hidden_states += residual
+ 
+         hidden_states = self.norm(hidden_states)
+-        return hidden_states, layers_kv_fused, layers_topk_ids
++        return hidden_states, aux_hidden_states, layers_kv_fused, layers_topk_ids
+ 
+ 
+ class DeepseekV3ForCausalLM(nnx.Module):
+@@ -765,6 +773,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
+             mesh=mesh,
+             enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+         )
++        self.capture_aux_hidden_states = False
+ 
+     def __call__(
+         self,
+@@ -773,8 +782,18 @@ class DeepseekV3ForCausalLM(nnx.Module):
+         logits_metadata: LogitsMetadata,
+     ):
+         kv_pool = memory_pools.token_to_kv_pool
+-        hidden_states, layers_kv_fused, layers_topk_ids = self.model(forward_batch, kv_pool)
+-        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
++        hidden_states, aux_hidden_states, layers_kv_fused, layers_topk_ids = self.model(
++            forward_batch, kv_pool
++        )
++        if not self.capture_aux_hidden_states:
++            aux_hidden_states = None
++
++        output = self.logits_processor(
++            hidden_states,
++            self.lm_head,
++            logits_metadata,
++            aux_hidden_states=aux_hidden_states,
++        )
+         return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
+ 
+     def load_weights(self, model_config: ModelConfig):
+diff --git a/python/sgl_jax/srt/multimodal/models/kimi_k25/kimi_k25_vl_generation.py b/python/sgl_jax/srt/multimodal/models/kimi_k25/kimi_k25_vl_generation.py
+index 443d8420..1d7b156c 100644
+--- a/python/sgl_jax/srt/multimodal/models/kimi_k25/kimi_k25_vl_generation.py
++++ b/python/sgl_jax/srt/multimodal/models/kimi_k25/kimi_k25_vl_generation.py
+@@ -50,11 +50,18 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
+         logits_metadata: LogitsMetadata,
+     ):
+         token_to_kv_pool = memory_pools.token_to_kv_pool
+-        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
++        hidden_states, aux_hidden_states, layers_kv_fused, layers_topk_ids = self.model(
+             forward_batch, token_to_kv_pool
+         )
++        if not self.capture_aux_hidden_states:
++            aux_hidden_states = None
+ 
+-        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
++        output = self.logits_processor(
++            hidden_states,
++            self.lm_head,
++            logits_metadata,
++            aux_hidden_states=aux_hidden_states,
++        )
+         return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
+ 
+     def load_weights(self, model_config: ModelConfig):

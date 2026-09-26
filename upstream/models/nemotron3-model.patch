@@ -1,0 +1,3012 @@
+Subject: [PATCH] feat(nemotron_h): add the Nemotron 3 model
+
+sglang-jax has no nemotron_h, so NVIDIA-Nemotron-3-Super-120B-A12B-BF16 and
+NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 don't serve. Adds the model, the
+config that resolves its irregular layer stack, and the Mamba-2 backend that
+owns the recurrent state.
+
+models/nemotron_h.py builds one block per layer: a Mamba-2 mixer, a GQA
+attention layer, a LatentMoE layer or a dense MLP. A block is one norm, one
+mixer, one residual add, so the stack never repeats a body and can't be one
+scan over layers. configs/nemotron_h.py reads layers_block_type or
+hybrid_override_pattern, derives num_hidden_layers from its length, and hands
+the runner the layer lists both cache managers size from. It also reads the
+linear_attention and full_attention names stock transformers writes when it
+saves a config. The layer field has no default, so the class sets
+has_no_defaults_at_init and AutoConfig can format the config it builds
+without constructing an empty one.
+
+A write to num_hidden_layers on a built config cuts the block list to its
+first entries, so --model-layer-nums and a num_hidden_layers entry in
+--json-model-override-args build that many layers. A config.json whose count
+disagrees with its block list still fails to load.
+
+The attention layers carry no position encoding. Both published config.json
+files ship rope_theta and partial_rotary_factor, the reference declares
+neither and reads neither, and this port does the same. Order comes from the
+Mamba-2 layers.
+
+layers/attention/mamba/ holds the scan. mamba2.py folds a chunk of tokens
+into one affine step and turns the chunk boundary states back into per-token
+outputs. mamba2_backend.py cuts the packed token axis into a chunk grid that
+never spans two requests, folds each request's cached state into its first
+chunk, and restarts the scan there, so one scan carries every request in the
+batch. The restart is a select rather than a multiply by a zero decay, and a
+padding slot reads B as zero, so an inf or NaN in one request's state can't
+reach the requests packed around it.
+
+With --enable-recurrent-extra-buffer the backend writes the state a forward
+leaves to the request's track slot as well as its running slot. The scheduler
+ends every forward that crosses a track boundary on the boundary, and the
+radix tree adopts the track slot as the state of that prefix.
+
+dt is clamped to mamba_dt_limit, whose (0.0, inf) default neither published
+config.json overrides. Megatron-LM trains with that pair, and NVIDIA's CUDA
+kernels and vLLM serve with it. The torch paths floor dt at time_step_min,
+0.001, instead: transformers in prefill, and NVIDIA's torch_forward in prefill
+and decode. On the published weights 212 of Super's 5,120 Mamba-2 heads have
+softplus(dt_bias) below 0.001, so that floor binds. The test's random weights
+keep dt above it, so the comparison with transformers doesn't reach it.
+
+The routed experts aren't gated: one up_proj, mlp_hidden_act, one down_proj,
+and they run in a shared latent of moe_latent_size rather than at
+hidden_size. The router reads the full-width token first, which is the order
+the reference uses. EPMoE grows a `gated` flag and a relu2 activation for
+that; a gated layer is unchanged. Under a MoE quantization config an ungated
+layer quantizes its two matrices.
+
+The experts get the QuantizationConfig ModelConfig resolves, and nothing else
+that sits on the config. The depthwise conv kernel is a bare parameter, so a
+linear quantization rule leaves it alone, and fc2_latent_proj gets the
+experts' output split over the tensor axis, the layout a QuantizedLinear
+requires. A pre-quantized checkpoint is refused at build time, since the
+weight mapping reads no scale tensors.
+
+The model refuses --ep-dispatch-algorithm, --init-expert-location and
+--ep-num-redundant-experts before it builds. The engine builds expert-location
+metadata only for a config that sets num_experts, and the weight mapping loads
+every expert in checkpoint order, so those flags would change nothing.
+
+The SSM state is [heads, mamba_head_dim, ssm_state_size], 64 by 128, not
+square. RecurrentStatePool allocated head_dim twice, which every existing
+caller reads as the same number because KDA and GDN run the two widths equal,
+so a square slot holds half the state. It now reads head_k_dim for the
+second, which leaves those callers alone. The pool also asserted that
+num_k_heads divides the tensor axis, an axis it never shards; the assert now
+covers the two segments of the conv buffer that do shard.
+mamba_ssm_cache_dtype is float32, so both state slots take float32 while the
+weights ship BF16.
+
+GroupRMSNorm required the tensor axis to divide num_groups. Nemotron 3 runs 8
+groups at a tensor parallel size of up to 32, so it grows a second layout
+that sums a group straddling shards with one all-reduce of a [tokens, groups]
+array. The upstream test that asserted the old error now checks that layout
+against an fp64 reference at tp=8 over 2 groups, traces it at tp=16 over 8
+groups, and checks that the tensor axis still has to divide hidden_size.
+
+Tested against the HuggingFace transformers implementation on CPU in float32:
+every layer, the final hidden state and the logits match to 1.2e-07 on a
+single request, on a packed batch and through a decode step, on a four-way
+tensor axis as well as a one-way one. Through the engine's own pools,
+metadata and jit, a prefix hit that resumes from a track slot matches a fresh
+prefill, and a poisoned request's inf and NaN stay out of the three requests
+packed around it. A stack cut to three blocks through ModelConfig matches the
+full stack at that depth, and each expert-placement flag stops the build.
+ python/sgl_jax/srt/configs/nemotron_h.py           | 436 ++++++++++
+ python/sgl_jax/srt/hf_transformers_utils.py        |   7 +
+ .../srt/layers/attention/fla/group_rmsnorm.py      |  64 +-
+ .../layers/attention/hybrid_linear_attn_backend.py |   8 +
+ .../sgl_jax/srt/layers/attention/mamba/__init__.py |  21 +
+ .../sgl_jax/srt/layers/attention/mamba/mamba2.py   | 305 +++++++
+ .../srt/layers/attention/mamba/mamba2_backend.py   | 583 +++++++++++++
+ python/sgl_jax/srt/layers/moe.py                   | 128 ++-
+ .../sgl_jax/srt/mem_cache/recurrent_state_pool.py  |  21 +-
+ .../model_executor/model_runner_kv_cache_mixin.py  |   4 +-
+ python/sgl_jax/srt/models/nemotron_h.py            | 931 +++++++++++++++++++++
+ python/sgl_jax/test/layers/test_group_rmsnorm.py   |  85 +-
+ 12 files changed, 2521 insertions(+), 72 deletions(-)
+
+diff --git a/python/sgl_jax/srt/configs/nemotron_h.py b/python/sgl_jax/srt/configs/nemotron_h.py
+new file mode 100644
+index 00000000..55409d48
+--- /dev/null
++++ b/python/sgl_jax/srt/configs/nemotron_h.py
+@@ -0,0 +1,436 @@
++"""Config and layer plan for the Nemotron 3 hybrid stack.
++
++Nemotron 3 doesn't repeat one layer shape, so the engine can't wrap the whole
++stack in a single `lax.scan` over layers. Each layer is a Mamba-2 mixer, an
++attention mixer, or a feed-forward, and the types interleave on a cycle whose
++period changes down the stack. The MoE sizes spell the feed-forward `moe`;
++Nano spells it `mlp`.
++
++Two spellings of the same field exist. Super and Nano ship
++`hybrid_override_pattern`, a string over `M`, `E`, `*` and `-`. Ultra ships
++`layers_block_type`, a list over `"mamba"`, `"moe"`, `"attention"` and
++`"mlp"`. `block_types` reads either spelling and returns the list form, and
++`num_hidden_layers` comes from its length. A config `transformers` saved
++names the two mixers `"linear_attention"` and `"full_attention"`, and
++`block_types` reads those as `"mamba"` and `"attention"`.
++
++`cache_plan` splits the layer indices the two cache managers own. Mamba-2
++layers need an SSM state slot and a conv state slot, neither of which depends
++on sequence length. Attention layers need KV pages that grow with it.
++
++`NemotronHConfig` exposes those lists to the runner under the names the
++hybrid recurrent path already reads: `linear_layer_ids`,
++`full_attention_layer_ids` and `linear_state_params`.
++"""
++
++from __future__ import annotations
++
++import math
++from collections.abc import Iterable, Sequence
++
++from transformers.configuration_utils import PretrainedConfig
++
++__all__ = [
++    "BLOCK_TYPES",
++    "NemotronHConfig",
++    "RECURRENT_BLOCK_TYPES",
++    "block_types",
++    "cache_plan",
++    "mtp_block_types",
++    "pattern",
++]
++
++
++BLOCK_TYPES = ("mamba", "moe", "attention", "mlp")
++
++# Types that carry a recurrent state across chunks, so `mamba2.py` folds a
++# chunk into one affine step and `mamba2_backend.py` scans those steps.
++RECURRENT_BLOCK_TYPES = ("mamba",)
++
++_PATTERN_TO_TYPE = {"M": "mamba", "E": "moe", "*": "attention", "-": "mlp"}
++_TYPE_TO_PATTERN = {v: k for k, v in _PATTERN_TO_TYPE.items()}
++
++# The names `transformers` 5.17 writes. Its `NemotronHConfig` renames the
++# mixers when it loads a config and saves them under the new names, so a
++# re-saved checkpoint carries these in place of the published ones.
++_TRANSFORMERS_TYPES = {"linear_attention": "mamba", "full_attention": "attention"}
++
++
++def _from_pattern(text: str) -> list[str]:
++    """Expand the `M`/`E`/`*` string into the list form."""
++    unknown = sorted(set(text) - set(_PATTERN_TO_TYPE))
++    if unknown:
++        raise ValueError(
++            f"hybrid_override_pattern holds unknown symbols {unknown}; "
++            f"allowed: {sorted(_PATTERN_TO_TYPE)}"
++        )
++    return [_PATTERN_TO_TYPE[char] for char in text]
++
++
++def _validate(types: Sequence[str], field: str) -> list[str]:
++    """Return the list form, or raise naming the bad entries."""
++    if isinstance(types, str):
++        raise ValueError(f"{field} must be a list of strings, not a string")
++    out = [_TRANSFORMERS_TYPES.get(t, t) for t in types]
++    if not out:
++        raise ValueError(f"{field} is empty, so the stack has no layers")
++    unknown = sorted(set(out) - set(BLOCK_TYPES))
++    if unknown:
++        raise ValueError(
++            f"{field} holds unknown block types {unknown}; allowed: {list(BLOCK_TYPES)}"
++        )
++    return out
++
++
++def block_types(config: dict) -> list[str]:
++    """Per-layer block types, read from either spelling of the field.
++
++    Args:
++      config: a parsed `config.json`, or any dict holding
++        `layers_block_type` or `hybrid_override_pattern`.
++
++    Returns:
++      One entry per layer, each one of `BLOCK_TYPES`.
++
++    Raises:
++      ValueError: neither field is present, an entry is unknown, or
++        `num_hidden_layers` disagrees with the length. The reference config
++        class only warns on that last one and trusts the list. An engine that
++        sizes its stack from the count builds the wrong model, so reject it.
++    """
++    if "layers_block_type" in config:
++        found = _validate(config["layers_block_type"], "layers_block_type")
++    elif "hybrid_override_pattern" in config:
++        found = _validate(
++            _from_pattern(config["hybrid_override_pattern"]), "hybrid_override_pattern"
++        )
++    else:
++        raise ValueError(
++            "config holds neither layers_block_type nor hybrid_override_pattern, "
++            "so the layer stack is undefined"
++        )
++
++    declared = config.get("num_hidden_layers")
++    if declared is not None and declared != len(found):
++        raise ValueError(
++            f"num_hidden_layers is {declared} but the block list holds {len(found)} layers"
++        )
++    return found
++
++
++def mtp_block_types(config: dict) -> list[str]:
++    """Block types of the multi-token prediction head.
++
++    Returns an empty list when `num_nextn_predict_layers` is 0 or absent. The
++    head repeats for each predicted token, so the returned list covers one
++    repeat.
++    """
++    if not config.get("num_nextn_predict_layers"):
++        return []
++    if "mtp_layers_block_type" in config:
++        return _validate(config["mtp_layers_block_type"], "mtp_layers_block_type")
++    if "mtp_hybrid_override_pattern" in config:
++        return _validate(
++            _from_pattern(config["mtp_hybrid_override_pattern"]),
++            "mtp_hybrid_override_pattern",
++        )
++    raise ValueError(
++        "num_nextn_predict_layers is set but no MTP block list is present"
++    )
++
++
++def pattern(types: Iterable[str]) -> str:
++    """Pack the list form back into the `M`/`E`/`*`/`-` string.
++
++    Raises:
++      ValueError: an entry isn't one of `BLOCK_TYPES`.
++    """
++    out = []
++    for t in types:
++        if t not in _TYPE_TO_PATTERN:
++            raise ValueError(
++                f"{t!r} is not a block type; allowed: {list(BLOCK_TYPES)}"
++            )
++        out.append(_TYPE_TO_PATTERN[t])
++    return "".join(out)
++
++
++def cache_plan(types: Sequence[str]) -> dict[str, list[int]]:
++    """Which layers each cache manager owns.
++
++    Args:
++      types: the resolved block type list of the stack the engine builds.
++
++    Returns:
++      `recurrent`: layers holding an SSM state and a conv state. Both sizes
++        are fixed per sequence, so neither pages.
++      `paged`: layers holding KV, which grows with the sequence.
++      `stateless`: the rest, which hold nothing between tokens.
++    """
++    plan: dict[str, list[int]] = {"recurrent": [], "paged": [], "stateless": []}
++    for i, block in enumerate(_validate(types, "block types")):
++        if block in RECURRENT_BLOCK_TYPES:
++            plan["recurrent"].append(i)
++        elif block == "attention":
++            plan["paged"].append(i)
++        else:
++            plan["stateless"].append(i)
++    return plan
++
++
++class NemotronHConfig(PretrainedConfig):
++    """Nemotron 3 config, in either spelling of the layer field.
++
++    The checkpoint ships `configuration_nemotron_h.py` beside the weights and
++    the engine refuses remote code, so the fields it reads live here.
++
++    `num_hidden_layers` is derived from the block list. A config that ships
++    both and disagrees is rejected: an engine that sizes its stack from the
++    count builds the wrong model. Setting `num_hidden_layers` on a built config
++    cuts the stack to its first blocks, which is how `--model-layer-nums` and a
++    `num_hidden_layers` override reach it.
++
++    The layer field has no default, so `NemotronHConfig()` raises.
++    `has_no_defaults_at_init` tells `PretrainedConfig.to_diff_dict` to skip
++    the default instance it otherwise builds to diff against. Without it every
++    `repr`, every `to_json_string` and every `save_pretrained` raises, and
++    `from_dict` logs the config it just built, so `AutoConfig` can't load the
++    published `config.json` at all.
++    """
++
++    model_type = "nemotron_h"
++    keys_to_ignore_at_inference = ["past_key_values"]
++    has_no_defaults_at_init = True
++
++    def __init__(
++        self,
++        vocab_size: int = 131072,
++        hidden_size: int = 4096,
++        intermediate_size: int = 2688,
++        layers_block_type: Sequence[str] | None = None,
++        hybrid_override_pattern: str | None = None,
++        num_hidden_layers: int | None = None,
++        # Attention.
++        num_attention_heads: int = 32,
++        num_key_value_heads: int = 2,
++        head_dim: int = 128,
++        attention_bias: bool = False,
++        max_position_embeddings: int = 262144,
++        # Mamba-2.
++        mamba_num_heads: int = 128,
++        mamba_head_dim: int = 64,
++        ssm_state_size: int = 128,
++        n_groups: int = 8,
++        conv_kernel: int = 4,
++        chunk_size: int = 128,
++        use_conv_bias: bool = True,
++        mamba_hidden_act: str = "silu",
++        mamba_ssm_cache_dtype: str = "float32",
++        time_step_min: float = 1e-3,
++        time_step_max: float = 0.1,
++        mamba_dt_limit: Sequence[float] = (0.0, math.inf),
++        # Feed-forward and LatentMoE.
++        mlp_hidden_act: str = "relu2",
++        mlp_bias: bool = False,
++        use_bias: bool = False,
++        n_routed_experts: int = 512,
++        num_experts_per_tok: int = 22,
++        n_shared_experts: int = 1,
++        moe_intermediate_size: int = 2688,
++        moe_latent_size: int | None = 1024,
++        moe_shared_expert_intermediate_size: int = 5376,
++        n_group: int = 1,
++        topk_group: int = 1,
++        norm_topk_prob: bool = True,
++        routed_scaling_factor: float = 5.0,
++        # Norms and heads.
++        layer_norm_epsilon: float = 1e-5,
++        tie_word_embeddings: bool = False,
++        num_nextn_predict_layers: int = 0,
++        mtp_layers_block_type: Sequence[str] | None = None,
++        mtp_hybrid_override_pattern: str | None = None,
++        pad_token_id: int = 0,
++        bos_token_id: int = 1,
++        eos_token_id: int = 2,
++        **kwargs,
++    ):
++        source = {}
++        if layers_block_type is not None:
++            source["layers_block_type"] = layers_block_type
++        if hybrid_override_pattern is not None:
++            source["hybrid_override_pattern"] = hybrid_override_pattern
++        if num_hidden_layers is not None:
++            source["num_hidden_layers"] = num_hidden_layers
++        self.layers_block_type = block_types(source)
++        self.hybrid_override_pattern = pattern(self.layers_block_type)
++
++        self.vocab_size = vocab_size
++        self.hidden_size = hidden_size
++        self.intermediate_size = intermediate_size
++
++        self.num_attention_heads = num_attention_heads
++        self.num_key_value_heads = num_key_value_heads
++        self.head_dim = head_dim
++        self.attention_bias = attention_bias
++        # `rope_theta` and `partial_rotary_factor` ride in on `**kwargs`.
++        # Attention carries no position encoding, so nothing reads them, and
++        # the reference config class doesn't declare them either.
++        self.max_position_embeddings = max_position_embeddings
++
++        self.mamba_num_heads = mamba_num_heads
++        self.mamba_head_dim = mamba_head_dim
++        self.ssm_state_size = ssm_state_size
++        self.n_groups = n_groups
++        self.conv_kernel = conv_kernel
++        self.chunk_size = chunk_size
++        self.use_conv_bias = use_conv_bias
++        self.mamba_hidden_act = mamba_hidden_act
++        self.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
++        # `time_step_min` and `time_step_max` bound the range the `dt_bias`
++        # initializer draws over. The runtime clamp is `mamba_dt_limit`, which
++        # the config class exposes as `time_step_limit`, and neither published
++        # `config.json` overrides its (0.0, inf) default. Megatron-LM trains
++        # with that pair, and NVIDIA's CUDA kernels and vLLM serve with it.
++        # The torch paths floor `dt` at `time_step_min` instead: transformers
++        # 5.17 in prefill, and NVIDIA's `torch_forward` in prefill and decode.
++        self.time_step_min = time_step_min
++        self.time_step_max = time_step_max
++        # A config this class wrote back out carries the resolved spelling.
++        low, high = kwargs.pop("time_step_limit", None) or mamba_dt_limit
++        if not 0.0 <= low <= high:
++            raise ValueError(
++                f"mamba_dt_limit is {(low, high)}; it has to be a "
++                "non-negative (low, high) pair"
++            )
++        self.time_step_limit = (float(low), float(high))
++
++        self.mlp_hidden_act = mlp_hidden_act
++        self.mlp_bias = mlp_bias
++        self.use_bias = use_bias
++        self.n_routed_experts = n_routed_experts
++        self.num_experts_per_tok = num_experts_per_tok
++        self.n_shared_experts = n_shared_experts
++        self.moe_intermediate_size = moe_intermediate_size
++        self.moe_latent_size = moe_latent_size
++        self.moe_shared_expert_intermediate_size = moe_shared_expert_intermediate_size
++        self.n_group = n_group
++        self.topk_group = topk_group
++        self.norm_topk_prob = norm_topk_prob
++        self.routed_scaling_factor = routed_scaling_factor
++
++        self.layer_norm_epsilon = layer_norm_epsilon
++        self.rms_norm_eps = layer_norm_epsilon
++        self.num_nextn_predict_layers = num_nextn_predict_layers
++        mtp_source = {"num_nextn_predict_layers": num_nextn_predict_layers}
++        if mtp_layers_block_type is not None:
++            mtp_source["mtp_layers_block_type"] = mtp_layers_block_type
++        if mtp_hybrid_override_pattern is not None:
++            mtp_source["mtp_hybrid_override_pattern"] = mtp_hybrid_override_pattern
++        self.mtp_layers_block_type = mtp_block_types(mtp_source)
++
++        super().__init__(
++            pad_token_id=pad_token_id,
++            bos_token_id=bos_token_id,
++            eos_token_id=eos_token_id,
++            tie_word_embeddings=tie_word_embeddings,
++            **kwargs,
++        )
++
++    # `num_hidden_layers` is a length, not a field: the block list decides it.
++    # A write after construction cuts the stack to its first `value` blocks.
++    # `ModelConfig` writes it for `--model-layer-nums`, and `get_config` writes
++    # it for a `num_hidden_layers` entry in `--json-model-override-args`.
++    @property
++    def num_hidden_layers(self) -> int:
++        return len(self.layers_block_type)
++
++    @num_hidden_layers.setter
++    def num_hidden_layers(self, value) -> None:
++        count = len(self.layers_block_type)
++        if value is None or value == count:
++            return
++        if not 0 < value < count:
++            raise ValueError(
++                f"num_hidden_layers is {value}, and the block list holds {count} layers; "
++                f"a write can cut the stack to between 1 and {count} layers"
++            )
++        self.layers_block_type = self.layers_block_type[:value]
++        self.hybrid_override_pattern = pattern(self.layers_block_type)
++
++    @property
++    def mamba_intermediate_size(self) -> int:
++        """Channels the SSM runs over. The conv carries `B` and `C` on top."""
++        return self.mamba_num_heads * self.mamba_head_dim
++
++    @property
++    def conv_dim(self) -> int:
++        """Channels the depthwise conv runs over: the SSM input, then B and C."""
++        return self.mamba_intermediate_size + 2 * self.n_groups * self.ssm_state_size
++
++    @property
++    def mamba_in_proj_size(self) -> int:
++        """The fused input projection: gate, then the conv stream, then `dt`."""
++        return self.mamba_intermediate_size + self.conv_dim + self.mamba_num_heads
++
++    @property
++    def expert_input_size(self) -> int:
++        """Width the routed experts run at. The latent, when there's one."""
++        return self.moe_latent_size or self.hidden_size
++
++    @property
++    def linear_layer_ids(self) -> list[int]:
++        """Layers holding a recurrent state. The runner sizes the state pool."""
++        return cache_plan(self.layers_block_type)["recurrent"]
++
++    @property
++    def full_attention_layer_ids(self) -> list[int]:
++        """Layers holding KV. The runner sizes the paged pool from these."""
++        return cache_plan(self.layers_block_type)["paged"]
++
++    @property
++    def linear_state_params(self):
++        """What `RecurrentStatePool` allocates per Mamba-2 layer.
++
++        The SSM state is `[mamba_num_heads, mamba_head_dim, ssm_state_size]`,
++        which isn't square: 64 by 128 at every published size. The pool reads
++        the second dim from `head_dim` and the third from `head_k_dim`.
++
++        The conv state is `[conv_dim, conv_kernel - 1]`. The pool builds that
++        width as `num_heads * head_dim + 2 * num_k_heads * head_k_dim`, so
++        `num_k_heads` carries the group count and `head_k_dim` the state size.
++
++        `mamba_ssm_cache_dtype` is float32 while the weights ship BF16, so the
++        SSM slot costs twice what the weight dtype suggests. The conv state
++        feeds the same float32 accumulation, so it takes the same dtype.
++        """
++        import jax.numpy as jnp
++
++        from sgl_jax.srt.mem_cache.recurrent_state_pool import (
++            LinearRecurrentStateParams,
++            RecurrentStateDType,
++        )
++
++        cache_dtype = jnp.dtype(self.mamba_ssm_cache_dtype)
++        return LinearRecurrentStateParams(
++            layers=self.linear_layer_ids,
++            num_heads=self.mamba_num_heads,
++            head_dim=self.mamba_head_dim,
++            conv_kernel_size=self.conv_kernel,
++            dtype=RecurrentStateDType(conv=cache_dtype, temporal=cache_dtype),
++            num_k_heads=self.n_groups,
++            head_k_dim=self.ssm_state_size,
++        )
++
++    def mamba_config(self):
++        """The `Mamba2Config` the chunked scan reads."""
++        from sgl_jax.srt.layers.attention.mamba.mamba2 import Mamba2Config
++
++        return Mamba2Config(
++            ssm_state_size=self.ssm_state_size,
++            mamba_num_heads=self.mamba_num_heads,
++            mamba_head_dim=self.mamba_head_dim,
++            n_groups=self.n_groups,
++            conv_kernel=self.conv_kernel,
++            chunk_size=self.chunk_size,
++            time_step_limit=tuple(self.time_step_limit),
++        )
+diff --git a/python/sgl_jax/srt/hf_transformers_utils.py b/python/sgl_jax/srt/hf_transformers_utils.py
+index 51805fa2..798c8db1 100644
+--- a/python/sgl_jax/srt/hf_transformers_utils.py
++++ b/python/sgl_jax/srt/hf_transformers_utils.py
+@@ -23,6 +23,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
+ from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
+ from sgl_jax.srt.configs.gemma4 import Gemma4Config
+ from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
++from sgl_jax.srt.configs.nemotron_h import NemotronHConfig
+ from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
+ from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
+ from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
+@@ -36,6 +37,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+     for cls in [
+         BailingHybridConfig,
+         KimiLinearConfig,
++        NemotronHConfig,
+         Qwen3_5HybridConfig,
+         Qwen3_5DenseConfig,
+         Qwen4ExpConfig,
+@@ -48,6 +50,11 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+ for name, cls in _CONFIG_REGISTRY.items():
+     AutoConfig.register(name, cls, exist_ok=True)
+ 
++# Stock transformers owns `nemotron_h` from 5.3 on, so the loop above skips
++# ours. Ours isn't interchangeable: it resolves the layer plan the runner
++# sizes both caches from. Force it to win.
++AutoConfig.register("nemotron_h", NemotronHConfig, exist_ok=True)
++
+ 
+ _UNSET = object()
+ 
+diff --git a/python/sgl_jax/srt/layers/attention/fla/group_rmsnorm.py b/python/sgl_jax/srt/layers/attention/fla/group_rmsnorm.py
+index ba0fed04..46244f9e 100644
+--- a/python/sgl_jax/srt/layers/attention/fla/group_rmsnorm.py
++++ b/python/sgl_jax/srt/layers/attention/fla/group_rmsnorm.py
+@@ -16,6 +16,13 @@ class GroupRMSNorm(nnx.Module):
+ 
+     Splits the last dimension into `num_groups` groups and applies
+     RMSNorm independently within each group.
++
++    Two layouts. When the tensor parallel size divides `num_groups`, every
++    shard holds whole groups and the reduction is local. When it doesn't, a
++    group straddles shards and the sum of squares comes out of a contraction
++    against a `[num_groups, hidden_size]` selector, which XLA turns into one
++    all-reduce of a `[tokens, num_groups]` array. Nemotron 3 runs 8 groups at
++    a tensor parallel size of up to 32, so it takes the second layout.
+     """
+ 
+     def __init__(
+@@ -30,15 +37,15 @@ class GroupRMSNorm(nnx.Module):
+     ):
+         if hidden_size % num_groups != 0:
+             raise ValueError("hidden_size must be divisible by num_groups")
+-        if mesh is not None:
+-            tp_size = mesh.shape.get("tensor", 1)
+-            if num_groups % tp_size != 0:
+-                raise ValueError(
+-                    "GroupRMSNorm requires the tensor parallel size to divide "
+-                    "num_groups so every shard holds whole RMS groups (the RMS "
+-                    "reduction is over group_size, which is never sharded), got "
+-                    f"tensor parallel size={tp_size}, num_groups={num_groups}."
+-                )
++        tp_size = mesh.shape.get("tensor", 1) if mesh is not None else 1
++        if hidden_size % tp_size != 0:
++            raise ValueError(
++                "GroupRMSNorm requires the tensor parallel size to divide "
++                f"hidden_size, got tensor parallel size={tp_size}, "
++                f"hidden_size={hidden_size}."
++            )
++        self.tp_size = tp_size
++        self.whole_groups_per_shard = num_groups % tp_size == 0
+ 
+         self.hidden_size = hidden_size
+         self.num_groups = num_groups
+@@ -57,6 +64,9 @@ class GroupRMSNorm(nnx.Module):
+ 
+     @named_scope
+     def __call__(self, hidden_states: jax.Array) -> jax.Array:
++        if not self.whole_groups_per_shard:
++            return self._split_groups(hidden_states)
++
+         orig_dtype = hidden_states.dtype
+         orig_shape = hidden_states.shape
+ 
+@@ -80,3 +90,39 @@ class GroupRMSNorm(nnx.Module):
+             orig_shape,
+             out_sharding=NamedSharding(self.mesh, P("data", "tensor")),
+         )
++
++    def _select(self, dtype) -> jax.Array:
++        """`[num_groups, hidden_size]`, one where a channel joins a group."""
++        select = jnp.repeat(
++            jnp.eye(self.num_groups, dtype=dtype), self.group_size, axis=1
++        )
++        return jax.sharding.reshard(select, P(None, "tensor"))
++
++    def _split_groups(self, hidden_states: jax.Array) -> jax.Array:
++        """The layout for a group that straddles shards.
++
++        Contracting the squares against the selector sums each group over
++        every shard that holds part of it, which is one all-reduce of a
++        `[tokens, num_groups]` array. Contracting the scale back against the
++        selector spreads it over the channels without another collective.
++        """
++        orig_dtype = hidden_states.dtype
++        x = hidden_states.astype(jnp.float32)
++        select = self._select(jnp.float32)
++
++        group_sq = lax.dot_general(
++            lax.square(x),
++            select,
++            (((1,), (1,)), ((), ())),
++            precision=lax.Precision.HIGHEST,
++            out_sharding=NamedSharding(self.mesh, P("data", None)),
++        )
++        scale = lax.rsqrt(group_sq / self.group_size + self.epsilon)
++        per_channel = lax.dot_general(
++            scale,
++            select,
++            (((1,), (0,)), ((), ())),
++            precision=lax.Precision.HIGHEST,
++            out_sharding=NamedSharding(self.mesh, P("data", "tensor")),
++        )
++        return (x * per_channel * self.weight.value.astype(jnp.float32)).astype(orig_dtype)
+diff --git a/python/sgl_jax/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sgl_jax/srt/layers/attention/hybrid_linear_attn_backend.py
+index 638f760d..549504d7 100644
+--- a/python/sgl_jax/srt/layers/attention/hybrid_linear_attn_backend.py
++++ b/python/sgl_jax/srt/layers/attention/hybrid_linear_attn_backend.py
+@@ -313,6 +313,14 @@ def attn_backend_wrapper(
+             dtype=runner.model_config.dtype,
+             prefill_impl=runner.server_args.gdn_prefill_impl,
+         )
++    elif getattr(cfg, "model_type", None) == "nemotron_h":
++        from sgl_jax.srt.layers.attention.mamba.mamba2_backend import Mamba2AttnBackend
++
++        linear_attn_backend = Mamba2AttnBackend(
++            mamba_config=cfg.mamba_config(),
++            mesh=runner.mesh,
++            activation=cfg.mamba_hidden_act,
++        )
+     elif runner.lightning_config is not None:
+         from sgl_jax.srt.layers.attention.linear.lightning_backend import (
+             LightningAttnBackend,
+diff --git a/python/sgl_jax/srt/layers/attention/mamba/__init__.py b/python/sgl_jax/srt/layers/attention/mamba/__init__.py
+new file mode 100644
+index 00000000..c421b608
+--- /dev/null
++++ b/python/sgl_jax/srt/layers/attention/mamba/__init__.py
+@@ -0,0 +1,21 @@
++"""Mamba-2 state space mixer: the chunked scan and its serving backend."""
++
++from sgl_jax.srt.layers.attention.mamba.mamba2 import (
++    Mamba2Config,
++    as_cache_layout,
++    chunk_outputs,
++    chunk_terms,
++    discretize,
++    entering_states,
++    from_cache_layout,
++)
++
++__all__ = [
++    "Mamba2Config",
++    "as_cache_layout",
++    "chunk_outputs",
++    "chunk_terms",
++    "discretize",
++    "entering_states",
++    "from_cache_layout",
++]
+diff --git a/python/sgl_jax/srt/layers/attention/mamba/mamba2.py b/python/sgl_jax/srt/layers/attention/mamba/mamba2.py
+new file mode 100644
+index 00000000..b4f4462b
+--- /dev/null
++++ b/python/sgl_jax/srt/layers/attention/mamba/mamba2.py
+@@ -0,0 +1,305 @@
++"""Chunked Mamba-2 selective scan, folded into one affine step per chunk.
++
++The Mamba-2 SSD recurrence is affine in the state. Per token, per head:
++
++    h_t = exp(dt_t * A_h) * h_{t-1} + B_t (dt_t x_t)^T
++
++`A_h` is one negative scalar per head, so the decay is a scalar. Fold a chunk
++of L tokens and the affine map falls out:
++
++    g_t     = dt_t * A_h                     log decay of one token
++    cum_t   = sum_{s <= t} g_s               running sum inside the chunk
++    A_chunk = exp(cum_{L-1})                 one scalar
++    B_chunk = sum_t exp(cum_{L-1} - cum_t) B_t (dt_t x_t)^T
++
++`exp(cum_{L-1} - cum_t)` is the decay that still applies to token `t` by the
++end of the chunk. The sum runs over `t` with no dependence between terms, so a
++chunk is one einsum. Only the chunk-to-chunk step is sequential, and
++`mamba2_backend.replay_scalar` runs that step.
++
++The state is `[..., K, V]` here, with heads leading, `K` = `ssm_state_size`
++and `V` = `mamba_head_dim`. Chunked arrays put the chunk axis first. The
++reference cache stores the same numbers as `[heads, mamba_head_dim,
++ssm_state_size]`, so it's the transpose; `as_cache_layout` and
++`from_cache_layout` convert.
++
++`chunk_outputs` turns the chunk boundary states into the per-token layer
++output. It adds the `C` projection against the state each chunk inherits, the
++causal intra-chunk block, and the `D` skip. `y_t` is what the gated norm and
++the output projection consume.
++
++`mamba_ssm_cache_dtype` is float32 even though the weights ship in BF16, so
++every function here that does arithmetic upcasts its inputs and returns
++float32. `state_dtype` overrides that, which is how a test measures what BF16
++accumulation costs. The two functions that only move data, `as_cache_layout`
++and `from_cache_layout`, pass the dtype through.
++
++Every matmul and einsum here asks for `Precision.HIGHEST`. A float32
++`dot_general` at the default precision rounds both operands to BF16 before the
++MXU multiplies them, which hands back the accuracy the float32 cache dtype
++pays for. CPU always runs true float32, so a CPU test can't see the difference.
++A test reads the jaxpr instead and fails on any `dot_general` that leaves the
++precision open.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import math
++
++import jax
++import jax.numpy as jnp
++from jax import lax
++
++__all__ = [
++    "Mamba2Config",
++    "PRECISION",
++    "STATE_DTYPE",
++    "as_cache_layout",
++    "chunk_outputs",
++    "chunk_terms",
++    "discretize",
++    "entering_states",
++    "from_cache_layout",
++]
++
++# `mamba_ssm_cache_dtype`. The state stays float32 in a BF16 model.
++STATE_DTYPE = jnp.float32
++
++# Keep float32 contractions in float32 on the MXU. See the module docstring.
++PRECISION = lax.Precision.HIGHEST
++
++
++@dataclasses.dataclass(frozen=True)
++class Mamba2Config:
++    """The fields of a Mamba-2 layer config that the chunked scan reads.
++
++    `time_step_limit` is the `(low, high)` clamp applied to `dt` after the
++    softplus. `config.json` calls the field `mamba_dt_limit`, and both
++    published Nemotron 3 checkpoints leave it at the `(0.0, inf)` default, the
++    pair Megatron-LM trains with.
++    """
++
++    ssm_state_size: int
++    mamba_num_heads: int
++    mamba_head_dim: int
++    n_groups: int
++    conv_kernel: int
++    chunk_size: int
++    time_step_limit: tuple[float, float] = (0.0, math.inf)
++
++    @property
++    def heads_per_group(self) -> int:
++        """Heads that share one `B` row. `B` is projected per group."""
++        return self.mamba_num_heads // self.n_groups
++
++    @property
++    def conv_dim(self) -> int:
++        """Channels the depthwise conv runs over.
++
++        The input projection hands the conv three concatenated pieces: the SSM
++        input at `mamba_num_heads * mamba_head_dim` channels, then `B` and `C`
++        at `n_groups * ssm_state_size` each.
++        """
++        return (
++            self.mamba_num_heads * self.mamba_head_dim
++            + 2 * self.n_groups * self.ssm_state_size
++        )
++
++
++def discretize(
++    dt_raw: jnp.ndarray,
++    dt_bias: jnp.ndarray,
++    a_log: jnp.ndarray,
++    time_step_limit: tuple[float, float] = (0.0, math.inf),
++) -> tuple[jnp.ndarray, jnp.ndarray]:
++    """Turn the raw `dt` projection and `A_log` into a step and a log decay.
++
++    Follows the Mamba-2 CUDA kernels: add the bias, softplus, clamp to
++    `time_step_limit`, then multiply by `A = -exp(A_log)`. Both ends of the
++    clamp apply, so a config with a finite upper limit gets it.
++
++    Args:
++      dt_raw: [T, H] the `dt` slice of the input projection.
++      dt_bias: [H]
++      a_log: [H] the stored log of `-A`.
++      time_step_limit: `(low, high)` clamp applied after the softplus, read
++        from `mamba_dt_limit` in `config.json`.
++
++    Returns:
++      dt: [T, H] float32 time step.
++      log_decay: [T, H] float32 `dt * A`, which is at most zero.
++    """
++    low, high = time_step_limit
++    dt = jax.nn.softplus(dt_raw.astype(STATE_DTYPE) + dt_bias.astype(STATE_DTYPE))
++    dt = jnp.clip(dt, low, high)
++    a = -jnp.exp(a_log.astype(STATE_DTYPE))
++    return dt, dt * a
++
++
++def _to_heads(b: jnp.ndarray, num_heads: int) -> jnp.ndarray:
++    """Expand a per-group `B` to per-head. [T, G, N] -> [T, H, N].
++
++    Head `h` reads group `h // heads_per_group`, so the repeat is contiguous.
++    """
++    groups = b.shape[-2]
++    if num_heads % groups:
++        raise ValueError(f"{num_heads} heads don't divide into {groups} groups")
++    return jnp.repeat(b, num_heads // groups, axis=-2)
++
++
++def chunk_terms(
++    x: jnp.ndarray,
++    b: jnp.ndarray,
++    dt: jnp.ndarray,
++    log_decay: jnp.ndarray,
++    chunk_size: int,
++    state_dtype: jnp.dtype = STATE_DTYPE,
++) -> tuple[jnp.ndarray, jnp.ndarray]:
++    """Fold each chunk into a log decay and a state increment.
++
++    Args:
++      x: [T, H, P] the SSM input, before the `dt` scaling.
++      b: [T, G, N] per group.
++      dt: [T, H]
++      log_decay: [T, H] `dt * A` from `discretize`.
++      chunk_size: `chunk_size` from the model config.
++      state_dtype: accumulation dtype.
++
++    Returns:
++      log_total: [C, H] the summed log decay of each chunk. `A_chunk` is
++        `exp(log_total)` times the identity.
++      b_chunks: [C, H, N, P] the state each chunk adds on its own.
++    """
++    tokens, heads, head_dim = x.shape
++    state_size = b.shape[-1]
++    if tokens % chunk_size:
++        raise ValueError(f"{tokens} tokens don't divide into chunks of {chunk_size}")
++    chunks = tokens // chunk_size
++
++    xd = x.astype(state_dtype) * dt.astype(state_dtype)[..., None]
++    xd = xd.reshape(chunks, chunk_size, heads, head_dim)
++    bh = _to_heads(b.astype(state_dtype), heads)
++    bh = bh.reshape(chunks, chunk_size, heads, state_size)
++
++    g = log_decay.astype(state_dtype).reshape(chunks, chunk_size, heads)
++    cum = jnp.cumsum(g, axis=1)
++    log_total = cum[:, -1, :]
++    # Decay still owed to token t when the chunk ends. The largest exponent is
++    # zero, at the last token, so this can't overflow.
++    decay = jnp.exp(log_total[:, None, :] - cum)
++
++    b_chunks = jnp.einsum(
++        "clhn,clhp->chnp", bh * decay[..., None], xd, precision=PRECISION
++    )
++    return log_total, b_chunks
++
++
++def entering_states(states: jnp.ndarray, h_in: jnp.ndarray) -> jnp.ndarray:
++    """Shift chunk boundary states so index `c` is the state entering chunk c.
++
++    `replay_scalar` returns the state after each chunk. `chunk_outputs` wants
++    the state before each chunk, which is the same list shifted right with the
++    incoming state in front.
++
++    Args:
++      states: [C, H, N, P] state after each chunk.
++      h_in: [H, N, P] state entering the first chunk.
++
++    Returns:
++      [C, H, N, P]
++
++    Concatenate first and drop the last row after: a slice of the tail would
++    drop the state the first chunk needs.
++    """
++    return jnp.concatenate([h_in[None].astype(states.dtype), states], axis=0)[:-1]
++
++
++def chunk_outputs(
++    x: jnp.ndarray,
++    b: jnp.ndarray,
++    c: jnp.ndarray,
++    dt: jnp.ndarray,
++    log_decay: jnp.ndarray,
++    h_entering: jnp.ndarray,
++    chunk_size: int,
++    d: jnp.ndarray | None = None,
++    state_dtype: jnp.dtype = STATE_DTYPE,
++) -> jnp.ndarray:
++    """Per-token layer output from each chunk's incoming state.
++
++    The scan carries the state from chunk to chunk. This turns that state into
++    `y_t`, the thing the gated norm and the output projection read. Three terms
++    add up, and the first two are the off-diagonal and diagonal blocks of the
++    SSD form:
++
++        y_t = C_t . h_t + D_h x_t
++            = exp(cum_t) C_t . h_in
++              + sum_{s <= t} exp(cum_t - cum_s) (C_t . B_s) dt_s x_s
++              + D_h x_t
++
++    `h_in` is the state entering the chunk that holds token `t`, so a chunk
++    needs nothing from the chunks around it beyond that one state. Inside a
++    chunk the sum over `s` is one masked einsum.
++
++    Args:
++      x: [T, H, P] the SSM input, before the `dt` scaling. `D` skips this, and
++        the second term scales it by `dt`.
++      b: [T, G, N] per group.
++      c: [T, G, N] per group, the same projection layout as `b`.
++      dt: [T, H]
++      log_decay: [T, H] `dt * A` from `discretize`.
++      h_entering: [C, H, N, P] state entering each chunk, from
++        `entering_states`.
++      chunk_size: `chunk_size` from the model config.
++      d: [H] the skip weight. `None` drops the skip.
++      state_dtype: accumulation dtype.
++
++    Returns:
++      [T, H, P] the mixer output before the gated norm.
++    """
++    tokens, heads, head_dim = x.shape
++    state_size = b.shape[-1]
++    if tokens % chunk_size:
++        raise ValueError(f"{tokens} tokens don't divide into chunks of {chunk_size}")
++    chunks = tokens // chunk_size
++
++    xd = x.astype(state_dtype) * dt.astype(state_dtype)[..., None]
++    xd = xd.reshape(chunks, chunk_size, heads, head_dim)
++    bh = _to_heads(b.astype(state_dtype), heads)
++    bh = bh.reshape(chunks, chunk_size, heads, state_size)
++    ch = _to_heads(c.astype(state_dtype), heads)
++    ch = ch.reshape(chunks, chunk_size, heads, state_size)
++
++    g = log_decay.astype(state_dtype).reshape(chunks, chunk_size, heads)
++    cum = jnp.cumsum(g, axis=1)
++
++    # Decay from source token s to target token t, zero where s is after t.
++    # Mask the exponent rather than the result, because cum_t - cum_s is
++    # positive above the diagonal and exp would overflow.
++    gap = cum[:, :, None, :] - cum[:, None, :, :]
++    causal = jnp.tril(jnp.ones((chunk_size, chunk_size), bool))[None, :, :, None]
++    decay = jnp.exp(jnp.where(causal, gap, -jnp.inf))
++
++    score = jnp.einsum("clhn,cshn->clsh", ch, bh, precision=PRECISION)
++    y = jnp.einsum("clsh,cshp->clhp", score * decay, xd, precision=PRECISION)
++
++    inherited = ch * jnp.exp(cum)[..., None]
++    y += jnp.einsum(
++        "clhn,chnp->clhp", inherited, h_entering.astype(state_dtype), precision=PRECISION
++    )
++
++    y = y.reshape(tokens, heads, head_dim)
++    if d is not None:
++        y += d.astype(state_dtype)[None, :, None] * x.astype(state_dtype)
++    return y
++
++
++def as_cache_layout(h: jnp.ndarray) -> jnp.ndarray:
++    """[..., N, P] -> [..., P, N], the layout the reference cache stores."""
++    return jnp.swapaxes(h, -1, -2)
++
++
++def from_cache_layout(h: jnp.ndarray) -> jnp.ndarray:
++    """[..., P, N] -> [..., N, P], the layout the affine scan wants."""
++    return jnp.swapaxes(h, -1, -2)
+diff --git a/python/sgl_jax/srt/layers/attention/mamba/mamba2_backend.py b/python/sgl_jax/srt/layers/attention/mamba/mamba2_backend.py
+new file mode 100644
+index 00000000..e4c63ebd
+--- /dev/null
++++ b/python/sgl_jax/srt/layers/attention/mamba/mamba2_backend.py
+@@ -0,0 +1,583 @@
++"""Mamba-2 attention backend: packed prefill and single-token decode.
++
++The mixer in ``models/nemotron_h.py`` hands over the fused conv stream and the
++raw ``dt`` projection. This backend owns everything that touches the cache: the
++depthwise conv state, the SSM state, and the chunked scan between them.
++
++**Prefill.** The engine packs several requests into one flat token axis, so the
++chunk grid has to cut at every request start. ``chunk_grid`` builds that grid
++from ``cu_q_lens``: chunk ``c`` holds up to ``chunk_size`` tokens and they all
++belong to one request, so a request whose length isn't a multiple of
++``chunk_size`` closes on a partial chunk. Padding slots carry ``dt = 0``, so
++they add nothing to the chunk's state increment and multiply its decay by one.
++
++With that grid the recurrence is affine:
++
++    h_c = A_c h_{c-1} + B_c
++
++``mamba2.chunk_terms`` returns ``A_c`` as one scalar per chunk per head and
++``B_c`` as the increment. ``open_requests`` folds each request's cached state
++into its first ``B_c``, and ``replay_scalar`` selects that ``B_c`` alone at a
++request start, so one scan carries every request in the batch. The boundary is
++a select rather than a multiply by a zero decay, because ``0 * inf`` is NaN: a
++multiply would carry one request's non-finite state into every request after
++it.
++
++**Decode.** One token per request, so the recurrence is one step and no chunk
++grid is needed.
++
++**Track slots.** With ``--enable-recurrent-extra-buffer`` the scheduler hands
++the backend a track slot for every request that ends a forward on a track
++boundary, and the radix tree later adopts that slot as the state of the prefix.
++The scheduler cuts a forward so it ends on the boundary, which makes the state
++the forward leaves the snapshot, so it goes to the track slot as well as the
++running slot.
++
++The conv runs through ``short_convolution``, the same packed varlen conv the KDA
++and GDN backends use.
++
++Both state slots are float32, because ``mamba_ssm_cache_dtype`` is float32 while
++the weights ship BF16.
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++import jax
++import jax.numpy as jnp
++from jax import lax
++from jax.sharding import PartitionSpec as P
++
++from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
++    LinearRecurrentAttnBackend,
++)
++from sgl_jax.srt.layers.attention.linear.short_convolution import short_convolution
++from sgl_jax.srt.layers.attention.mamba.mamba2 import (
++    PRECISION,
++    STATE_DTYPE,
++    as_cache_layout,
++    chunk_outputs,
++    chunk_terms,
++    discretize,
++    entering_states,
++    from_cache_layout,
++)
++from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
++from sgl_jax.srt.utils.profiling_utils import named_scope
++
++if TYPE_CHECKING:
++    from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
++
++__all__ = ["Mamba2AttnBackend", "chunk_grid", "open_requests", "replay_scalar"]
++
++
++def chunk_grid(cu_q_lens: jax.Array, num_tokens: int, chunk_size: int):
++    """Cut the packed token axis into chunks that never span two requests.
++
++    Args:
++      cu_q_lens: [B + 1] cumulative token counts, one entry per request plus a
++        leading zero. This is the metadata the hybrid recurrent path already
++        computes.
++      num_tokens: length of the packed token axis. Static.
++      chunk_size: `chunk_size` from the model config.
++
++    Returns:
++      token_index: [C, L] the token each grid slot reads. Out-of-range slots
++        clamp to a real index and are masked by `valid`.
++      valid: [C, L] bool. False on a padding slot.
++      request: [C] which request owns the chunk.
++      first: [C] bool. True on a request's first chunk, which is where the
++        cached state enters.
++      last_chunk: [B] the grid index each request closes on, so the final state
++        scatters back to the right cache slot.
++
++    The grid holds `num_tokens // chunk_size + B` chunks. Every request wastes
++    at most one partial chunk, so that bound is tight and static.
++    """
++    batch = cu_q_lens.shape[0] - 1
++    num_chunks = num_tokens // chunk_size + batch
++
++    starts = cu_q_lens[:-1]
++    ends = cu_q_lens[1:]
++    lengths = ends - starts
++    # Chunks each request needs, and where its first one lands in the grid.
++    per_request = (lengths + chunk_size - 1) // chunk_size
++    offsets = jnp.concatenate(
++        [jnp.zeros((1,), per_request.dtype), jnp.cumsum(per_request)[:-1]]
++    )
++
++    grid = jnp.arange(num_chunks, dtype=cu_q_lens.dtype)
++    # searchsorted on the exclusive prefix: chunk g belongs to the last request
++    # whose first chunk is at or before g. Requests with no chunks are skipped
++    # because their offset repeats the next one.
++    request = jnp.searchsorted(offsets + per_request, grid, side="right")
++    request = jnp.clip(request, 0, batch - 1)
++
++    within = grid - offsets[request]
++    chunk_start = starts[request] + within * chunk_size
++    token_index = chunk_start[:, None] + jnp.arange(chunk_size, dtype=cu_q_lens.dtype)[None, :]
++    valid = (token_index < ends[request][:, None]) & (within < per_request[request])[:, None]
++    token_index = jnp.clip(token_index, 0, max(num_tokens - 1, 0))
++
++    first = (within == 0) & (per_request[request] > 0)
++    last_chunk = jnp.clip(offsets + per_request - 1, 0, num_chunks - 1)
++    return token_index, valid, request, first, last_chunk
++
++
++def open_requests(
++    log_total: jax.Array, b_chunks: jax.Array, first: jax.Array, entering: jax.Array
++) -> jax.Array:
++    """Fold each request's cached state into its first chunk's increment.
++
++    One scan runs the whole packed batch. At a request's first chunk
++    `replay_scalar` drops the carry, which holds what the request before it
++    left, and restarts from `B_c`. So `B_c` there has to hold the request's own
++    cached state, decayed across the chunk, as well as what the chunk adds.
++
++    Args:
++      log_total: [C, H] summed log decay of each chunk.
++      b_chunks: [C, H, N, P] state each chunk adds on its own.
++      first: [C] bool. True on a request's first chunk.
++      entering: [C, H, N, P] the cached state of the request that owns each
++        chunk.
++
++    Returns:
++      [C, H, N, P] `b_chunks` with every first chunk rewritten.
++    """
++    decay = jnp.exp(log_total)[..., None, None]
++    return jnp.where(first[:, None, None, None], decay * entering + b_chunks, b_chunks)
++
++
++def replay_scalar(
++    log_total: jax.Array,
++    b_chunks: jax.Array,
++    h_in: jax.Array,
++    first: jax.Array | None = None,
++) -> jax.Array:
++    """Apply the chunk pairs in order, with a scalar decay per chunk.
++
++    `A_c` is a scalar times the identity, so the scan carries one number per
++    chunk per head where a dense `[K, K]` form would carry `K` squared: 16,384
++    times as many at `ssm_state_size=128`.
++
++    Args:
++      log_total: [C, H] summed log decay of each chunk. Zero means the chunk
++        keeps the state it inherits.
++      b_chunks: [C, H, N, P] state each chunk adds on its own.
++      h_in: [H, N, P] state entering the first chunk.
++      first: [C] bool, True on a request's first chunk, or None when every
++        chunk belongs to one sequence. The state there is `B_c` alone. It's a
++        select rather than a multiply by a zero decay: `0 * inf` is NaN, so a
++        multiply would carry one request's non-finite state into every request
++        after it.
++
++    Returns:
++      [C, H, N, P] state after each chunk.
++    """
++
++    @jax.checkpoint
++    def body(h, step):
++        decay, b, start = step
++        h_next = jnp.where(start, b, decay[:, None, None] * h + b)
++        return h_next, h_next
++
++    if first is None:
++        first = jnp.zeros(log_total.shape[:1], bool)
++    _, states = lax.scan(body, h_in, (jnp.exp(log_total), b_chunks, first))
++    return states
++
++
++def _reshard(value, spec: P):
++    """Put an operand on the layout the manual region declares.
++
++    A mesh axis of size one normalizes away, so a parameter built with
++    `kernel_axes=("tensor", None)` arrives replicated and `shard_map` rejects
++    it against `P("tensor", None)`. Resharding first states the layout.
++    """
++    if value is None:
++        return None
++    return jax.sharding.reshard(value, spec)
++
++
++class Mamba2AttnBackend(LinearRecurrentAttnBackend):
++    """Serving backend for the Nemotron 3 Mamba-2 mixer."""
++
++    def __init__(
++        self,
++        mamba_config=None,
++        mesh: jax.sharding.Mesh = None,
++        activation: str = "silu",
++    ):
++        # `mamba_config` defaults to None so the base class can rebuild the
++        # backend from its pytree, which calls `cls()` with no arguments.
++        super().__init__(mesh=mesh)
++        self.mamba_config = mamba_config
++        self.activation = activation
++
++    # ------------------------------------------------------------------
++    # Cache access. Same shape contract as the KDA backend, one axis wider:
++    # the SSM state is [slots, heads, mamba_head_dim, ssm_state_size], which
++    # is 64 by 128 rather than square.
++    # ------------------------------------------------------------------
++
++    def get_state(self, recurrent_state_pool, layer_id, recurrent_indices):
++        recurrent_buffer, conv_buffer_list = self.get_layer_cache(recurrent_state_pool, layer_id)
++        if len(conv_buffer_list) != 1:
++            raise ValueError(
++                f"Mamba-2 expects one conv buffer per layer, got {len(conv_buffer_list)}"
++            )
++
++        ssm = jax.shard_map(
++            lambda buf, idx: buf[idx],
++            mesh=self.mesh,
++            in_specs=(P("data", "tensor", None, None), P("data")),
++            out_specs=P("data", "tensor", None, None),
++            check_vma=False,
++        )(
++            _reshard(recurrent_buffer, P("data", "tensor", None, None)),
++            _reshard(recurrent_indices, P("data")),
++        )
++
++        conv = jax.shard_map(
++            lambda buf, idx: buf[idx],
++            mesh=self.mesh,
++            in_specs=(P("data", "tensor", None), P("data")),
++            out_specs=P("data", "tensor", None),
++            check_vma=False,
++        )(
++            _reshard(conv_buffer_list[0], P("data", "tensor", None)),
++            _reshard(recurrent_indices, P("data")),
++        )
++
++        has_initial_state = self.forward_metadata.has_initial_state
++        if has_initial_state is not None:
++            ssm = jnp.where(has_initial_state[:, None, None, None], ssm, 0.0)
++            conv = jnp.where(has_initial_state[:, None, None], conv, 0.0)
++        return ssm, conv
++
++    def set_ssm_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_ssm):
++        full_recurrent, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
++
++        def _scatter(buf, idx, val):
++            # Padding rows carry idx 0. Writing them pollutes the dummy slot,
++            # which comes back as another request's initial state.
++            keep = (idx == 0).reshape(-1, 1, 1, 1)
++            return buf.at[idx].set(jnp.where(keep, buf[idx], val))
++
++        return jax.shard_map(
++            _scatter,
++            mesh=self.mesh,
++            in_specs=(
++                P("data", "tensor", None, None),
++                P("data"),
++                P("data", "tensor", None, None),
++            ),
++            out_specs=P("data", "tensor", None, None),
++            check_vma=False,
++        )(
++            _reshard(full_recurrent, P("data", "tensor", None, None)),
++            _reshard(recurrent_indices, P("data")),
++            _reshard(new_ssm, P("data", "tensor", None, None)),
++        )
++
++    def set_conv_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_conv):
++        _, conv_buffer_list = self.get_layer_cache(recurrent_state_pool, layer_id)
++
++        def _scatter(buf, idx, val):
++            keep = (idx == 0).reshape(-1, 1, 1)
++            return buf.at[idx].set(jnp.where(keep, buf[idx], val))
++
++        return [
++            jax.shard_map(
++                _scatter,
++                mesh=self.mesh,
++                in_specs=(P("data", "tensor", None), P("data"), P("data", "tensor", None)),
++                out_specs=P("data", "tensor", None),
++                check_vma=False,
++            )(
++                _reshard(conv_buffer_list[0], P("data", "tensor", None)),
++                _reshard(recurrent_indices, P("data")),
++                _reshard(new_conv, P("data", "tensor", None)),
++            )
++        ]
++
++    def _set_track_state(self, full_buffer, track_indices, track_mask, new_state):
++        """Write `new_state` into each boundary request's track slot as well.
++
++        Takes the buffer `set_ssm_state` or `set_conv_state` returned, so the
++        running slot and the track slot both keep this forward's state. A row
++        keeps what its slot held when the track index is 0, the padding dummy,
++        or the mask is 0, a request that crossed no boundary this forward. The
++        result goes through the same `optimization_barrier` the KDA backend
++        puts on its track write to the donated pool buffer.
++        """
++        spec = P("data", "tensor", *([None] * (full_buffer.ndim - 2)))
++
++        def _scatter(buf, tidx, tmask, val):
++            keep = ((tidx == 0) | (tmask == 0)).reshape(-1, *([1] * (val.ndim - 1)))
++            return buf.at[tidx].set(jnp.where(keep, buf[tidx], val))
++
++        new_full = jax.shard_map(
++            _scatter,
++            mesh=self.mesh,
++            in_specs=(spec, P("data"), P("data"), spec),
++            out_specs=spec,
++            check_vma=False,
++        )(
++            _reshard(full_buffer, spec),
++            _reshard(track_indices, P("data")),
++            _reshard(track_mask, P("data")),
++            _reshard(new_state, spec),
++        )
++        return jax.lax.optimization_barrier(new_full)
++
++    # ------------------------------------------------------------------
++    # Forward
++    # ------------------------------------------------------------------
++
++    @named_scope
++    def __call__(
++        self,
++        q: jax.Array,
++        k: jax.Array,
++        v: jax.Array,
++        a: jax.Array,
++        b: jax.Array,
++        layer,
++        forward_batch: ForwardBatch,
++        recurrent_state_pool,
++        **kwargs,
++    ):
++        """Run the mixer's state path.
++
++        Args:
++          q: [T, conv_dim] the fused conv stream, before the conv. It carries
++            the SSM input, then `B`, then `C`.
++          k, v, b: unused. The signature is the one `HybridLinearAttnBackend`
++            calls every linear backend with.
++          a: [T, H] the raw `dt` projection.
++          layer: the mixer, which holds the conv weight, `A_log`, `dt_bias`
++            and `D`.
++
++        Returns:
++          y: [T, H * mamba_head_dim] the mixer output, before the gated norm.
++          state: `(ssm_buffers, conv_buffers)` for the cache writeback.
++        """
++        del k, v, b
++        cfg = self.mamba_config
++        recurrent_indices = self.forward_metadata.recurrent_indices
++        cu_q_lens = self.forward_metadata.cu_q_lens
++
++        ssm_cache, conv_cache = self.get_state(
++            recurrent_state_pool, layer.layer_id, recurrent_indices
++        )
++
++        xbc, new_conv = self._conv(
++            q, layer.conv1d_weight.value, layer.conv1d_bias, conv_cache, cu_q_lens, forward_batch
++        )
++
++        # The conv stream is one `conv_dim` axis sharded over the tensor mesh,
++        # and the three pieces inside it don't start on a shard edge, so every
++        # reshape below states the layout it wants rather than inferring one.
++        inner = cfg.mamba_num_heads * cfg.mamba_head_dim
++        state_width = cfg.n_groups * cfg.ssm_state_size
++        by_head = jax.sharding.NamedSharding(self.mesh, P("data", "tensor", None))
++        by_group = jax.sharding.NamedSharding(self.mesh, P("data", None, None))
++        x, b_proj, c_proj = jnp.split(xbc, [inner, inner + state_width], axis=-1)
++        x = x.reshape(-1, cfg.mamba_num_heads, cfg.mamba_head_dim, out_sharding=by_head)
++        b_proj = b_proj.reshape(
++            -1, cfg.n_groups, cfg.ssm_state_size, out_sharding=by_group
++        )
++        c_proj = c_proj.reshape(
++            -1, cfg.n_groups, cfg.ssm_state_size, out_sharding=by_group
++        )
++
++        dt, log_decay = discretize(
++            a, layer.dt_bias.value, layer.a_log.value, cfg.time_step_limit
++        )
++
++        # The cache stores [heads, mamba_head_dim, ssm_state_size]; the scan
++        # wants [heads, ssm_state_size, mamba_head_dim].
++        h_in = from_cache_layout(ssm_cache.astype(STATE_DTYPE))
++
++        decode = forward_batch.forward_mode == ForwardMode.DECODE
++        heads_per_group = cfg.heads_per_group
++
++        def _state_path(x, b_proj, c_proj, dt, log_decay, h_in, d, cu):
++            b_local = self._local_groups(b_proj, x.shape[1], heads_per_group)
++            c_local = self._local_groups(c_proj, x.shape[1], heads_per_group)
++            if decode:
++                return self._decode(x, b_local, c_local, dt, log_decay, h_in, d)
++            return self._extend(x, b_local, c_local, dt, log_decay, h_in, d, cu)
++
++        # `B` and `C` stay replicated across the tensor axis. They hold
++        # `n_groups * ssm_state_size` numbers per token against the head
++        # path's `mamba_num_heads * mamba_head_dim`, so replicating them is
++        # cheaper than resharding the group axis.
++        y, new_ssm = jax.shard_map(
++            _state_path,
++            mesh=self.mesh,
++            in_specs=(
++                P("data", "tensor", None),  # x [T, H, P]
++                P("data", None, None),  # B [T, G, N]
++                P("data", None, None),  # C [T, G, N]
++                P("data", "tensor"),  # dt [T, H]
++                P("data", "tensor"),  # log decay [T, H]
++                P("data", "tensor", None, None),  # state [B, H, N, P]
++                P("tensor"),  # D [H]
++                P("data"),  # cu_q_lens [B + 1]
++            ),
++            out_specs=(P("data", "tensor", None), P("data", "tensor", None, None)),
++            check_vma=False,
++        )(
++            _reshard(x, P("data", "tensor", None)),
++            _reshard(b_proj, P("data", None, None)),
++            _reshard(c_proj, P("data", None, None)),
++            _reshard(dt, P("data", "tensor")),
++            _reshard(log_decay, P("data", "tensor")),
++            _reshard(h_in, P("data", "tensor", None, None)),
++            _reshard(layer.d.value, P("tensor")),
++            _reshard(cu_q_lens, P("data")),
++        )
++
++        new_ssm_full = self.set_ssm_state(
++            recurrent_state_pool, layer.layer_id, recurrent_indices, new_ssm
++        )
++        new_conv_full = self.set_conv_state(
++            recurrent_state_pool, layer.layer_id, recurrent_indices, new_conv
++        )
++
++        # The extra buffer's snapshot. The metadata is None when the flag is
++        # off or no request crosses a boundary, and that path compiles as
++        # before.
++        track_indices = self.forward_metadata.recurrent_track_indices
++        if track_indices is not None:
++            track_mask = self.forward_metadata.recurrent_track_mask
++            new_ssm_full = self._set_track_state(
++                new_ssm_full, track_indices, track_mask, new_ssm
++            )
++            new_conv_full = [
++                self._set_track_state(new_conv_full[0], track_indices, track_mask, new_conv)
++            ]
++        return y.reshape(y.shape[0], -1), (new_ssm_full, new_conv_full)
++
++    def _conv(self, xbc, weight, bias, conv_cache, cu_q_lens, forward_batch):
++        """Depthwise causal conv over the fused stream, then the activation.
++
++        The conv is per channel, so a device's stripe of `conv_dim` is
++        self-contained and the manual region needs no collective.
++        """
++        mode = forward_batch.forward_mode
++        bias_value = bias.value if bias is not None else None
++
++        def _call(x, w, cache, cu, b):
++            return short_convolution(x, w, cache, cu, mode, bias=b, activation=self.activation)
++
++        sharded = jax.shard_map(
++            _call,
++            mesh=self.mesh,
++            in_specs=(
++                P("data", "tensor"),  # x [T, conv_dim]
++                P("tensor", None),  # weight [conv_dim, K]
++                P("data", "tensor", None),  # cache [B, conv_dim, K-1]
++                P("data"),  # cu_q_lens [B+1]
++                P("tensor") if bias_value is not None else None,  # bias [conv_dim]
++            ),
++            out_specs=(P("data", "tensor"), P("data", "tensor", None)),
++            check_vma=False,
++        )
++        y, new_cache = sharded(
++            _reshard(xbc, P("data", "tensor")),
++            _reshard(weight, P("tensor", None)),
++            _reshard(conv_cache, P("data", "tensor", None)),
++            _reshard(cu_q_lens, P("data")),
++            _reshard(bias_value, P("tensor")),
++        )
++        return y.astype(STATE_DTYPE), new_cache
++
++    def _local_groups(self, b_proj, heads_local: int, heads_per_group: int):
++        """The `B` or `C` rows this device's heads read.
++
++        `B` and `C` are projected per group and the state path shards by head,
++        so a device holds a slice of the group axis. `n_groups` is 8 at every
++        published size, which is below the tensor axis of a large mesh, so
++        several devices read the same group.
++        """
++        if heads_local % heads_per_group and heads_per_group % heads_local:
++            raise ValueError(
++                f"{heads_local} heads per device don't line up with "
++                f"{heads_per_group} heads per group"
++            )
++        span = max(1, heads_local // heads_per_group)
++        first_head = lax.axis_index("tensor") * heads_local
++        return lax.dynamic_slice_in_dim(b_proj, first_head // heads_per_group, span, axis=1)
++
++    def _decode(self, x, b_proj, c_proj, dt, log_decay, h_in, d):
++        """One token per request.
++
++        h = exp(dt A) h + B (dt x)^T, then y = C . h + D x.
++        """
++        heads = x.shape[1]
++        groups = b_proj.shape[1]
++        repeat = heads // groups
++        bh = jnp.repeat(b_proj.astype(STATE_DTYPE), repeat, axis=1)
++        ch = jnp.repeat(c_proj.astype(STATE_DTYPE), repeat, axis=1)
++        xd = x.astype(STATE_DTYPE) * dt[..., None]
++
++        decay = jnp.exp(log_decay)[..., None, None]
++        h = decay * h_in + bh[..., None] * xd[:, :, None, :]
++        y = jnp.einsum("bhn,bhnp->bhp", ch, h, precision=PRECISION)
++        y = y + d.astype(STATE_DTYPE)[None, :, None] * x.astype(STATE_DTYPE)
++        return y, as_cache_layout(h)
++
++    def _extend(self, x, b_proj, c_proj, dt, log_decay, h_in, d, cu_q_lens):
++        """Packed prefill over a chunk grid that cuts at every request start."""
++        cfg = self.mamba_config
++        tokens = x.shape[0]
++        chunk = cfg.chunk_size
++        token_index, valid, request, first, last_chunk = chunk_grid(cu_q_lens, tokens, chunk)
++        grid_shape = token_index.shape
++
++        def gather(arr):
++            return arr[token_index.reshape(-1)].reshape(*grid_shape, *arr.shape[1:])
++
++        # A padding slot takes dt = 0, so it adds nothing and decays by one.
++        # Its `x` and `B` read zero as well. The gather clamps a padding slot
++        # onto a token of the next request, and a zero weight on that token's
++        # `B` still gives NaN when the value isn't finite. `C` only reaches the
++        # padding slot's own output row, which the scatter below drops.
++        keep = valid[..., None]
++        x_g = jnp.where(keep[..., None], gather(x), 0.0)
++        b_g = jnp.where(keep[..., None], gather(b_proj), 0.0)
++        c_g = gather(c_proj)
++        dt_g = jnp.where(keep, gather(dt), 0.0)
++        g_g = jnp.where(keep, gather(log_decay), 0.0)
++
++        x_flat = x_g.reshape(-1, *x_g.shape[2:])
++        b_flat = b_g.reshape(-1, *b_g.shape[2:])
++        c_flat = c_g.reshape(-1, *c_g.shape[2:])
++        dt_flat = dt_g.reshape(-1, dt_g.shape[-1])
++        g_flat = g_g.reshape(-1, g_g.shape[-1])
++
++        log_total, b_chunks = chunk_terms(x_flat, b_flat, dt_flat, g_flat, chunk)
++
++        entering = h_in[request]
++        b_chunks = open_requests(log_total, b_chunks, first, entering)
++
++        states = replay_scalar(log_total, b_chunks, jnp.zeros_like(h_in[0]), first)
++        # The state entering a chunk is the state after the chunk before it,
++        # except on a request's first chunk, which takes the cache.
++        shifted = entering_states(states, jnp.zeros_like(h_in[0]))
++        h_entering = jnp.where(first[:, None, None, None], entering, shifted)
++
++        y = chunk_outputs(x_flat, b_flat, c_flat, dt_flat, g_flat, h_entering, chunk, d=d)
++
++        # Scatter back to the packed layout. A padding slot gets an index past
++        # the end, and `mode="drop"` throws it away rather than overwriting a
++        # real token.
++        scatter_index = jnp.where(valid, token_index, tokens).reshape(-1)
++        out = jnp.zeros((tokens, *y.shape[1:]), y.dtype)
++        out = out.at[scatter_index].set(y, mode="drop")
++        new_ssm = as_cache_layout(states[last_chunk])
++        return out, new_ssm
+diff --git a/python/sgl_jax/srt/layers/moe.py b/python/sgl_jax/srt/layers/moe.py
+index 18b2a09b..c4bc7535 100644
+--- a/python/sgl_jax/srt/layers/moe.py
++++ b/python/sgl_jax/srt/layers/moe.py
+@@ -42,6 +42,7 @@ class EPMoE(nnx.Module):
+         weight_dtype: jnp.dtype = jnp.bfloat16,
+         dtype: jnp.dtype = jnp.bfloat16,
+         activation: str = "silu",
++        gated: bool = True,
+         layer_id: int = 0,
+         quantization_config=None,
+         physical_to_logical_map: "jax.Array | None" = None,
+@@ -50,6 +51,9 @@ class EPMoE(nnx.Module):
+         use_sc_permute: bool | None = None,
+     ):
+         self.num_experts_per_tok = num_experts_per_tok
++        # A gated expert reads two input matrices and multiplies them.
++        # Nemotron 3 experts read one and square the ReLU, so `wi_1` is absent.
++        self.gated = gated
+         # Opt-in SparseCore permute/unpermute kernels; ``None`` defers to the env flag.
+         self.use_sc_permute = (
+             moe_sc_permute_enabled_by_env() if use_sc_permute is None else bool(use_sc_permute)
+@@ -147,14 +151,17 @@ class EPMoE(nnx.Module):
+                 )
+             )
+ 
+-            self.wi_1 = nnx.Param(
+-                jax.random.normal(
+-                    jax.random.PRNGKey(0),
+-                    (self.num_experts, hidden_size, intermediate_dim),
+-                    dtype=weight_dtype,
+-                    out_sharding=wi_sharding,
++            if self.gated:
++                self.wi_1 = nnx.Param(
++                    jax.random.normal(
++                        jax.random.PRNGKey(0),
++                        (self.num_experts, hidden_size, intermediate_dim),
++                        dtype=weight_dtype,
++                        out_sharding=wi_sharding,
++                    )
+                 )
+-            )
++            else:
++                self.wi_1 = None
+ 
+             self.wo = nnx.Param(
+                 jax.random.normal(
+@@ -171,6 +178,15 @@ class EPMoE(nnx.Module):
+             self.wi_1_scale = None
+             self.wo_scale = None
+ 
++    @property
++    def wi_1_operand(self):
++        """The second input matrix, or a stand-in when the experts aren't gated.
++
++        `shard_map` takes a fixed operand list, so an ungated layer repeats
++        `wi_0` in the slot. `_forward` never reads it, so XLA drops it.
++        """
++        return self.wi_0.value if self.wi_1 is None else self.wi_1.value
++
+     def _detect_device_capabilities(self):
+         try:
+             devices = jax.devices()
+@@ -342,6 +358,8 @@ class EPMoE(nnx.Module):
+                     # dtype. Dummy loading must use that same weight contract.
+                     for name in ("wi_0", "wi_1", "wo"):
+                         param = getattr(self, name)
++                        if param is None:  # no wi_1 on an ungated expert
++                            continue
+                         param.value = jax.ShapeDtypeStruct(
+                             param.value.shape, self.quantized_dtype, sharding=param.value.sharding
+                         )
+@@ -379,13 +397,17 @@ class EPMoE(nnx.Module):
+ 
+                 if hasattr(self, "wi_1_scale"):
+                     del self.wi_1_scale
+-                self.wi_1_scale = nnx.Param(
+-                    jnp.zeros(
+-                        (num_experts, k_blocks_wi, 1, intermediate_dim),
+-                        dtype=jnp.float32,
++                self.wi_1_scale = (
++                    nnx.Param(
++                        jnp.zeros(
++                            (num_experts, k_blocks_wi, 1, intermediate_dim),
++                            dtype=jnp.float32,
++                            out_sharding=wi_scale_sharding,
++                        ),
+                         out_sharding=wi_scale_sharding,
+-                    ),
+-                    out_sharding=wi_scale_sharding,
++                    )
++                    if self.gated
++                    else None
+                 )
+ 
+                 if hasattr(self, "wo_scale"):
+@@ -415,12 +437,14 @@ class EPMoE(nnx.Module):
+                 axis=1,
+                 block_size=block_size_k,
+             )
+-            w1_value, w1_scale = quantize_tensor(
+-                self.quantized_dtype,
+-                self.wi_1.value,
+-                axis=1,
+-                block_size=block_size_k,
+-            )
++            # An ungated expert has no wi_1, so it quantizes two matrices.
++            if self.gated:
++                w1_value, w1_scale = quantize_tensor(
++                    self.quantized_dtype,
++                    self.wi_1.value,
++                    axis=1,
++                    block_size=block_size_k,
++                )
+             wo_value, wo_scale = quantize_tensor(
+                 self.quantized_dtype,
+                 self.wo.value,
+@@ -429,18 +453,21 @@ class EPMoE(nnx.Module):
+             )
+ 
+             self.wi_0 = nnx.Param(w0_value, out_sharding=P("expert", None, "tensor"))
+-            self.wi_1 = nnx.Param(w1_value, out_sharding=P("expert", None, "tensor"))
++            if self.gated:
++                self.wi_1 = nnx.Param(w1_value, out_sharding=P("expert", None, "tensor"))
+             self.wo = nnx.Param(wo_value, out_sharding=P("expert", "tensor", None))
+ 
+             if block_size_k is not None:
+                 # axis=1 quantization on [g, k, n] gives scale [g, k_blocks, n]
+                 # → expand to [g, k_blocks, 1, n]
+                 w0_scale = w0_scale[:, :, None, :]
+-                w1_scale = w1_scale[:, :, None, :]
++                if self.gated:
++                    w1_scale = w1_scale[:, :, None, :]
+                 wo_scale = wo_scale[:, :, None, :]
+             else:
+                 w0_scale = w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1])
+-                w1_scale = w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1])
++                if self.gated:
++                    w1_scale = w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1])
+                 wo_scale = wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1])
+ 
+             if hasattr(self, "wi_0_scale"):
+@@ -452,9 +479,13 @@ class EPMoE(nnx.Module):
+ 
+             if hasattr(self, "wi_1_scale"):
+                 del self.wi_1_scale
+-            self.wi_1_scale = nnx.Param(
+-                w1_scale,
+-                out_sharding=P("expert", None, None, "tensor"),
++            self.wi_1_scale = (
++                nnx.Param(
++                    w1_scale,
++                    out_sharding=P("expert", None, None, "tensor"),
++                )
++                if self.gated
++                else None
+             )
+ 
+             if hasattr(self, "wo_scale"):
+@@ -515,7 +546,7 @@ class EPMoE(nnx.Module):
+             )
+             w1_scale = self._normalize_scale_for_gmm(
+                 self.wi_1_scale.value if self.wi_1_scale is not None else None,
+-                self.wi_1.value,
++                self.wi_1_operand,
+                 scale_name="wi_1_scale",
+             )
+             wo_scale = self._normalize_scale_for_gmm(
+@@ -551,7 +582,7 @@ class EPMoE(nnx.Module):
+                 topk_weights_reshard,
+                 topk_ids_reshard,
+                 self.wi_0.value,
+-                self.wi_1.value,
++                self.wi_1_operand,
+                 self.wo.value,
+                 w0_scale,
+                 w1_scale,
+@@ -607,7 +638,7 @@ class EPMoE(nnx.Module):
+                 topk_weights,
+                 topk_ids,
+                 self.wi_0[...],
+-                self.wi_1[...],
++                self.wi_1_operand,
+                 self.wo[...],
+             )
+ 
+@@ -756,7 +787,7 @@ class EPMoE(nnx.Module):
+             acc_dtype=jnp.float32,
+         )
+ 
+-        # === GEMM1: x @ w0 and x @ w1 ===
++        # === GEMM1: x @ w0, and x @ w1 when the expert is gated ===
+         layer_w0 = gmm(
+             lhs=x,
+             rhs=w0_kernel,
+@@ -766,24 +797,30 @@ class EPMoE(nnx.Module):
+             activation_quantized_dtype=act_q_dtype,
+             **gmm_kwargs,
+         )
+-        layer_w1 = gmm(
+-            lhs=x,
+-            rhs=w1_kernel,
+-            rhs_scale=w1_kernel_scale,
+-            rhs_bias=w1_kernel_bias,
+-            zero_initialize=False,
+-            activation_quantized_dtype=act_q_dtype,
+-            **gmm_kwargs,
+-        )
+ 
+         # === Activation ===
+         if self.activation == "silu":
+             layer_act = jax.nn.silu(layer_w0)
+         elif self.activation == "gelu":
+             layer_act = jax.nn.gelu(layer_w0)
++        elif self.activation == "relu2":
++            layer_act = jnp.square(jax.nn.relu(layer_w0))
+         else:
+             raise ValueError(f"Unsupported activation function {self.activation}")
+-        intermediate_layer = jnp.multiply(layer_act, layer_w1)
++
++        if self.gated:
++            layer_w1 = gmm(
++                lhs=x,
++                rhs=w1_kernel,
++                rhs_scale=w1_kernel_scale,
++                rhs_bias=w1_kernel_bias,
++                zero_initialize=False,
++                activation_quantized_dtype=act_q_dtype,
++                **gmm_kwargs,
++            )
++            intermediate_layer = jnp.multiply(layer_act, layer_w1)
++        else:
++            intermediate_layer = layer_act
+ 
+         # === GEMM2: intermediate @ wo ===
+         return gmm(
+@@ -944,15 +981,24 @@ def create_moe_weights_mapping(
+     moe_path: str = "mlp",
+     source_expert_pattern: str = "experts.{i}",
+     physical_to_logical_map=None,  # np.ndarray shape (num_physical,) or None
++    gated: bool = True,
+ ) -> dict:
+-    """Generate a unified mapping dictionary for MoE layer expert weights."""
++    """Generate a unified mapping dictionary for MoE layer expert weights.
++
++    ``gated=False`` covers experts with one input matrix, such as Nemotron 3's
++    squared-ReLU experts. The middle entry of ``expert_type_names`` is unused
++    then, and the layer holds no ``wi_1``.
++    """
+     if moe_backend == "epmoe":
+         expert_type_map = {
+             expert_type_names[0]: "wi_0",
+-            expert_type_names[1]: "wi_1",
+             expert_type_names[2]: "wo",
+         }
++        if gated:
++            expert_type_map[expert_type_names[1]] = "wi_1"
+     elif moe_backend in ("fused", "fused_v2"):
++        if not gated:
++            raise ValueError("the fused MoE backends require gated experts")
+         expert_type_map = {
+             expert_type_names[0]: "w1",
+             expert_type_names[1]: "w3",
+diff --git a/python/sgl_jax/srt/mem_cache/recurrent_state_pool.py b/python/sgl_jax/srt/mem_cache/recurrent_state_pool.py
+index d0505d6b..85512a7f 100644
+--- a/python/sgl_jax/srt/mem_cache/recurrent_state_pool.py
++++ b/python/sgl_jax/srt/mem_cache/recurrent_state_pool.py
+@@ -153,12 +153,17 @@ class RecurrentStatePool:
+             f"num_heads {num_heads} must be divisible by "
+             f"'{recurrent_partition_axis}' size {recurrent_axis_size}"
+         )
+-        assert num_k_heads % recurrent_axis_size == 0, (
+-            f"num_k_heads {num_k_heads} must be divisible by "
+-            f"'{recurrent_partition_axis}' size {recurrent_axis_size}"
++        # The conv buffer shards `proj_size`, which concatenates the value
++        # stream and the two key streams. That split lands on a segment
++        # boundary only when both segments shard evenly. `num_k_heads` itself
++        # never shards: the recurrent buffer carries `num_heads`, and a model
++        # with fewer key heads than devices reads a replicated key stream.
++        assert proj_v % conv_axis_size == 0, (
++            f"num_heads * head_dim {proj_v} must be divisible by "
++            f"'{conv_partition_axis}' size {conv_axis_size}"
+         )
+-        assert self.proj_size % conv_axis_size == 0, (
+-            f"proj_size {self.proj_size} must be divisible by "
++        assert proj_k % conv_axis_size == 0, (
++            f"num_k_heads * head_k_dim {proj_k} must be divisible by "
+             f"'{conv_partition_axis}' size {conv_axis_size}"
+         )
+ 
+@@ -170,7 +175,11 @@ class RecurrentStatePool:
+         self.recurrent_buffers, self.conv_buffers = self._create_buffers(abstract=abstract)
+ 
+     def _create_buffers(self, *, abstract: bool = False) -> tuple[list, list]:
+-        recurrent_shape = (self.total_slots, self.num_heads, self.head_dim, self.head_dim)
++        # The state is [heads, value width, key width]. KDA and GDN run the two
++        # widths equal, so `head_k_dim` defaults to `head_dim` and the buffer is
++        # square. Mamba-2 runs 64 by 128, so the key width has to be its own
++        # axis or the SSM state doesn't fit.
++        recurrent_shape = (self.total_slots, self.num_heads, self.head_dim, self.head_k_dim)
+         conv_shape = (self.total_slots, self.proj_size, self.conv_kernel_size - 1)
+         temporal_dtype = self.temporal_dtype
+         conv_dtype = self.conv_dtype
+diff --git a/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py
+index f44322a8..c5727164 100644
+--- a/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -54,7 +54,7 @@ def _compute_recurrent_per_req_bytes(
+     proj_size = num_heads * head_dim + 2 * (num_k_heads * head_k_dim)
+     assert proj_size % tp_size == 0, f"proj_size {proj_size} must be divisible by tp_size {tp_size}"
+     per_req_recurrent = (
+-        num_layers * (num_heads // tp_size) * head_dim * head_dim * temporal_dtype_bytes
++        num_layers * (num_heads // tp_size) * head_dim * head_k_dim * temporal_dtype_bytes
+     )
+     per_req_conv = num_layers * (conv_kernel_size - 1) * (proj_size // tp_size) * conv_dtype_bytes
+     return per_req_recurrent + per_req_conv
+@@ -915,6 +915,8 @@ class ModelRunnerKVCacheMixin:
+             return self.qwen3_5_hybrid_config.text_config
+         if self.qwen4_exp_config is not None:
+             return self.qwen4_exp_config.text_config
++        if getattr(self.model_config.hf_config, "model_type", None) == "nemotron_h":
++            return self.model_config.hf_config
+         return self.lightning_config
+ 
+     def _kv_pool_layer_count(self: ModelRunner):
+diff --git a/python/sgl_jax/srt/models/nemotron_h.py b/python/sgl_jax/srt/models/nemotron_h.py
+new file mode 100644
+index 00000000..253fe621
+--- /dev/null
++++ b/python/sgl_jax/srt/models/nemotron_h.py
+@@ -0,0 +1,931 @@
++"""Nemotron 3: Mamba-2, attention and LatentMoE on one irregular stack.
++
++Covers `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16` and
++`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16`. Both ship
++`NemotronHForCausalLM` and `model_type: nemotron_h`.
++
++**One sublayer per block.** A block is one norm, one mixer, one residual add.
++The mixer is a Mamba-2 state space layer, a GQA attention layer, a LatentMoE
++layer or a dense MLP, and `configs/nemotron_h.py` reads which from
++`layers_block_type` or `hybrid_override_pattern`. That's why the stack can't be
++one `lax.scan` over layers: neither the weight shapes nor the body repeat.
++
++**Mamba-2.** The mixer projects, then hands the conv stream and `dt` to
++`Mamba2AttnBackend`, which owns the conv state, the SSM state and the chunked
++scan. `layers/attention/mamba/mamba2.py` folds a chunk of tokens into one
++affine step and the backend scans those steps.
++
++**LatentMoE.** The experts don't run at `hidden_size`. The router reads the
++full-width token, `fc1_latent_proj` drops it to `moe_latent_size`, 1,024 on
++Super and 2,048 on Ultra, the experts run there, and `fc2_latent_proj` lifts
++the result back. The reference does the same thing in the same order. Routing
++is top-22 of 512 on both sizes, so the dispatch carries 22 copies of a latent
++token rather than 22 copies of a full one. One shared expert runs at
++`hidden_size` on every token, in parallel with the routed path.
++
++The experts aren't gated: one `up_proj`, `mlp_hidden_act`, one `down_proj`.
++`EPMoE(gated=False)` runs them, which is one grouped matmul per expert GEMM
++rather than two.
++
++**Tensor parallelism.** The gated norm runs `n_groups` RMS groups, 8 at both
++published sizes. A tensor axis wider than 8 splits a group across shards, and
++`GroupRMSNorm` then sums each group with one all-reduce of a `[tokens, 8]`
++array. `num_heads`, `conv_dim`, the latent and the expert count all divide by
++32, so a 32-chip slice shards the whole model.
++"""
++
++from __future__ import annotations
++
++import logging
++
++import jax
++import jax.numpy as jnp
++from flax import nnx
++from jax.sharding import NamedSharding
++from jax.sharding import PartitionSpec as P
++
++from sgl_jax.srt.configs.model_config import ModelConfig
++from sgl_jax.srt.configs.nemotron_h import NemotronHConfig
++from sgl_jax.srt.configs.quantization_config import QuantizationConfig
++from sgl_jax.srt.eplb.expert_location import get_global_server_args
++from sgl_jax.srt.layers.attention.fla.group_rmsnorm import GroupRMSNorm
++from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
++from sgl_jax.srt.layers.gate import GateLogit, TopK
++from sgl_jax.srt.layers.layernorm import RMSNorm
++from sgl_jax.srt.layers.linear import LinearBase
++from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
++from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
++from sgl_jax.srt.layers.radix_attention import RadixAttention
++from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
++from sgl_jax.srt.utils.profiling_utils import named_scope
++from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
++
++logger = logging.getLogger(__name__)
++
++__all__ = [
++    "NemotronHAttention",
++    "NemotronHBlock",
++    "NemotronHForCausalLM",
++    "NemotronHLatentMoE",
++    "NemotronHMLP",
++    "NemotronHMamba2Mixer",
++    "NemotronHModel",
++]
++
++
++def relu2(x: jax.Array) -> jax.Array:
++    """The squared ReLU both published Nemotron 3 feed-forwards use."""
++    return jnp.square(jax.nn.relu(x))
++
++
++# `mlp_hidden_act`, and the two names `EPMoE` runs under the same semantics as
++# the reference `ACT2FN` table. A checkpoint that ships anything else is
++# rejected at build time rather than run as squared ReLU.
++MLP_ACTIVATIONS = {"relu2": relu2, "silu": jax.nn.silu}
++
++
++def mlp_activation(name: str):
++    """The feed-forward activation `mlp_hidden_act` names."""
++    try:
++        return MLP_ACTIVATIONS[name]
++    except KeyError:
++        raise ValueError(
++            f"mlp_hidden_act is {name!r}; this model file runs "
++            f"{sorted(MLP_ACTIVATIONS)}"
++        ) from None
++
++
++def _epmoe_activation(name: str) -> str:
++    """Validate `mlp_hidden_act` and hand the name to `EPMoE`."""
++    mlp_activation(name)
++    return name
++
++
++def _quantization_config(config) -> QuantizationConfig | None:
++    """The quantization `ModelConfig` resolved for this run, or None.
++
++    `ModelConfig` puts a `QuantizationConfig` on the config when the user
++    passes `--quantization-config-path` or the checkpoint ships a format it
++    converts. A `quantization_config` it doesn't convert stays the dict
++    `config.json` carries, and `EPMoE` calls methods on what it gets, so only
++    the object goes through.
++    """
++    quant = getattr(config, "quantization_config", None)
++    return quant if isinstance(quant, QuantizationConfig) else None
++
++
++class NemotronHMamba2Mixer(nnx.Module):
++    """Mamba-2 state space mixer.
++
++    The fused `in_proj` emits three pieces in one GEMM: the gate, the conv
++    stream, and `dt`. The conv stream holds the SSM input, then `B`, then `C`,
++    which is why the depthwise conv runs over `conv_dim` channels rather than
++    the SSM width alone.
++
++    Everything with a cache in it lives in `Mamba2AttnBackend`: the conv state,
++    the SSM state, the chunk grid and the scan. This class holds the weights
++    the backend reads and does the projections around it.
++
++    `in_proj` shards its 18,560 output columns over the tensor axis as one
++    block, and the split into gate, conv stream and `dt` falls at 8,192 and
++    18,432. Neither offset is a multiple of the 2,320 columns a shard owns at
++    a tensor parallel size of 8, so the three slices arrive on the wrong
++    layout and XLA emits a collective-permute per slice to fix it. Compiling
++    the mixer alone on a four-way tensor axis gives 14 of them, against 2
++    all-gathers that replicate `B` and `C` and 2 all-reduces that close
++    `out_proj` and the gated norm's group sum. This runs in 40 of Super's 88
++    layers and 48 of Ultra's 108.
++    """
++
++    def __init__(
++        self,
++        config: NemotronHConfig,
++        mesh: jax.sharding.Mesh,
++        layer_id: int = 0,
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        self.layer_id = layer_id
++        self.config = config
++        self.dtype = dtype
++        self.mesh = mesh
++        self.num_heads = config.mamba_num_heads
++        self.head_dim = config.mamba_head_dim
++        self.intermediate_size = config.mamba_intermediate_size
++        self.conv_dim = config.conv_dim
++        self.activation = config.mamba_hidden_act
++
++        self.in_proj = LinearBase(
++            input_size=config.hidden_size,
++            output_size=config.mamba_in_proj_size,
++            mesh=mesh,
++            use_bias=config.use_bias,
++            kernel_axes=(None, "tensor"),
++            params_dtype=dtype,
++            scope_name="in_proj",
++        )
++
++        # The depthwise kernel is stored [conv_dim, conv_kernel], which is the
++        # layout `short_convolution` consumes. It's a bare parameter because
++        # nothing multiplies by it as a matrix: a `LinearBase` here would match
++        # the linear rules of a quantization config and come back as a
++        # `QuantizedLinear` with no `weight` for the backend to read.
++        self.conv1d_weight = nnx.Param(
++            jnp.zeros(
++                (self.conv_dim, config.conv_kernel), dtype=dtype, out_sharding=P("tensor", None)
++            )
++        )
++        if config.use_conv_bias:
++            self.conv1d_bias = nnx.Param(
++                jnp.zeros((self.conv_dim,), dtype=dtype, out_sharding=P("tensor"))
++            )
++        else:
++            self.conv1d_bias = None
++
++        # `A_log`, `dt_bias` and `D` are one number per head and stay float32:
++        # `A = -exp(A_log)` sets the decay and BF16 there moves the time scale.
++        self.a_log = nnx.Param(
++            jnp.zeros((self.num_heads,), dtype=jnp.float32, out_sharding=P("tensor"))
++        )
++        self.dt_bias = nnx.Param(
++            jnp.zeros((self.num_heads,), dtype=jnp.float32, out_sharding=P("tensor"))
++        )
++        self.d = nnx.Param(
++            jnp.ones((self.num_heads,), dtype=jnp.float32, out_sharding=P("tensor"))
++        )
++
++        # Grouped RMSNorm over the SSM output, gated by the first slice of the
++        # input projection. The gate multiplies before the norm, so the norm
++        # sees the gated value.
++        self.norm = GroupRMSNorm(
++            hidden_size=self.intermediate_size,
++            num_groups=config.n_groups,
++            epsilon=config.layer_norm_epsilon,
++            kernel_axes=("tensor",),
++            mesh=mesh,
++            scope_name="mixer_norm",
++        )
++
++        self.out_proj = LinearBase(
++            input_size=self.intermediate_size,
++            output_size=config.hidden_size,
++            mesh=mesh,
++            use_bias=config.use_bias,
++            kernel_axes=("tensor", None),
++            params_dtype=dtype,
++            scope_name="out_proj",
++        )
++
++    @named_scope
++    def __call__(
++        self,
++        hidden_states: jax.Array,
++        forward_batch: ForwardBatch,
++        recurrent_state_pool,
++    ):
++        projected, _ = self.in_proj(hidden_states)
++        gate, conv_stream, dt = jnp.split(
++            projected, [self.intermediate_size, self.intermediate_size + self.conv_dim], axis=-1
++        )
++
++        y, state = forward_batch.attn_backend(
++            conv_stream,
++            None,
++            None,
++            layer=self,
++            forward_batch=forward_batch,
++            pool=recurrent_state_pool,
++            a=dt,
++            b=None,
++        )
++
++        y = self.norm(y.astype(jnp.float32) * jax.nn.silu(gate.astype(jnp.float32)))
++        out, _ = self.out_proj(y.astype(self.dtype))
++        return out, state
++
++
++class NemotronHAttention(nnx.Module):
++    """GQA with no position encoding. Two KV heads at every published size.
++
++    There's no rotary table and no learned position bias. The attention
++    layers read order from the Mamba-2 layers below them, which is why eight
++    of them are enough for a 262,144 token context. Both published
++    `config.json` files carry `rope_theta` and `partial_rotary_factor`, the
++    reference declares neither and reads neither, and this file does the same.
++    """
++
++    def __init__(
++        self,
++        config: NemotronHConfig,
++        mesh: jax.sharding.Mesh,
++        layer_id: int = 0,
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        self.layer_id = layer_id
++        self.mesh = mesh
++        self.head_dim = config.head_dim
++        self.q_head_num = config.num_attention_heads
++        self.kv_head_num = config.num_key_value_heads
++        self.scaling = self.head_dim**-0.5
++
++        self.q_proj = LinearBase(
++            input_size=config.hidden_size,
++            output_size=self.q_head_num * self.head_dim,
++            mesh=mesh,
++            use_bias=config.attention_bias,
++            kernel_axes=(None, "tensor"),
++            params_dtype=dtype,
++            scope_name="q_proj",
++        )
++        self.k_proj = LinearBase(
++            input_size=config.hidden_size,
++            output_size=self.kv_head_num * self.head_dim,
++            mesh=mesh,
++            use_bias=config.attention_bias,
++            kernel_axes=(None, "tensor"),
++            params_dtype=dtype,
++            scope_name="k_proj",
++        )
++        self.v_proj = LinearBase(
++            input_size=config.hidden_size,
++            output_size=self.kv_head_num * self.head_dim,
++            mesh=mesh,
++            use_bias=config.attention_bias,
++            kernel_axes=(None, "tensor"),
++            params_dtype=dtype,
++            scope_name="v_proj",
++        )
++        self.o_proj = LinearBase(
++            input_size=self.q_head_num * self.head_dim,
++            output_size=config.hidden_size,
++            mesh=mesh,
++            use_bias=config.attention_bias,
++            kernel_axes=("tensor", None),
++            params_dtype=dtype,
++            scope_name="o_proj",
++        )
++
++        self.attn = RadixAttention(
++            num_heads=self.q_head_num,
++            head_dim=self.head_dim,
++            scaling=self.scaling,
++            num_kv_heads=self.kv_head_num,
++            layer_id=layer_id,
++        )
++
++    @named_scope
++    def __call__(
++        self,
++        hidden_states: jax.Array,
++        forward_batch: ForwardBatch,
++        token_to_kv_pool,
++    ):
++        q, _ = self.q_proj(hidden_states)
++        k, _ = self.k_proj(hidden_states)
++        v, _ = self.v_proj(hidden_states)
++
++        shape = NamedSharding(self.mesh, P("data", "tensor", None))
++        q = q.reshape(-1, self.q_head_num, self.head_dim, out_sharding=shape)
++        k = k.reshape(-1, self.kv_head_num, self.head_dim, out_sharding=shape)
++        v = v.reshape(-1, self.kv_head_num, self.head_dim, out_sharding=shape)
++
++        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
++        out, _ = self.o_proj(attn_output)
++        return out, kv_fused
++
++
++class NemotronHMLP(nnx.Module):
++    """Feed-forward with no gate: up, `mlp_hidden_act`, down."""
++
++    def __init__(
++        self,
++        hidden_size: int,
++        intermediate_size: int,
++        mesh: jax.sharding.Mesh,
++        use_bias: bool = False,
++        activation: str = "relu2",
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        self.activation = mlp_activation(activation)
++        self.up_proj = LinearBase(
++            input_size=hidden_size,
++            output_size=intermediate_size,
++            mesh=mesh,
++            use_bias=use_bias,
++            kernel_axes=(None, "tensor"),
++            params_dtype=dtype,
++            scope_name="up_proj",
++        )
++        self.down_proj = LinearBase(
++            input_size=intermediate_size,
++            output_size=hidden_size,
++            mesh=mesh,
++            use_bias=use_bias,
++            kernel_axes=("tensor", None),
++            params_dtype=dtype,
++            scope_name="down_proj",
++        )
++
++    @named_scope
++    def __call__(self, hidden_states: jax.Array) -> jax.Array:
++        up, _ = self.up_proj(hidden_states)
++        out, _ = self.down_proj(self.activation(up))
++        return out
++
++
++class NemotronHLatentMoE(nnx.Module):
++    """Top-22 of 512 routed experts in a shared latent, plus one shared expert.
++
++    The routed path is: project the token to `moe_latent_size`, route, run the
++    experts there, project back. The shared expert reads the block input at
++    `hidden_size` and adds to the result.
++
++    The router scores with a sigmoid, adds a per-expert correction bias before
++    the top-k, and takes the weights from the unbiased scores. Group routing is
++    on the config (`n_group`, `topk_group`) and both published sizes set it to
++    one group, which selects every expert.
++    """
++
++    def __init__(
++        self,
++        config: NemotronHConfig,
++        mesh: jax.sharding.Mesh,
++        layer_id: int = 0,
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        self.layer_id = layer_id
++        self.mesh = mesh
++        self.latent_size = config.expert_input_size
++        self.use_latent = config.moe_latent_size is not None
++        if config.mlp_bias:
++            # The reference gives every routed expert a bias under this flag.
++            # `EPMoE` holds one grouped kernel per GEMM and no bias beside it,
++            # so those numbers would load nowhere.
++            raise ValueError(
++                "mlp_bias is set, and EPMoE carries no bias for the routed "
++                "experts, so their bias would be dropped"
++            )
++
++        if self.use_latent:
++            self.fc1_latent_proj = LinearBase(
++                input_size=config.hidden_size,
++                output_size=config.moe_latent_size,
++                mesh=mesh,
++                use_bias=config.mlp_bias,
++                kernel_axes=(None, "tensor"),
++                params_dtype=dtype,
++                scope_name="fc1_latent_proj",
++            )
++            self.fc2_latent_proj = LinearBase(
++                input_size=config.moe_latent_size,
++                output_size=config.hidden_size,
++                mesh=mesh,
++                use_bias=config.mlp_bias,
++                kernel_axes=("tensor", None),
++                params_dtype=dtype,
++                scope_name="fc2_latent_proj",
++            )
++        else:
++            self.fc1_latent_proj = None
++            self.fc2_latent_proj = None
++
++        self.moe_gate = GateLogit(
++            input_size=config.hidden_size,
++            num_experts=config.n_routed_experts,
++            enable_expert_bias=True,
++            weight_dtype=jnp.float32,
++            kernel_dtype=jnp.float32,
++            compute_dtype=jnp.float32,
++            bias_dtype=jnp.float32,
++            score_func="sigmoid",
++        )
++        self.topk = TopK(
++            topk=config.num_experts_per_tok,
++            renormalize=config.norm_topk_prob,
++            num_expert_group=config.n_group,
++            topk_group=config.topk_group,
++            routed_scaling_factor=config.routed_scaling_factor,
++            layer_id=layer_id,
++            mesh=mesh,
++        )
++        self.experts = EPMoE(
++            hidden_size=self.latent_size,
++            num_experts=config.n_routed_experts,
++            num_experts_per_tok=config.num_experts_per_tok,
++            intermediate_dim=config.moe_intermediate_size,
++            ep_size=getattr(config, "ep_size", 1),
++            mesh=mesh,
++            weight_dtype=dtype,
++            dtype=dtype,
++            activation=_epmoe_activation(config.mlp_hidden_act),
++            gated=False,
++            layer_id=layer_id,
++            quantization_config=_quantization_config(config),
++        )
++        self.shared_experts = (
++            NemotronHMLP(
++                hidden_size=config.hidden_size,
++                intermediate_size=config.moe_shared_expert_intermediate_size,
++                mesh=mesh,
++                use_bias=config.mlp_bias,
++                activation=config.mlp_hidden_act,
++                dtype=dtype,
++            )
++            if config.n_shared_experts
++            else None
++        )
++
++    @named_scope
++    def __call__(self, hidden_states: jax.Array, dispatch_info=None) -> jax.Array:
++        router_logits = self.moe_gate(hidden_states)
++        correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
++        topk_weights, topk_ids = self.topk(
++            router_logits, correction_bias, dispatch_info=dispatch_info
++        )
++
++        latent = hidden_states
++        if self.use_latent:
++            latent, _ = self.fc1_latent_proj(hidden_states)
++        routed = self.experts(latent, topk_weights, topk_ids)
++        if self.use_latent:
++            # The experts hand back a replicated latent and `fc2_latent_proj`
++            # is row parallel. A `QuantizedLinear`, which a quantization config
++            # swaps in, takes its input only on the layout it contracts over.
++            routed = jax.sharding.reshard(routed, NamedSharding(self.mesh, P("data", "tensor")))
++            routed, _ = self.fc2_latent_proj(routed)
++
++        if self.shared_experts is not None:
++            routed = routed + self.shared_experts(hidden_states)
++        return routed, topk_ids
++
++
++class NemotronHBlock(nnx.Module):
++    """One norm, one mixer, one residual add.
++
++    `hidden_states` and `residual` travel as a pair so the add of the previous
++    block folds into this block's norm, which is the form every sglang-jax
++    model uses. `residual` is None on layer 0.
++    """
++
++    def __init__(
++        self,
++        config: NemotronHConfig,
++        mesh: jax.sharding.Mesh,
++        layer_id: int,
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        self.layer_id = layer_id
++        self.block_type = config.layers_block_type[layer_id]
++        self.norm = RMSNorm(
++            config.hidden_size,
++            epsilon=config.layer_norm_epsilon,
++            param_dtype=dtype,
++            scope_name="norm",
++        )
++        if self.block_type == "mamba":
++            self.mixer = NemotronHMamba2Mixer(config, mesh=mesh, layer_id=layer_id, dtype=dtype)
++        elif self.block_type == "attention":
++            self.mixer = NemotronHAttention(config, mesh=mesh, layer_id=layer_id, dtype=dtype)
++        elif self.block_type == "moe":
++            self.mixer = NemotronHLatentMoE(config, mesh=mesh, layer_id=layer_id, dtype=dtype)
++        elif self.block_type == "mlp":
++            self.mixer = NemotronHMLP(
++                hidden_size=config.hidden_size,
++                intermediate_size=config.intermediate_size,
++                mesh=mesh,
++                use_bias=config.mlp_bias,
++                activation=config.mlp_hidden_act,
++                dtype=dtype,
++            )
++        else:
++            raise ValueError(f"layer {layer_id} has block type {self.block_type!r}")
++
++    def __call__(
++        self,
++        hidden_states: jax.Array,
++        forward_batch: ForwardBatch,
++        memory_pools,
++        residual: jax.Array | None = None,
++        dispatch_info=None,
++    ):
++        if residual is not None:
++            hidden_states += residual
++        residual = hidden_states
++        hidden_states = self.norm(hidden_states)
++
++        state = None
++        topk_ids = None
++        if self.block_type == "mamba":
++            hidden_states, state = self.mixer(
++                hidden_states, forward_batch, memory_pools.recurrent_state_pool
++            )
++        elif self.block_type == "attention":
++            hidden_states, state = self.mixer(
++                hidden_states, forward_batch, memory_pools.token_to_kv_pool
++            )
++        elif self.block_type == "moe":
++            hidden_states, topk_ids = self.mixer(hidden_states, dispatch_info=dispatch_info)
++        else:
++            hidden_states = self.mixer(hidden_states)
++
++        return hidden_states, residual, state, topk_ids
++
++
++class NemotronHModel(nnx.Module):
++    """The backbone: embeddings, the block stack, the final norm."""
++
++    def __init__(
++        self,
++        config: NemotronHConfig,
++        mesh: jax.sharding.Mesh,
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        self.config = config
++        self.embed_tokens = Embed(
++            num_embeddings=config.vocab_size,
++            features=config.hidden_size,
++            dtype=dtype,
++            param_dtype=dtype,
++            kernel_axes=("tensor", None),
++            mesh=mesh,
++        )
++        # One block per entry of the block list. No two adjacent layers share a
++        # type on either published size, so nothing stacks into a scan and the
++        # loop stays flat.
++        self.layers = nnx.data(
++            [
++                NemotronHBlock(config, mesh=mesh, layer_id=layer_id, dtype=dtype)
++                for layer_id in range(config.num_hidden_layers)
++            ]
++        )
++        self.norm = RMSNorm(
++            config.hidden_size,
++            epsilon=config.layer_norm_epsilon,
++            param_dtype=dtype,
++            scope_name="norm",
++        )
++
++    def __call__(self, forward_batch: ForwardBatch, memory_pools):
++        hidden_states = (
++            self.embed_tokens(forward_batch.input_ids)
++            if forward_batch.input_embedding is None
++            else forward_batch.input_embedding
++        )
++        residual = None
++        layers_kv_fused = []
++        layers_recurrent = []
++        layers_conv = []
++        layers_topk_ids = []
++
++        for layer in self.layers:
++            hidden_states, residual, state, topk_ids = layer(
++                hidden_states,
++                forward_batch,
++                memory_pools,
++                residual,
++                dispatch_info=forward_batch.expert_location_metadata,
++            )
++            if layer.block_type == "mamba":
++                recurrent_buffer, conv_buffers = state
++                layers_recurrent.append(recurrent_buffer)
++                layers_conv.append(conv_buffers)
++            elif layer.block_type == "attention":
++                layers_kv_fused.append(state)
++            # One entry per layer, `None` on a layer that routes nothing.
++            # `RoutedExpertsCapturer` indexes this list by layer id.
++            layers_topk_ids.append(topk_ids)
++
++        if residual is not None:
++            hidden_states += residual
++        hidden_states = self.norm(hidden_states)
++        return (
++            hidden_states,
++            layers_kv_fused,
++            (layers_recurrent, layers_conv),
++            layers_topk_ids,
++        )
++
++
++class NemotronHForCausalLM(nnx.Module):
++    """Entry class. `NemotronHForCausalLM` in both checkpoints."""
++
++    @classmethod
++    def check_server_args(cls, server_args, model_config=None) -> None:
++        """Refuse the expert-placement flags before any weight loads.
++
++        `--ep-dispatch-algorithm`, `--init-expert-location` and
++        `--ep-num-redundant-experts` place the routed experts through
++        expert-location metadata. The engine builds that metadata only for a
++        config that sets `num_experts`, and this config names the count
++        `n_routed_experts`. The weight mapping loads every expert in checkpoint
++        order and the router routes in that order, so the flags would change
++        nothing. `__init__` runs this on the server args the runner publishes
++        before it builds the model. `model_config` isn't read; it keeps the
++        two-argument form of a worker hook that checks a model class.
++        """
++        flags = []
++        algorithm = getattr(server_args, "ep_dispatch_algorithm", None)
++        if algorithm is not None:
++            flags.append(f"--ep-dispatch-algorithm {algorithm}")
++        redundant = getattr(server_args, "ep_num_redundant_experts", 0)
++        if redundant:
++            flags.append(f"--ep-num-redundant-experts {redundant}")
++        location = getattr(server_args, "init_expert_location", None)
++        if location not in (None, "trivial"):
++            flags.append(f"--init-expert-location {location}")
++        if flags:
++            raise ValueError(
++                f"{cls.__name__} can't serve with {', '.join(flags)}. It loads every routed "
++                "expert in checkpoint order and builds no expert-location metadata, so these "
++                "flags would change nothing; drop them."
++            )
++
++    def __init__(
++        self,
++        config: NemotronHConfig,
++        mesh: jax.sharding.Mesh,
++        dtype: jnp.dtype = jnp.bfloat16,
++    ):
++        server_args = get_global_server_args()
++        if server_args is not None:
++            self.check_server_args(server_args)
++        quant = _quantization_config(config)
++        if quant is not None and quant.is_static_checkpoint:
++            # The mapping below names weights and no scale tensors, so a
++            # pre-quantized checkpoint can't load through it. Refuse it here,
++            # before any weight moves.
++            raise NotImplementedError(
++                "this checkpoint ships pre-quantized weights, and the Nemotron 3 weight "
++                "mapping reads no scale tensors; serve the BF16 checkpoint and quantize "
++                "it at load with --quantization-config-path"
++            )
++        self.config = config
++        self.mesh = mesh
++        self.dtype = dtype
++        self.model = NemotronHModel(config, mesh=mesh, dtype=dtype)
++        if not getattr(config, "tie_word_embeddings", False):
++            self.lm_head = ParallelLMHead(
++                config.vocab_size,
++                config.hidden_size,
++                dtype=dtype,
++                param_dtype=dtype,
++                mesh=mesh,
++                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
++            )
++        self.logits_processor = LogitsProcessor(
++            config.vocab_size,
++            mesh=mesh,
++            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
++        )
++
++    def __call__(
++        self,
++        forward_batch: ForwardBatch,
++        memory_pools,
++        logits_metadata: LogitsMetadata,
++    ):
++        hidden_states, layers_kv_fused, layers_recurrent_state, layers_topk_ids = self.model(
++            forward_batch, memory_pools
++        )
++        if not getattr(self.config, "tie_word_embeddings", False):
++            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
++        else:
++            output = self.logits_processor(
++                hidden_states, self.model.embed_tokens, logits_metadata
++            )
++        return (
++            output,
++            {
++                "token_to_kv_pool": layers_kv_fused,
++                "recurrent_state_pool": layers_recurrent_state,
++            },
++            True,
++            layers_topk_ids,
++        )
++
++    # ------------------------------------------------------------------
++    # Weights
++    # ------------------------------------------------------------------
++
++    def load_weights(self, model_config: ModelConfig):
++        loader = WeightLoader(
++            model=self,
++            model_config=model_config,
++            mesh=self.mesh,
++            dtype=self.dtype,
++        )
++        loader.load_weights_from_safetensors(self._create_weight_mappings())
++        logger.info("Nemotron 3 weights loaded successfully!")
++
++    def _create_weight_mappings(self) -> dict:
++        """Checkpoint key to parameter path.
++
++        The checkpoint calls the backbone `backbone`, the embedding
++        `embeddings` and the final norm `norm_f`.
++        """
++        mappings = {
++            "backbone.embeddings.weight": WeightMapping(
++                target_path="model.embed_tokens.embedding",
++                sharding=("tensor", None),
++                transpose=False,
++            ),
++            "backbone.norm_f.weight": WeightMapping(
++                target_path="model.norm.scale", sharding=(None,), transpose=False
++            ),
++        }
++        if not getattr(self.config, "tie_word_embeddings", False):
++            mappings["lm_head.weight"] = WeightMapping(
++                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
++            )
++        for layer_id, block_type in enumerate(self.config.layers_block_type):
++            mappings.update(self._create_layer_mappings(layer_id, block_type))
++        return mappings
++
++    def _create_layer_mappings(self, layer_id: int, block_type: str) -> dict:
++        config = self.config
++        prefix = f"backbone.layers.{layer_id}"
++        target = f"model.layers.{layer_id}"
++
++        mappings = {
++            f"{prefix}.norm.weight": WeightMapping(
++                target_path=f"{target}.norm.scale", sharding=(None,), transpose=False
++            ),
++        }
++
++        def projection(name: str, sharding, bias: bool, **kwargs):
++            """A `LinearBase` weight, and its bias when the config asks for one.
++
++            `LinearBase` shards a bias over the last axis of its kernel, so a
++            column-parallel projection shards the bias and a row-parallel one
++            replicates it.
++            """
++            out = {
++                f"{prefix}.mixer.{name}.weight": WeightMapping(
++                    target_path=f"{target}.mixer.{name}.weight",
++                    sharding=sharding,
++                    transpose=True,
++                    **kwargs,
++                )
++            }
++            if bias:
++                out[f"{prefix}.mixer.{name}.bias"] = WeightMapping(
++                    target_path=f"{target}.mixer.{name}.bias",
++                    sharding=sharding[-1:],
++                    transpose=False,
++                    **kwargs,
++                )
++            return out
++
++        if block_type == "mamba":
++            mappings.update(projection("in_proj", (None, "tensor"), config.use_bias))
++            mappings.update(projection("out_proj", ("tensor", None), config.use_bias))
++            mappings.update(
++                {
++                    # HF ships the depthwise kernel as [conv_dim, 1, K].
++                    f"{prefix}.mixer.conv1d.weight": WeightMapping(
++                        target_path=f"{target}.mixer.conv1d_weight",
++                        sharding=("tensor", None),
++                        transpose=False,
++                        reshape=(config.conv_dim, config.conv_kernel),
++                    ),
++                    f"{prefix}.mixer.A_log": WeightMapping(
++                        target_path=f"{target}.mixer.a_log",
++                        sharding=("tensor",),
++                        transpose=False,
++                    ),
++                    f"{prefix}.mixer.dt_bias": WeightMapping(
++                        target_path=f"{target}.mixer.dt_bias",
++                        sharding=("tensor",),
++                        transpose=False,
++                    ),
++                    f"{prefix}.mixer.D": WeightMapping(
++                        target_path=f"{target}.mixer.d",
++                        sharding=("tensor",),
++                        transpose=False,
++                    ),
++                    f"{prefix}.mixer.norm.weight": WeightMapping(
++                        target_path=f"{target}.mixer.norm.weight",
++                        sharding=("tensor",),
++                        transpose=False,
++                    ),
++                }
++            )
++            if config.use_conv_bias:
++                mappings[f"{prefix}.mixer.conv1d.bias"] = WeightMapping(
++                    target_path=f"{target}.mixer.conv1d_bias",
++                    sharding=("tensor",),
++                    transpose=False,
++                )
++        elif block_type == "attention":
++            for name, sharding in (
++                ("q_proj", (None, "tensor")),
++                ("k_proj", (None, "tensor")),
++                ("v_proj", (None, "tensor")),
++                ("o_proj", ("tensor", None)),
++            ):
++                mappings.update(
++                    projection(
++                        name,
++                        sharding,
++                        config.attention_bias,
++                        kv_head_padding=name in ("k_proj", "v_proj"),
++                    )
++                )
++        elif block_type == "moe":
++            mappings.update(
++                {
++                    f"{prefix}.mixer.gate.weight": WeightMapping(
++                        target_path=f"{target}.mixer.moe_gate.kernel",
++                        sharding=(None, None),
++                        transpose=True,
++                    ),
++                    f"{prefix}.mixer.gate.e_score_correction_bias": WeightMapping(
++                        target_path=f"{target}.mixer.moe_gate.bias",
++                        sharding=(None,),
++                    ),
++                }
++            )
++            mappings.update(
++                projection(
++                    "shared_experts.up_proj", (None, "tensor"), config.mlp_bias
++                )
++            )
++            mappings.update(
++                projection(
++                    "shared_experts.down_proj", ("tensor", None), config.mlp_bias
++                )
++            )
++            if config.moe_latent_size is not None:
++                mappings.update(
++                    projection("fc1_latent_proj", (None, "tensor"), config.mlp_bias)
++                )
++                mappings.update(
++                    projection("fc2_latent_proj", ("tensor", None), config.mlp_bias)
++                )
++            mappings.update(
++                create_moe_weights_mapping(
++                    prefix=prefix,
++                    target_prefix=target,
++                    num_experts=config.n_routed_experts,
++                    expert_type_names=("up_proj", None, "down_proj"),
++                    moe_backend="epmoe",
++                    moe_path="mixer.experts",
++                    source_expert_pattern="{i}",
++                    gated=False,
++                )
++            )
++        elif block_type == "mlp":
++            mappings.update(projection("up_proj", (None, "tensor"), config.mlp_bias))
++            mappings.update(projection("down_proj", ("tensor", None), config.mlp_bias))
++        return mappings
++
++    def get_embed_and_head(self):
++        return (self.model.embed_tokens.embedding.value, self.lm_head.embedding.value)
++
++    def set_embed_and_head(self, embed_weight=None, head_weight=None) -> None:
++        if embed_weight is not None:
++            self.model.embed_tokens.embedding.value = embed_weight
++        if head_weight is not None:
++            self.lm_head.embedding.value = head_weight
++
++
++EntryClass = NemotronHForCausalLM
+diff --git a/python/sgl_jax/test/layers/test_group_rmsnorm.py b/python/sgl_jax/test/layers/test_group_rmsnorm.py
+index ccca1dbd..18db9de4 100644
+--- a/python/sgl_jax/test/layers/test_group_rmsnorm.py
++++ b/python/sgl_jax/test/layers/test_group_rmsnorm.py
+@@ -2,6 +2,7 @@ import jax
+ import jax.numpy as jnp
+ import numpy as np
+ import pytest
++from flax import nnx
+ from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding
+ from jax.sharding import PartitionSpec as P
+ 
+@@ -43,22 +44,25 @@ def _make_weight(rng, hidden_size=HIDDEN_SIZE):
+     return rng.standard_normal(hidden_size).astype(np.float32)
+ 
+ 
+-def _make_mesh(num_groups=NUM_GROUPS):
++def _make_mesh(tp_size=NUM_GROUPS):
+     devices = np.array(jax.devices())
+-    if devices.size < num_groups:
++    if devices.size < tp_size:
+         pytest.skip(
+-            f"GroupRMSNorm sharded test requires at least {num_groups} devices, got {devices.size}"
++            f"GroupRMSNorm sharded test requires at least {tp_size} devices, got {devices.size}"
+         )
+     return Mesh(
+-        devices[:num_groups].reshape(1, num_groups),
++        devices[:tp_size].reshape(1, tp_size),
+         axis_names=("data", "tensor"),
+         axis_types=(AxisType.Explicit, AxisType.Explicit),
+     )
+ 
+ 
+-def _make_jax_model(hidden_size=HIDDEN_SIZE, num_groups=NUM_GROUPS, weight=None):
+-    """Create a JAX GroupRMSNorm model, optionally with custom weight."""
+-    mesh = _make_mesh(num_groups)
++def _make_jax_model(hidden_size=HIDDEN_SIZE, num_groups=NUM_GROUPS, weight=None, tp_size=None):
++    """Create a JAX GroupRMSNorm model, optionally with custom weight.
++
++    The tensor axis holds `num_groups` devices unless `tp_size` says otherwise.
++    """
++    mesh = _make_mesh(num_groups if tp_size is None else tp_size)
+     with jax.set_mesh(mesh):
+         model = GroupRMSNorm(
+             hidden_size,
+@@ -131,24 +135,75 @@ class TestGroupRMSNorm:
+ 
+         np.testing.assert_allclose(jax_output, expected, rtol=FP32_RTOL, atol=FP32_ATOL)
+ 
+-    def test_rejects_tp_not_dividing_num_groups(self):
+-        """Tensor parallel size must evenly divide the number of RMS groups."""
+-        # tp=16 does not divide num_groups=8, so the 8 groups cannot be sharded
+-        # evenly across the tensor axis. Use an AbstractMesh so the constructor
+-        # guard is exercised without requiring 16 physical devices (the guard
+-        # raises before any sharded parameter is created).
++    def test_split_groups_match_reference(self):
++        """A group that straddles shards normalizes over the whole group."""
++        # tp=8 over 2 groups puts each 4,096-channel group on four shards, so the
++        # sum of squares closes with an all-reduce instead of a local reduction.
++        num_groups = 2
++        rng = np.random.default_rng(SEED)
++        input_data = _make_input(rng, (BATCH_SIZE * SEQ_LEN, HIDDEN_SIZE))
++        weight = _make_weight(rng)
++
++        model = _make_jax_model(num_groups=num_groups, weight=weight, tp_size=8)
++        assert not model.whole_groups_per_shard
++        jax_output = _run_jax(model, input_data)
++        expected = _numpy_group_rmsnorm_fp64(input_data, weight, num_groups, EPSILON)
++
++        np.testing.assert_allclose(jax_output, expected, rtol=FP32_RTOL, atol=FP32_ATOL)
++        # A per-shard RMS, which is what the whole-group layout would compute
++        # here, lands far from the reference.
++        per_shard = _numpy_group_rmsnorm_fp64(input_data, weight, 8, EPSILON)
++        assert not np.allclose(jax_output, per_shard, rtol=FP32_RTOL, atol=FP32_ATOL)
++
++    def test_split_layout_traces_where_tp_exceeds_num_groups(self):
++        """tp=16 over 8 groups builds and traces the split layout."""
++        # tp=16 doesn't divide num_groups=8, so every group straddles two
++        # shards. An AbstractMesh builds and traces the layer without 16
++        # physical devices; nothing here allocates a sharded array.
+         mesh = AbstractMesh(
+             axis_sizes=(1, 16),
+             axis_names=("data", "tensor"),
+             axis_types=(AxisType.Explicit, AxisType.Explicit),
+         )
++        with jax.sharding.use_abstract_mesh(mesh):
++            model = nnx.eval_shape(
++                lambda: GroupRMSNorm(
++                    HIDDEN_SIZE,
++                    num_groups=NUM_GROUPS,
++                    epsilon=EPSILON,
++                    kernel_axes=("tensor",),
++                    mesh=mesh,
++                )
++            )
++            assert not model.whole_groups_per_shard
++            x = jax.ShapeDtypeStruct(
++                (BATCH_SIZE * SEQ_LEN, HIDDEN_SIZE),
++                jnp.bfloat16,
++                sharding=NamedSharding(mesh, P("data", "tensor")),
++            )
++            out = jax.eval_shape(lambda m, h: m(h), model, x)
++
++        assert out.shape == x.shape
++        assert out.dtype == x.dtype
++        assert out.sharding.spec == P("data", "tensor")
++
++    def test_rejects_tp_not_dividing_hidden_size(self):
++        """Tensor parallel size must divide hidden_size."""
++        # 96 channels split into 8 groups of 12, but not over 64 shards. The
++        # constructor raises before it creates any sharded parameter, so an
++        # AbstractMesh stands in for 64 devices.
++        mesh = AbstractMesh(
++            axis_sizes=(1, 64),
++            axis_names=("data", "tensor"),
++            axis_types=(AxisType.Explicit, AxisType.Explicit),
++        )
+ 
+         with pytest.raises(
+             ValueError,
+-            match="tensor parallel size to divide num_groups",
++            match="tensor parallel size to divide hidden_size",
+         ):
+             GroupRMSNorm(
+-                HIDDEN_SIZE,
++                96,
+                 num_groups=NUM_GROUPS,
+                 epsilon=EPSILON,
+                 kernel_axes=("tensor",),

@@ -1,0 +1,106 @@
+Subject: [PATCH] feat(kimi_linear): add layers_to_capture hook to KimiModel
+
+Kimi Linear has no layers_to_capture hook, so --enable-return-hidden-states
+refuses to start on it. Adds the same hook gemma4.py, llama.py and qwen3.py
+already carry.
+
+KimiModel accumulates aux_hidden_states for layers in layers_to_capture and
+returns them. KimiLinearForCausalLM gates on capture_aux_hidden_states and
+forwards them to the logits processor on both the tied and untied head paths.
+
+Uses the None-residual form. Kimi carries residual separately, and it's None
+on layer 0. EAGLE3 never captures layer 0, but the hidden-states flag does.
+---
+ python/sgl_jax/srt/models/kimi_linear.py | 41 +++++++++++++++++++++++++++-----
+ 1 file changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/python/sgl_jax/srt/models/kimi_linear.py b/python/sgl_jax/srt/models/kimi_linear.py
+index 821e91bd..36446363 100644
+--- a/python/sgl_jax/srt/models/kimi_linear.py
++++ b/python/sgl_jax/srt/models/kimi_linear.py
+@@ -525,12 +525,13 @@ class KimiModel(nnx.Module):
+             param_dtype=dtype,
+             scope_name="norm",
+         )
++        self.layers_to_capture = []
+ 
+     def __call__(
+         self,
+         forward_batch: ForwardBatch,
+         memory_pools,
+-    ) -> tuple[jax.Array, list, list, list]:
++    ) -> tuple[jax.Array, list, list, list, list]:
+         hidden_states = self.embed_tokens(forward_batch.input_ids)
+ 
+         residual = None
+@@ -538,8 +539,15 @@ class KimiModel(nnx.Module):
+         layers_recurrent_buffers = []
+         layers_conv_buffers = []
+         layers_topk_ids = []
+-
+-        for layer in self.layers:
++        aux_hidden_states = []
++
++        for layer_id, layer in enumerate(self.layers):
++            if layer_id in self.layers_to_capture:
++                # residual is None on layer 0, and the hidden-states flag marks
++                # every layer, so this has to tolerate it.
++                aux_hidden_states.append(
++                    hidden_states + residual if residual is not None else hidden_states
++                )
+             hidden_states, residual, attn_state, topk_ids = layer(
+                 forward_batch.positions,
+                 hidden_states,
+@@ -562,6 +570,7 @@ class KimiModel(nnx.Module):
+         hidden_states = self.norm(hidden_states)
+         return (
+             hidden_states,
++            aux_hidden_states,
+             layers_kv_fused,
+             (layers_recurrent_buffers, layers_conv_buffers),
+             layers_topk_ids,
+@@ -604,6 +613,7 @@ class KimiLinearForCausalLM(nnx.Module):
+             mesh=mesh,
+             enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+         )
++        self.capture_aux_hidden_states = False
+ 
+     def __call__(
+         self,
+@@ -611,14 +621,33 @@ class KimiLinearForCausalLM(nnx.Module):
+         memory_pools,
+         logits_metadata: LogitsMetadata,
+     ):
+-        hidden_states, layers_kv_fused, layers_recurrent_state, layers_topk_ids = self.model(
++        (
++            hidden_states,
++            aux_hidden_states,
++            layers_kv_fused,
++            layers_recurrent_state,
++            layers_topk_ids,
++        ) = self.model(
+             forward_batch,
+             memory_pools,
+         )
++        if not self.capture_aux_hidden_states:
++            aux_hidden_states = None
++
+         if not getattr(self.config, "tie_word_embeddings", False):
+-            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
++            output = self.logits_processor(
++                hidden_states,
++                self.lm_head,
++                logits_metadata,
++                aux_hidden_states=aux_hidden_states,
++            )
+         else:
+-            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
++            output = self.logits_processor(
++                hidden_states,
++                self.model.embed_tokens,
++                logits_metadata,
++                aux_hidden_states=aux_hidden_states,
++            )
+         return (
+             output,
+             {

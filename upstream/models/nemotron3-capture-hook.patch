@@ -1,0 +1,99 @@
+Subject: [PATCH] feat(nemotron_h): add layers_to_capture hook to NemotronHModel
+
+Nemotron 3 has no per-layer activation capture, so the engine refuses to start
+it with --enable-return-hidden-states. Adds the same hook gemma4.py, llama.py
+and qwen3.py already carry.
+
+NemotronHModel accumulates aux_hidden_states for layers in layers_to_capture
+and returns them second; NemotronHForCausalLM gates on
+capture_aux_hidden_states and forwards them to the logits processor.
+
+Uses the None-residual form. The stack carries residual separately, and it's
+None on layer 0, which EAGLE3 never captures but the hidden-states flag does.
+
+Depends on #877 for the flag and the output reshape, and on the model patch
+for the file.
+ python/sgl_jax/srt/models/nemotron_h.py | 39 +++++++++++++++++++++++++++------
+ 1 file changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/python/sgl_jax/srt/models/nemotron_h.py b/python/sgl_jax/srt/models/nemotron_h.py
+index 253fe621..d87ec5a8 100644
+--- a/python/sgl_jax/srt/models/nemotron_h.py
++++ b/python/sgl_jax/srt/models/nemotron_h.py
+@@ -603,6 +603,7 @@ class NemotronHModel(nnx.Module):
+             param_dtype=dtype,
+             scope_name="norm",
+         )
++        self.layers_to_capture = []
+ 
+     def __call__(self, forward_batch: ForwardBatch, memory_pools):
+         hidden_states = (
+@@ -615,8 +616,15 @@ class NemotronHModel(nnx.Module):
+         layers_recurrent = []
+         layers_conv = []
+         layers_topk_ids = []
+-
+-        for layer in self.layers:
++        aux_hidden_states = []
++
++        for layer_id, layer in enumerate(self.layers):
++            if layer_id in self.layers_to_capture:
++                # residual is None on layer 0, and --enable-return-hidden-states
++                # captures every layer, so this has to tolerate it.
++                aux_hidden_states.append(
++                    hidden_states + residual if residual is not None else hidden_states
++                )
+             hidden_states, residual, state, topk_ids = layer(
+                 hidden_states,
+                 forward_batch,
+@@ -639,6 +647,7 @@ class NemotronHModel(nnx.Module):
+         hidden_states = self.norm(hidden_states)
+         return (
+             hidden_states,
++            aux_hidden_states,
+             layers_kv_fused,
+             (layers_recurrent, layers_conv),
+             layers_topk_ids,
+@@ -716,6 +725,7 @@ class NemotronHForCausalLM(nnx.Module):
+             mesh=mesh,
+             enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+         )
++        self.capture_aux_hidden_states = False
+ 
+     def __call__(
+         self,
+@@ -723,14 +733,29 @@ class NemotronHForCausalLM(nnx.Module):
+         memory_pools,
+         logits_metadata: LogitsMetadata,
+     ):
+-        hidden_states, layers_kv_fused, layers_recurrent_state, layers_topk_ids = self.model(
+-            forward_batch, memory_pools
+-        )
++        (
++            hidden_states,
++            aux_hidden_states,
++            layers_kv_fused,
++            layers_recurrent_state,
++            layers_topk_ids,
++        ) = self.model(forward_batch, memory_pools)
++        if not self.capture_aux_hidden_states:
++            aux_hidden_states = None
++
+         if not getattr(self.config, "tie_word_embeddings", False):
+-            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
++            output = self.logits_processor(
++                hidden_states,
++                self.lm_head,
++                logits_metadata,
++                aux_hidden_states=aux_hidden_states,
++            )
+         else:
+             output = self.logits_processor(
+-                hidden_states, self.model.embed_tokens, logits_metadata
++                hidden_states,
++                self.model.embed_tokens,
++                logits_metadata,
++                aux_hidden_states=aux_hidden_states,
+             )
+         return (
+             output,

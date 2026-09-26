@@ -1,0 +1,12 @@
+tpu-mech-interp
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+The patches in upstream/ apply to sgl-project/sglang-jax
+(https://github.com/sgl-project/sglang-jax), which is licensed under the Apache License,
+Version 2.0.
+
+upstream/sglang-jax-877.patch carries sgl-project/sglang-jax pull request #877 by zhengkezhou1
+(https://github.com/sgl-project/sglang-jax/pull/877), rebased onto a later main with fixes.
+The patch keeps its original author.

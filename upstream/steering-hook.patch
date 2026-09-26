@@ -1,0 +1,1178 @@
+Subject: [PATCH] feat(steering): causal activation steering in the gemma4 forward
+
+Adds --enable-steering. The server loads a bank of steering directions, a request names one of its features, and the model adds alpha * v to the residual stream leaving --steering-layer.
+
+    h -> h + alpha * v
+
+layers/steering.py holds the arithmetic: static_steer for the add, conditional_steer for the add under a probe and a threshold, and apply_steering as the one call a model makes. Static steering is conditional steering at a threshold of -inf, so both ride one code path and one program.
+
+The hook site is the only thing that compiles in. It's a Python int on the inner model, set before nnx.split() bakes it into model_def, the same way layers_to_capture works. Everything a request chooses arrives as a device array on ForwardBatch: the bank [S, D], a bank row per token, alpha per token and a threshold per token. So one executable covers every feature, every alpha, every mix of static and conditional, and every choice of steered tokens, and two requests in one batch can steer with different features.
+
+A server that loaded a bank builds a SteeringBatch on every forward pass, including the ones CompilationManager precompiles and the ones nobody asked to steer. Those carry alpha 0 and a threshold of +inf and fire on no token. That's what holds the executable count at one: forward_batch is a jit argument and ForwardBatch is a registered pytree, so None against a SteeringBatch is a different treedef, and the hook widens the residual stream to float32 in one of the two and not the other. Two treedefs means the precompiled buckets cover the unsteered graph alone and the first steering request pays a full prefill compile. The bank places the all-off arrays once per token count, and a lax.cond on alpha inside the hook skips the two bank gathers and the projection when no token steers, so an all-off pass costs the float32 widening and one reduction over [T].
+
+The bank records the site it was fit at, and load() refuses a bank whose site isn't the --steering-layer the server got. Width can't catch that: every layer of a model is the same width. Capture appends before layer(...) runs and the hook fires after it returns, so capture slot k and --steering-layer k - 1 name the same tensor, and an SAE trained on slot 20 serves at 19. load() also refuses a bank whose thresholds don't match its features, an empty bank, a NaN or -inf threshold and a non-finite vector or probe. Each of those loaded and then stopped the server from the scheduler thread. A +inf threshold marks a dead latent. It loads with a warning that names the feature, because static steering reads no threshold and still adds the vector.
+
+The hook widens the residual stream to float32 and leaves it widened. A bf16 add throws a small steering vector away: at a per-element residual RMS of 300 with 5,376 dim, 99% of the delta comes back bit-identical, and rounding back after the add loses the same 99%. Matmuls downstream stay bf16, because LinearBase asks for preferred_element_type=params_dtype and the MoE dispatch casts its input, so what widens is the residual accumulation alone.
+
+The scheduler writes the per-token configuration on the layout _merge_input_and_positions builds, and resolves nothing: it doesn't hold the bank. ForwardBatch.init_new turns feature ids into bank rows, fills in the fitted threshold where a request asked for it, zeroes a request that named a feature the bank doesn't hold, and places the three per-token arrays with device_array, like every other per-token array it builds. jax.device_put would check each host's copy against every other host first, one allgather per array per forward pass on a multi-host mesh.
+
+Steering changes the KV that every layer above the hook writes, so the tokenizer manager appends the steering to the request's extra_key, the way LoRA appends lora_id. A request reuses a cached prefix only from requests that steer the same way, and a position inside that prefix was steered when the prefix ran. A server with --enable-steering refuses a client extra_key that holds "steering:", the prefix every steered namespace starts with, so no request can name a steered request's namespace and share its KV.
+
+The request validator checks every field, and refuses an alpha or a finite threshold past the float32 range, which the scheduler's float32 arrays would turn into inf. It refuses any key outside feature, alpha, mode, threshold and positions, because the scheduler reads a missing field as its default, and a misspelled positions steered every token. It refuses a threshold beside mode static, which the scheduler served as conditional steering. The tokenizer manager refuses a steering request on a server started without --enable-steering, the way #877 refuses return_hidden_states without its flag. Such a request used to come back unsteered with no error. check_server_args refuses --enable-steering with --speculative-algorithm: the verify pass builds its batch without the per-token steering arrays, so a steered request would steer its prefill and nothing after it. The steering dict is logged at debug level where the tokenizer manager sends it, where the scheduler receives it, where the scheduler lays it out per token, and where ForwardBatch.init_new resolves it against the bank.
+
+Engine.generate and async_generate take steering after return_routed_experts, the last positional parameter, so a call that passes the earlier ones by position binds as it did.
+
+gemma4 first, because its layer carries one residual stream rather than a (hidden, residual) pair, so the hook is one call and nothing to unpack. The same three lines port to any model with an unrolled layer loop.
+
+Independent of #877, and the two apply in either order. Run both to steer and read the per-layer stream in one request.
+---
+ python/sgl_jax/srt/entrypoints/engine.py      |   4 +
+ python/sgl_jax/srt/layers/steering.py         | 392 ++++++++++++++++++
+ python/sgl_jax/srt/managers/io_struct.py      | 141 +++++++
+ python/sgl_jax/srt/managers/schedule_batch.py | 125 ++++++
+ python/sgl_jax/srt/managers/scheduler.py      |   8 +
+ .../sgl_jax/srt/managers/tokenizer_manager.py |  26 ++
+ .../srt/model_executor/forward_batch_info.py  |  39 ++
+ .../srt/model_executor/model_runner.py        |  48 +++
+ python/sgl_jax/srt/models/gemma4.py           |  10 +
+ python/sgl_jax/srt/server_args.py             |  29 ++
+ 10 files changed, 822 insertions(+)
+ create mode 100644 python/sgl_jax/srt/layers/steering.py
+
+diff --git a/python/sgl_jax/srt/entrypoints/engine.py b/python/sgl_jax/srt/entrypoints/engine.py
+index 3b62dc2..2d75623 100644
+--- a/python/sgl_jax/srt/entrypoints/engine.py
++++ b/python/sgl_jax/srt/entrypoints/engine.py
+@@ -164,6 +164,7 @@ class Engine(EngineBase):
+         stream: bool = False,
+         lora_path: list[str] | str | None = None,
+         return_routed_experts: list[bool] | bool | None = False,
++        steering: list[dict] | dict | None = None,
+         *,
+         image_data: MultimodalDataInputFormat | None = None,
+         video_data: MultimodalDataInputFormat | None = None,
+@@ -187,6 +188,7 @@ class Engine(EngineBase):
+             token_ids_logprob=token_ids_logprob,
+             stream=stream,
+             lora_path=lora_path,
++            steering=steering,
+             return_routed_experts=return_routed_experts,
+             image_data=image_data,
+             video_data=video_data,
+@@ -222,6 +224,7 @@ class Engine(EngineBase):
+         stream: bool = False,
+         lora_path: list[str] | str | None = None,
+         return_routed_experts: list[bool] | bool | None = False,
++        steering: list[dict] | dict | None = None,
+         *,
+         image_data: MultimodalDataInputFormat | None = None,
+         video_data: MultimodalDataInputFormat | None = None,
+@@ -245,6 +248,7 @@ class Engine(EngineBase):
+             token_ids_logprob=token_ids_logprob,
+             stream=stream,
+             lora_path=lora_path,
++            steering=steering,
+             return_routed_experts=return_routed_experts,
+             image_data=image_data,
+             video_data=video_data,
+diff --git a/python/sgl_jax/srt/layers/steering.py b/python/sgl_jax/srt/layers/steering.py
+new file mode 100644
+index 0000000..827df09
+--- /dev/null
++++ b/python/sgl_jax/srt/layers/steering.py
+@@ -0,0 +1,392 @@
++"""Causal activation steering inside the compiled forward pass.
++
++Steering adds a direction to the residual stream part way through the model:
++
++    h -> h + alpha * v
++
++The hard part is keeping the intervention inside the one program the engine already compiled. A
++prefill graph for a 32-chip slice takes minutes to compile, and the engine holds one executable per
++(batch bucket, token bucket). Anything that decides in Python multiplies that set.
++
++So the hook site is the only thing that compiles in. It's a Python int on the model, set from
++``--steering-layer`` before ``nnx.split()`` bakes it into ``model_def``, the same way
++``layers_to_capture`` works. Everything a request chooses arrives as a device array on
++``ForwardBatch``:
++
++    vectors    [S, D]  the loaded bank, one unit-norm direction per feature
++    probes     [S, D]  the matching read directions
++    slot       [T]     which bank row this token steers with
++    alpha      [T]     length of the shift, 0 for a token nobody asked to steer
++    threshold  [T]     fire above this projection; -inf steers unconditionally, +inf never
++
++One executable therefore covers every feature in the bank, every alpha, every mix of static and
++conditional requests, and every choice of steered tokens. Two requests in one batch can steer with
++different features, because the slot is per token.
++
++A batch nobody asked to steer still carries a ``SteeringBatch``, filled with a slot of 0, an alpha
++of 0 and a threshold of +inf so that no token fires. ``ForwardBatch`` is a registered pytree and
++``forward_batch`` is a jit argument, so ``None`` against a ``SteeringBatch`` is a second treedef
++and a second executable, and the hook widens the stream to float32 in one of them. Building it
++either way is what keeps the count at one and lets the precompiled buckets cover a steering
++request. Inside that one program a ``lax.cond`` on alpha skips the bank gathers and the projection
++when no token steers, so such a batch pays for the float32 widening and one reduction over [T].
++
++Precision. The engine serves a bf16 residual stream. A bf16 add throws a small steering vector
++away: at a per-element residual RMS of 300 with 5,376 dim, 99% of the delta's components come back
++bit-identical. So the hook widens the stream to float32, adds there, and leaves it widened for the
++rest of the stack. Rounding back to bf16 after the add loses the same 99%, so the widening has to
++persist. Every matmul downstream still runs at bf16, because ``LinearBase`` asks for
++``preferred_element_type=params_dtype`` and the MoE dispatch casts its input, so what widens is the
++residual accumulation and nothing else.
++
++Reads widen too. ``projection`` normalizes and contracts in float32, which is what makes the probe
++scale invariant and the fired set stable. A bf16 compare puts 512 tokens on a few hundred distinct
++values, so tokens tie against the threshold, and a token that flips moves the output by the whole
++``alpha * v`` rather than by a rounding-scale amount.
++
++``steering/from_sae.py`` in the interpretability repo writes the bank this module loads: a decoder
++row per feature as the vector, the matching encoder column as the probe, and the fitted JumpReLU
++threshold converted into the units ``projection`` returns.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import json
++import logging
++from typing import NamedTuple
++
++import jax
++import jax.numpy as jnp
++import numpy as np
++from jax.sharding import NamedSharding
++from jax.sharding import PartitionSpec as P
++
++logger = logging.getLogger(__name__)
++
++# The hook runs in float32 inside a bf16 model.
++STEER_DTYPE = jnp.float32
++
++# A float32 matmul at TPU's default precision runs one bf16 pass, which puts a read of the
++# residual stream back at bf16 error. Ask for the float32 result.
++PRECISION = jax.lax.Precision.HIGHEST
++
++# What a token no request steers carries once the bank resolves it.
++NO_SLOT = 0
++NO_ALPHA = 0.0
++NEVER_FIRES = float("inf")
++
++BANK_KEYS = ("features", "vectors", "probes", "thresholds")
++
++
++class SteeringBatch(NamedTuple):
++    """Per-request steering, as device arrays. A pytree child of ``ForwardBatch``."""
++
++    vectors: jax.Array  # [S, D] float32
++    probes: jax.Array  # [S, D] float32
++    slot: jax.Array  # [T] int32
++    alpha: jax.Array  # [T] float32
++    threshold: jax.Array  # [T] float32
++
++
++def projection(h: jax.Array, probe: jax.Array) -> jax.Array:
++    """Read each token's residual stream along its own probe. `[T]` float32.
++
++    ``probe`` is `[D]` for one direction or `[T, D]` for a direction per token. Normalizing in
++    ``h.dtype`` breaks scale invariance: at bf16 a probe rescaled by 10 moves the projection by
++    1.3e-2 against a projection standard deviation of 0.98, which flips tokens across a threshold.
++    """
++    h = h.astype(STEER_DTYPE)
++    probe = probe.astype(STEER_DTYPE)
++    scale = jnp.maximum(
++        jnp.linalg.norm(probe, axis=-1, keepdims=True), jnp.asarray(1e-12, STEER_DTYPE)
++    )
++    unit = probe / scale
++    if unit.ndim == 1:
++        return jnp.dot(h, unit, precision=PRECISION)
++    return jnp.sum(h * unit, axis=-1)
++
++
++def threshold_fire(h: jax.Array, probe: jax.Array, threshold: jax.Array) -> jax.Array:
++    """Which tokens the predicate selects. `[T]` bool.
++
++    ``threshold`` is a scalar or `[T]`. `-inf` fires on every token, which is how static steering
++    rides the same code path as conditional steering. `+inf` fires on none.
++    """
++    return projection(h, probe) > jnp.asarray(threshold, STEER_DTYPE)
++
++
++def static_steer(
++    h: jax.Array,
++    v: jax.Array,
++    alpha: jax.Array,
++    mask: jax.Array,
++) -> jax.Array:
++    """Add ``alpha * v`` to the masked rows of the residual stream. Returns float32.
++
++    ``v`` is `[D]` or `[T, D]`. ``alpha`` is a scalar or `[T]`. Unmasked rows come back as the
++    float32 widening of ``h``, bit for bit.
++    """
++    wide = h.astype(STEER_DTYPE)
++    alpha = jnp.asarray(alpha, STEER_DTYPE)
++    if alpha.ndim:
++        alpha = alpha[:, None]
++    delta = alpha * v.astype(STEER_DTYPE)
++    return jnp.where(mask[:, None], wide + delta, wide)
++
++
++def conditional_steer(
++    h: jax.Array,
++    v: jax.Array,
++    alpha: jax.Array,
++    probe: jax.Array,
++    threshold: jax.Array,
++) -> jax.Array:
++    """Steer the tokens that pass the predicate. Masked select, no branch. Returns float32."""
++    return static_steer(h, v, alpha, threshold_fire(h, probe, threshold))
++
++
++def apply_steering(hidden_states: jax.Array, steering: SteeringBatch | None) -> jax.Array:
++    """The hook a model calls at its steering layer.
++
++    Gathers a direction and a probe per token out of the bank, then runs one masked select.
++    Returns ``hidden_states`` untouched when the batch carries no steering, so a server started
++    without the flag pays nothing. A batch whose every alpha is 0 takes the branch that only
++    widens: nothing it could add moves a row, so the gathers and the projection are skipped.
++    Both branches trace into the one program and return the same float32 rows.
++    """
++    if steering is None:
++        return hidden_states
++    # Under explicit sharding the operand replicates while the indices shard on the token axis,
++    # so jax can't resolve the gather's output sharding and raises ShardingTypeError. The gather
++    # returns one row per token, the shape hidden_states already has, so reuse its sharding. Pass
++    # the NamedSharding rather than a bare PartitionSpec, which needs a mesh context. Under auto
++    # sharding the mesh is empty and None lets the gather resolve on its own.
++    aval_sharding = jax.typeof(hidden_states).sharding
++    aval_mesh = getattr(aval_sharding, "mesh", None)
++    rows = (
++        aval_sharding if aval_mesh is not None and not getattr(aval_mesh, "empty", True) else None
++    )
++
++    def steer(h):
++        v = steering.vectors.at[steering.slot].get(out_sharding=rows)
++        probe = steering.probes.at[steering.slot].get(out_sharding=rows)
++        steered = conditional_steer(h, v, steering.alpha, probe, steering.threshold)
++        # Under explicit sharding both branches have to return one type, sharding included,
++        # and the widened stream keeps the sharding hidden_states has.
++        return steered if rows is None else jax.sharding.reshard(steered, rows)
++
++    def widen(h):
++        return h.astype(STEER_DTYPE)
++
++    return jax.lax.cond(jnp.any(steering.alpha != 0), steer, widen, hidden_states)
++
++
++@dataclasses.dataclass(frozen=True)
++class SteeringBank:
++    """The steering directions a server holds, loaded once at startup.
++
++    ``vectors`` and ``probes`` live on device and replicate across the mesh. They're operands,
++    not trace-time constants, so swapping a bank doesn't recompile.
++
++    ``features`` and ``thresholds`` stay on the host. A request names a feature, and
++    :meth:`resolve` turns per-token feature ids into per-token bank rows. The bank sorts its
++    features once, when it's built, and places the arrays of a batch nobody steers once per token
++    count, so a forward pass nobody steers does neither.
++    """
++
++    features: np.ndarray  # [S] int32
++    thresholds: np.ndarray  # [S] float32, the fitted JumpReLU threshold per feature
++    vectors: jax.Array  # [S, D] float32
++    probes: jax.Array  # [S, D] float32
++    # The bank row of each feature in sorted order, and the sorted features, for slots_for.
++    _order: np.ndarray = dataclasses.field(init=False, repr=False, compare=False)
++    _sorted: np.ndarray = dataclasses.field(init=False, repr=False, compare=False)
++    # all_off's placed arrays, by token count and sharding.
++    _all_off: dict = dataclasses.field(init=False, repr=False, compare=False, default_factory=dict)
++
++    def __post_init__(self):
++        order = np.argsort(self.features)
++        object.__setattr__(self, "_order", order)
++        object.__setattr__(self, "_sorted", self.features[order])
++
++    @classmethod
++    def load(
++        cls,
++        path: str,
++        mesh: jax.sharding.Mesh,
++        hidden_size: int,
++        steering_layer: int | None = None,
++    ) -> SteeringBank:
++        """Read a bank written by ``steering/from_sae.py::save_bank``.
++
++        Checks the site the bank was fit at against ``--steering-layer``. Width can't catch a
++        site mismatch, because every layer of a model is the same width, and a probe read one
++        layer off the distribution it was calibrated on selects a different set of tokens.
++        ``from_sae.py`` copies the SAE's capture slot into ``meta`` and converts it to the
++        ``--steering-layer`` that writes the same tensor, which is one less.
++        """
++        with np.load(path, allow_pickle=False) as data:
++            missing = [key for key in BANK_KEYS if key not in data]
++            if missing:
++                raise ValueError(f"steering bank {path} is missing {missing}")
++            features = np.asarray(data["features"], np.int32)
++            vectors = np.asarray(data["vectors"], np.float32)
++            probes = np.asarray(data["probes"], np.float32)
++            thresholds = np.asarray(data["thresholds"], np.float32)
++            meta = json.loads(str(data["meta"])) if "meta" in data else {}
++
++        # Each of these fails later on the scheduler thread, where it stops the server: a short
++        # thresholds array on the first request for a fitted threshold, an empty bank on the
++        # all-off batch every forward pass builds. A NaN threshold is the sentinel for "use the
++        # fitted one", so it can't stand for a value. +inf marks a dead latent and loads.
++        if (
++            features.ndim != 1
++            or vectors.ndim != 2
++            or vectors.shape != probes.shape
++            or vectors.shape[0] != features.shape[0]
++            or thresholds.shape != features.shape
++        ):
++            raise ValueError(
++                f"steering bank {path} is inconsistent: features {features.shape},"
++                f" thresholds {thresholds.shape}, vectors {vectors.shape}, probes {probes.shape}"
++            )
++        if features.shape[0] == 0:
++            raise ValueError(f"steering bank {path} holds no feature")
++        if np.isnan(thresholds).any() or np.isneginf(thresholds).any():
++            raise ValueError(
++                f"steering bank {path} has a NaN or -inf threshold; a threshold is a number, or"
++                " +inf for a dead latent"
++            )
++        if not (np.isfinite(vectors).all() and np.isfinite(probes).all()):
++            raise ValueError(f"steering bank {path} has a non-finite vector or probe")
++        if vectors.shape[1] != hidden_size:
++            raise ValueError(
++                f"steering bank {path} is {vectors.shape[1]} wide, the model is {hidden_size}"
++            )
++        if len(set(features.tolist())) != features.shape[0]:
++            raise ValueError(f"steering bank {path} lists a feature twice")
++        # A dead latent never fired during calibration. Conditional steering compares against
++        # its +inf and never fires either, but static steering reads no threshold and still adds
++        # the vector to every token it steers.
++        dead = features[np.isposinf(thresholds)]
++        if dead.size:
++            logger.warning(
++                "steering bank %s holds dead latent(s) %s with a +inf threshold. Conditional"
++                " steering never fires them, and static steering still adds their vectors.",
++                path,
++                dead.tolist(),
++            )
++
++        fit_at = meta.get("steering_layer")
++        if fit_at is None:
++            logger.warning(
++                "steering bank %s records no site, so --steering-layer %s goes unchecked."
++                " Rebuild it from an SAE whose checkpoint carries capture_layer.",
++                path,
++                steering_layer,
++            )
++        elif steering_layer is not None and int(fit_at) != int(steering_layer):
++            raise ValueError(
++                f"steering bank {path} was fit on capture slot {meta.get('capture_layer')},"
++                f" which is --steering-layer {int(fit_at)}, but this server was started with"
++                f" --steering-layer {steering_layer}"
++            )
++
++        replicated = NamedSharding(mesh, P())
++        return cls(
++            features=features,
++            thresholds=thresholds,
++            vectors=jax.device_put(jnp.asarray(vectors, STEER_DTYPE), replicated),
++            probes=jax.device_put(jnp.asarray(probes, STEER_DTYPE), replicated),
++        )
++
++    def slots_for(self, feature: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++        """Map per-token feature ids to bank rows.
++
++        Returns ``(slot, known)``. A token with no steering carries -1 and comes back unknown, so
++        the caller zeroes its alpha rather than steering it with row 0.
++        """
++        at = np.searchsorted(self._sorted, feature)
++        at = np.clip(at, 0, self._sorted.shape[0] - 1)
++        slot = self._order[at]
++        known = self.features[slot] == feature
++        return np.where(known, slot, NO_SLOT).astype(np.int32), known
++
++    def all_off(self, num_tokens: int, sharding, place) -> tuple[jax.Array, jax.Array, jax.Array]:
++        """The per-token arrays of a batch nobody steers, placed once per token count.
++
++        Slot 0, alpha 0 and a +inf threshold on every token, which is what :meth:`resolve` gives
++        a batch of -1 features. ``ForwardBatch.init_new`` needs them on every forward pass nobody
++        steers, and its token counts come from a few padded buckets. ``place`` is its
++        ``device_array``, called as ``place(arrays, sharding=sharding)``.
++        """
++        key = (num_tokens, sharding)
++        if key not in self._all_off:
++            self._all_off[key] = place(
++                (
++                    np.full(num_tokens, NO_SLOT, np.int32),
++                    np.full(num_tokens, NO_ALPHA, np.float32),
++                    np.full(num_tokens, NEVER_FIRES, np.float32),
++                ),
++                sharding=sharding,
++            )
++        return self._all_off[key]
++
++    def resolve(
++        self,
++        feature: np.ndarray,
++        alpha: np.ndarray,
++        threshold: np.ndarray,
++    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++        """Resolve the scheduler's per-token configuration against the bank, on the host.
++
++        ``feature`` is -1 on a token nobody steers. ``threshold`` is NaN where the request asked
++        for this feature's fitted threshold, -inf for static steering, and a number when the
++        request set one. A feature the bank doesn't hold steers nothing and logs a warning.
++
++        Returns ``(slot, alpha, threshold)`` as host arrays. ``ForwardBatch.init_new`` puts them on
++        the token axis with ``device_array``, like every other per-token array it builds.
++        """
++        feature = np.asarray(feature, np.int32)
++        alpha = np.asarray(alpha, np.float32).copy()
++        threshold = np.asarray(threshold, np.float32).copy()
++
++        slot, known = self.slots_for(feature)
++        wanted = feature >= 0
++        missing = wanted & ~known
++        if missing.any():
++            logger.warning(
++                "steering: %d token(s) asked for feature(s) %s, which the bank doesn't hold",
++                int(missing.sum()),
++                sorted(set(feature[missing].tolist())),
++            )
++        live = wanted & known
++        alpha[~live] = NO_ALPHA
++        threshold[~live] = NEVER_FIRES
++
++        fitted = np.isnan(threshold)
++        threshold[fitted] = self.thresholds[slot[fitted]]
++
++        if logger.isEnabledFor(logging.DEBUG):
++            steered = np.flatnonzero(live)
++            logger.debug(
++                "steering: %d of %d token(s) steer; rows %s, slots %s, alphas %s, thresholds %s",
++                steered.size,
++                feature.shape[0],
++                steered.tolist(),
++                slot[steered].tolist(),
++                alpha[steered].tolist(),
++                threshold[steered].tolist(),
++            )
++        return slot, alpha, threshold
++
++    def batch(self, slot: jax.Array, alpha: jax.Array, threshold: jax.Array) -> SteeringBatch:
++        """Pair the per-token device arrays with the bank the server holds."""
++        return SteeringBatch(
++            vectors=self.vectors,
++            probes=self.probes,
++            slot=slot,
++            alpha=alpha,
++            threshold=threshold,
++        )
+diff --git a/python/sgl_jax/srt/managers/io_struct.py b/python/sgl_jax/srt/managers/io_struct.py
+index e685644..edaa07f 100644
+--- a/python/sgl_jax/srt/managers/io_struct.py
++++ b/python/sgl_jax/srt/managers/io_struct.py
+@@ -1,4 +1,5 @@
+ import copy
++import json
+ import time
+ import uuid
+ from dataclasses import dataclass, field
+@@ -168,6 +169,8 @@ class TokenizedGenerateReqInput:
+     extra_key: str | None = None
+     # return_routed_experts decides whether return expert indices for every token for every layer
+     return_routed_experts: list[bool] | bool | None = None
++    # Activation steering for this request. See GenerateReqInput.steering.
++    steering: dict | None = None
+     # whether to return hidden states
+     return_hidden_states: bool = False
+     # multimodal inputs (e.g., mrope positions, embeddings)
+@@ -240,6 +243,119 @@ class PauseGenerationReqInput(BaseReq):
+             raise ValueError(f"Invalid mode: {self.mode!r}. " f"Expected one of {allowed}.")
+ 
+ 
++# The fields a steering request can set. Anything else is refused, because the scheduler reads
++# a missing field as its default: a misspelled "positions" would steer every token.
++STEERING_FIELDS = ("feature", "alpha", "mode", "threshold", "positions")
++
++# What steering_cache_key puts in front of a steered request's cache namespace. A server with
++# --enable-steering refuses a client extra_key that holds it, so no request can name a steered
++# request's namespace and share its cached KV.
++STEERING_KEY_PREFIX = "steering:"
++
++
++def _validate_steering(config) -> None:
++    """Reject a malformed steering request at the front door.
++
++    Every field a request can set gets checked here, by type and by value, and a key outside
++    those fields gets refused. Downstream there's nowhere to report a problem: `_merge_steering`
++    calls `float()` on alpha and on the threshold, and it runs on the scheduler thread, so one
++    bad value stops request handling for the whole server instead of returning an error to the
++    caller who sent it.
++    """
++    if config is None:
++        return
++    if not isinstance(config, dict):
++        raise ValueError(f"steering must be a dict, got {type(config).__name__}")
++    unknown = [key for key in config if key not in STEERING_FIELDS]
++    if unknown:
++        raise ValueError(
++            f"steering takes {', '.join(STEERING_FIELDS)} and no other key, got {unknown!r}"
++        )
++    missing = [key for key in ("feature", "alpha") if key not in config]
++    if missing:
++        raise ValueError(f"steering needs {missing}")
++
++    feature = config["feature"]
++    if isinstance(feature, bool) or not isinstance(feature, int):
++        raise ValueError(f"steering feature must be an int, got {feature!r}")
++    if not 0 <= feature < 2**31:
++        raise ValueError(f"steering feature must be in [0, 2**31), got {feature}")
++
++    # The scheduler stores alpha and the threshold as float32. A finite value past that range
++    # turns into inf there, and a steered row then goes to NaN after the next norm.
++    float32_max = float(np.finfo(np.float32).max)
++
++    def in_float32_range(value):
++        try:
++            value = float(value)
++        except OverflowError:
++            return False
++        return bool(np.isfinite(value)) and abs(value) <= float32_max
++
++    alpha = config["alpha"]
++    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
++        raise ValueError(f"steering alpha must be a number, got {alpha!r}")
++    if not in_float32_range(alpha):
++        raise ValueError(f"steering alpha must be finite in float32, got {alpha!r}")
++
++    threshold = config.get("threshold")
++    if threshold is not None:
++        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
++            raise ValueError(f"steering threshold must be a number, got {threshold!r}")
++        if isinstance(threshold, float) and np.isnan(threshold):
++            # NaN is the sentinel for "use the feature's fitted threshold", so a request
++            # that sends one would silently get conditional steering it never asked for.
++            raise ValueError("steering threshold must not be NaN; drop the key instead")
++        # +inf never fires and -inf always does, and both survive float32 as they are.
++        if not (isinstance(threshold, float) and np.isinf(threshold)) and not in_float32_range(
++            threshold
++        ):
++            raise ValueError(f"steering threshold must fit in float32, got {threshold!r}")
++
++    mode = config.get("mode", "static")
++    if not isinstance(mode, str) or mode.lower() not in ("static", "conditional"):
++        raise ValueError(f"steering mode must be static or conditional, got {mode!r}")
++    # A threshold picks the tokens conditional steering fires on. Static steering steers every
++    # token it picked and reads none, and the scheduler would serve the pair as conditional.
++    if threshold is not None and "mode" in config and mode.lower() == "static":
++        raise ValueError(
++            "steering mode static reads no threshold; drop the threshold or set mode conditional"
++        )
++
++    positions = config.get("positions")
++    if positions is not None:
++        if not isinstance(positions, (list, tuple)):
++            raise ValueError(f"steering positions must be a list, got {positions!r}")
++        for position in positions:
++            if isinstance(position, bool) or not isinstance(position, int):
++                raise ValueError(f"steering positions must be ints, got {position!r}")
++            if not 0 <= position < 2**63:
++                raise ValueError(f"steering positions must be in [0, 2**63), got {position}")
++
++
++def steering_cache_key(config: dict) -> str:
++    """The radix-cache namespace of a steered request, appended to its extra_key.
++
++    Steering changes the stream every layer above the hook writes to the KV cache, so a
++    request may reuse only KV built under the same steering. The key names every field that
++    decides what the hook does. Two requests that steer the same way share a cached prefix, and
++    a request that steers another way, or not at all, never sees it. So a position inside a
++    reused prefix was steered, when that prefix ran, by a request with these same positions.
++    """
++    positions = config.get("positions")
++    threshold = config.get("threshold")
++    return STEERING_KEY_PREFIX + json.dumps(
++        {
++            "feature": int(config["feature"]),
++            "alpha": float(config["alpha"]),
++            "mode": str(config.get("mode", "static")).lower(),
++            "threshold": None if threshold is None else float(threshold),
++            "positions": None if positions is None else sorted({int(p) for p in positions}),
++        },
++        sort_keys=True,
++    )
++
++
+ @dataclass
+ class ContinueGenerationReqInput(BaseReq):
+     pass
+@@ -341,6 +457,18 @@ class GenerateReqInput:
+ 
+     return_routed_experts: list[bool] | bool | None = None
+ 
++    # Activation steering, one dict per request or one shared by the batch. Needs a server
++    # started with --enable-steering, which refuses it otherwise, and a bank that holds the
++    # feature. Any key outside these five is refused.
++    #
++    #   {"feature": 40977,          # required, a feature id in the loaded bank
++    #    "alpha": 1.5,              # required, length of the shift in activation units
++    #    "mode": "conditional",     # "static" (default) steers every token it picked
++    #    "threshold": 0.31,         # optional, overrides the feature's fitted threshold; set
++    #                               # alone it means conditional, and static refuses it
++    #    "positions": [12, 13]}     # optional, absolute positions; default every token
++    steering: list[dict] | dict | None = None
++
+     # Decode DP rank selected by request routing.
+     dp_rank: list[int] | int | None = None
+ 
+@@ -416,6 +544,7 @@ class GenerateReqInput:
+                 raise ValueError("Single request cannot have multiple lora_paths")
+         if self.return_routed_experts is None:
+             self.return_routed_experts = False
++        _validate_steering(self.steering)
+ 
+     def _handle_parallel_sampling(self):
+         """Handle parallel sampling parameters and adjust batch size if needed."""
+@@ -465,6 +594,7 @@ class GenerateReqInput:
+         self._normalize_logprob_params(num)
+         self._normalize_lora_paths(num)
+         self._normalize_return_routed_experts(num)
++        self._normalize_steering(num)
+ 
+     def _expand_inputs(self, num):
+         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
+@@ -530,6 +660,16 @@ class GenerateReqInput:
+             self.return_routed_experts, False, "return_routed_experts", num
+         )
+ 
++    def _normalize_steering(self, num):
++        """One steering dict per request.
++
++        A single dict applies to every request in the batch. A list gives one entry each, and an
++        entry of None steers that request not at all.
++        """
++        self.steering = self._normalize_param(self.steering, None, "steering", num)
++        for config in self.steering:
++            _validate_steering(config)
++
+     # Helper function to normalize a parameter
+     def _normalize_param(self, param, default_value, param_name, num):
+         if param is None:
+@@ -598,6 +738,7 @@ class GenerateReqInput:
+             lora_path=self.lora_path[i] if self.lora_path is not None else None,
+             lora_id=self.lora_id[i] if self.lora_id is not None else None,
+             return_routed_experts=self.return_routed_experts[i],
++            steering=self.steering[i] if isinstance(self.steering, list) else self.steering,
+             dp_rank=self.dp_rank[i] if isinstance(self.dp_rank, list) else self.dp_rank,
+             # PD disaggregation passthrough.
+             # Supports both scalar and list shapes.
+diff --git a/python/sgl_jax/srt/managers/schedule_batch.py b/python/sgl_jax/srt/managers/schedule_batch.py
+index ae0481e..d083dc6 100644
+--- a/python/sgl_jax/srt/managers/schedule_batch.py
++++ b/python/sgl_jax/srt/managers/schedule_batch.py
+@@ -196,6 +196,7 @@ class Req:
+         deepstack_visual_embedding: list[list[float]] | None = None,
+         deepstack_visual_pos_mask: list[int] | None = None,
+         radix_input_ids: list[int] | None = None,
++        steering: dict | None = None,
+     ):
+         # Input and output info
+         self.rid = rid
+@@ -422,6 +423,10 @@ class Req:
+         self.grammar_key: tuple[str, str] | None = None  # Cache key for grammar
+         self.grammar_wait_ct = 0  # Counter for grammar compilation wait time
+ 
++        # Activation steering. A dict with a feature, an alpha, and optionally a mode, a
++        # threshold and the positions to steer. None means this request steers nothing.
++        self.steering = steering
++
+         # capture routed experts
+         self.return_routed_experts = return_routed_experts
+         self.routed_experts: np.ndarray | None = None  # shape (seqlen, topk)
+@@ -796,6 +801,36 @@ class ScheduleReqsInfo:
+     recurrent_track_mask: np.ndarray | None = None
+ 
+ 
++def _steering_token_rows(config: dict, prefix: int, width: int) -> np.ndarray:
++    """Which rows of a request's token window the steering applies to.
++
++    ``config["positions"]`` lists absolute sequence positions. A position past the window this
++    forward pass covers lands when a later chunk or decode step reaches it. A position before
++    the window was steered already: either an earlier chunk of this request ran it, or it sits
++    in a cached prefix, and the steering is part of the cache key, so only a request with these
++    same positions built that prefix. Without the key, every token in the window steers.
++    """
++    positions = config.get("positions")
++    if positions is None:
++        return np.arange(width, dtype=np.int64)
++    rows = np.asarray(list(positions), dtype=np.int64) - prefix
++    return np.unique(rows[(rows >= 0) & (rows < width)])
++
++
++def _steering_threshold(config: dict) -> float:
++    """The per-token threshold a request asks for.
++
++    Static steering is conditional steering with a threshold of -inf, so both ride one code path
++    and one executable. NaN means the feature's own fitted JumpReLU threshold, which the model
++    runner fills in from the bank.
++    """
++    if config.get("threshold") is not None:
++        return float(config["threshold"])
++    if str(config.get("mode", "static")).lower() == "conditional":
++        return float("nan")
++    return float("-inf")
++
++
+ def _build_recurrent_cow_src_indices(reqs: list[Req]) -> np.ndarray:
+     """Build fixed-shape CoW metadata; zero means no clone for that request."""
+     vals = [r.recurrent_cow_src_index or 0 for r in reqs]
+@@ -922,6 +957,13 @@ class ScheduleBatch:
+     # Whether to return captured experts
+     return_routed_experts: bool = False
+ 
++    # Per-token activation steering, on the same layout as input_ids. None when no request in
++    # the batch asks for it. steering_feature is -1 on a token nobody steers, and
++    # steering_threshold is NaN where the request wants the feature's own fitted threshold.
++    steering_feature: np.ndarray | None = None
++    steering_alpha: np.ndarray | None = None
++    steering_threshold: np.ndarray | None = None
++
+     # Deepstack
+     apply_for_deepstack: bool = False
+     input_embedding: list[list[list[float]]] | None = None
+@@ -2156,6 +2198,81 @@ class ScheduleBatch:
+ 
+         return input_ids_cpu, positions_cpu, out_cache_loc_cpu, real_input_ids_len
+ 
++    def _merge_steering(
++        self,
++        per_dp_token_size: int,
++        total_token_size: int,
++    ) -> dict:
++        """Per-token steering configuration, on the layout ``_merge_input_and_positions`` builds.
++
++        Per-rank slot stride ``per_dp_token_size``; within a rank, the per-req EXTEND window
++        ``[prefix_len, seq_len)`` or one token per req on DECODE. Reads ``Req.steering`` and
++        writes nothing back.
++
++        Returns three ``[total_token_size]`` arrays, or all None when no request steers:
++
++        - ``steering_feature`` int32, -1 where nobody steers.
++        - ``steering_alpha`` float32, the length of the shift.
++        - ``steering_threshold`` float32. -inf steers every token the request picked, NaN asks
++          for the feature's own fitted threshold, and a number sets one.
++
++        The bank index isn't resolved here. The scheduler doesn't hold the bank; the model runner
++        does, and ``ForwardBatch.init_new`` turns these feature ids into bank rows.
++
++        All None doesn't mean no steering batch. A server that loaded a bank builds an all-off
++        one in ``ForwardBatch.init_new``, so the executable count stays at one.
++        """
++        empty = {
++            "steering_feature": None,
++            "steering_alpha": None,
++            "steering_threshold": None,
++        }
++        if not any(
++            getattr(req, "steering", None) for info in self.reqs_info for req in (info.reqs or [])
++        ):
++            return empty
++
++        feature = np.full(total_token_size, -1, dtype=np.int32)
++        alpha = np.zeros(total_token_size, dtype=np.float32)
++        threshold = np.full(total_token_size, -np.inf, dtype=np.float32)
++
++        is_extend = self.forward_mode.is_extend()
++        offset = 0
++        for dp_rank in range(self.dp_size):
++            info = self.reqs_info[dp_rank]
++            reqs = info.reqs or []
++            pt = offset
++            for i, req in enumerate(reqs):
++                if is_extend:
++                    prefix = int((info.prefix_lens or [0] * len(reqs))[i])
++                    width = int((info.extend_lens or [0] * len(reqs))[i])
++                else:
++                    prefix = int(info.seq_lens[i]) - 1
++                    width = 1
++                config = getattr(req, "steering", None)
++                if config and width > 0:
++                    rows = _steering_token_rows(config, prefix, width)
++                    if rows.size:
++                        feature[pt + rows] = int(config["feature"])
++                        alpha[pt + rows] = float(config.get("alpha", 0.0))
++                        threshold[pt + rows] = _steering_threshold(config)
++                    logger.debug(
++                        "steering for rid %s: %s over positions %d to %d steers %s",
++                        req.rid,
++                        config,
++                        prefix,
++                        prefix + width - 1,
++                        (prefix + rows).tolist(),
++                    )
++                pt += width
++            offset += per_dp_token_size
++
++        return {
++            "steering_feature": feature,
++            "steering_alpha": alpha,
++            "steering_threshold": threshold,
++        }
++
+     def _merge_multimodal(
+         self,
+         per_dp_token_size: int,
+@@ -3224,6 +3341,7 @@ class ScheduleBatch:
+         # reqs_info[*].reqs; see ScheduleBatch._merge_multimodal. Each is
+         # None/False for pure-text batches, so non-multimodal paths stay
+         # unchanged.
++        _steering = self._merge_steering(per_dp_token_padding, total_token_size)
+         _mm = self._merge_multimodal(per_dp_token_padding, total_token_size)
+         input_embedding = _mm["input_embedding"]
+         mrope_positions = _mm["mrope_positions"]
+@@ -3355,6 +3473,7 @@ class ScheduleBatch:
+             recurrent_track_mask=recurrent_track_mask_cpu,
+             has_initial_state=has_initial_state_cpu,
+             spec_algorithm=self.spec_algorithm,
++            **_steering,
+         )
+ 
+     def get_spec_model_worker_batch(
+@@ -3799,6 +3918,12 @@ class ModelWorkerBatch:
+     # Whether each request has prior recurrent state (lazy zero-on-read)
+     has_initial_state: np.ndarray | None = None
+ 
++    # Per-token activation steering, on the input_ids layout. ScheduleBatch fills these in
++    # _merge_steering and ForwardBatch.init_new turns them into device arrays.
++    steering_feature: np.ndarray | None = None
++    steering_alpha: np.ndarray | None = None
++    steering_threshold: np.ndarray | None = None
++
+     def get_original_input_len(self):
+         """
+         return unpadded tokens number for prefill and real batch size for decode
+diff --git a/python/sgl_jax/srt/managers/scheduler.py b/python/sgl_jax/srt/managers/scheduler.py
+index eca5806..3306802 100644
+--- a/python/sgl_jax/srt/managers/scheduler.py
++++ b/python/sgl_jax/srt/managers/scheduler.py
+@@ -1209,7 +1209,15 @@ class Scheduler(
+             vocab_size=self.model_config.vocab_size,
+             return_routed_experts=recv_req.return_routed_experts,
+             return_hidden_states=recv_req.return_hidden_states,
++            steering=getattr(recv_req, "steering", None),
+         )
++        if req.steering:
++            logger.debug(
++                "steering for rid %s reached the scheduler: %s, cache namespace %r",
++                req.rid,
++                req.steering,
++                req.extra_key,
++            )
+         req.tokenizer = self.tokenizer
+         # PD disaggregation routing keys.
+         req.bootstrap_host = recv_req.bootstrap_host
+diff --git a/python/sgl_jax/srt/managers/tokenizer_manager.py b/python/sgl_jax/srt/managers/tokenizer_manager.py
+index a6d22f4..d3eee53 100644
+--- a/python/sgl_jax/srt/managers/tokenizer_manager.py
++++ b/python/sgl_jax/srt/managers/tokenizer_manager.py
+@@ -37,6 +37,7 @@ from sgl_jax.srt.hf_transformers_utils import (
+ )
+ from sgl_jax.srt.lora.lora_registry import LoRARegistry
+ from sgl_jax.srt.managers.io_struct import (
++    STEERING_KEY_PREFIX,
+     AbortReq,
+     BatchEmbeddingOut,
+     BatchStrOut,
+@@ -65,6 +66,7 @@ from sgl_jax.srt.managers.io_struct import (
+     SetInternalStateReqOutput,
+     TokenizedEmbeddingReqInput,
+     TokenizedGenerateReqInput,
++    steering_cache_key,
+ )
+ from sgl_jax.srt.managers.mm_utils import send_mm_request
+ from sgl_jax.srt.multimodal.common.modality_enum import build_radix_input_ids
+@@ -547,6 +549,30 @@ class TokenizerManager:
+         tokenized_obj.dp_rank = dp_rank
+         tokenized_obj.disagg_prefill_dp_rank = prefill_dp_rank
+         tokenized_obj.disagg_transfer_id = getattr(obj, "disagg_transfer_id", None)
++        tokenized_obj.steering = getattr(obj, "steering", None)
++        steering_on = getattr(self.server_args, "enable_steering", False)
++        if tokenized_obj.steering and not steering_on:
++            # Refuse here, where the caller gets the error. Past this point the request would
++            # reach a model with no bank loaded and come back unsteered.
++            raise ValueError("steering needs a server started with --enable-steering")
++        if steering_on and STEERING_KEY_PREFIX in (tokenized_obj.extra_key or ""):
++            # Only a steered request's cache namespace holds this prefix, so a client key that
++            # holds it could name that namespace and share the steered request's KV.
++            raise ValueError(
++                f"extra_key can't hold {STEERING_KEY_PREFIX!r}, which names a steered request's"
++                " cache namespace"
++            )
++        if tokenized_obj.steering:
++            # A steered request shares cached KV only with requests that steer the same way.
++            tokenized_obj.extra_key = (tokenized_obj.extra_key or "") + steering_cache_key(
++                tokenized_obj.steering
++            )
++            logger.debug(
++                "steering for rid %s leaves the tokenizer manager: %s, cache namespace %r",
++                tokenized_obj.rid,
++                tokenized_obj.steering,
++                tokenized_obj.extra_key,
++            )
+         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
+         if (
+             tokenized_obj.return_logprob
+diff --git a/python/sgl_jax/srt/model_executor/forward_batch_info.py b/python/sgl_jax/srt/model_executor/forward_batch_info.py
+index 5db6594..9092897 100644
+--- a/python/sgl_jax/srt/model_executor/forward_batch_info.py
++++ b/python/sgl_jax/srt/model_executor/forward_batch_info.py
+@@ -33,6 +33,7 @@ from sgl_jax.srt.eplb.expert_location import (
+     ExpertLocationMetadata,
+     get_global_expert_location_metadata,
+ )
++from sgl_jax.srt.layers.steering import SteeringBatch
+ from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+ from sgl_jax.srt.utils.jax_utils import device_array
+ 
+@@ -212,6 +213,10 @@ class ForwardBatch:
+     recurrent_track_indices: jax.Array | None = None
+     recurrent_track_mask: jax.Array | None = None
+ 
++    # Per-request activation steering. None unless the server ran with --enable-steering.
++    # Every field is a device array, so one executable covers every steering configuration.
++    steering: SteeringBatch | None = None
++
+     # Host-only multimodal batch consumed before the backbone JIT.
+     multimodal_batch: object | None = None
+ 
+@@ -240,6 +245,7 @@ class ForwardBatch:
+             self.recurrent_cow_src_indices,
+             self.recurrent_track_indices,
+             self.recurrent_track_mask,
++            self.steering,
+         )
+ 
+         aux_data = {
+@@ -291,6 +297,7 @@ class ForwardBatch:
+         obj.recurrent_cow_src_indices = children[20]
+         obj.recurrent_track_indices = children[21]
+         obj.recurrent_track_mask = children[22]
++        obj.steering = children[23]
+         # Host-only attribute, never a pytree child; reset so attribute access on
+         # an unflattened ForwardBatch never raises (the routine that consumes it
+         # runs on the original, pre-jit ForwardBatch).
+@@ -473,6 +480,37 @@ class ForwardBatch:
+ 
+         multimodal_batch = getattr(batch, "multimodal_batch", None)
+ 
++        # Per-token steering. The bank lives on device from startup, so this only moves the
++        # three per-token arrays the requests chose.
++        #
++        # A server that loaded a bank builds one on every batch, including the batches
++        # CompilationManager precompiles and the batches nobody asked to steer. Those get alpha
++        # 0 and a threshold of +inf, which fires on no token. Building it either way is what
++        # keeps the executable count at one. ForwardBatch is a pytree and forward_batch is a jit
++        # argument, so None against a SteeringBatch is a different treedef and a different
++        # program, and the hook widens the residual stream to float32 in one of the two. The
++        # bank places the all-off arrays once per token count, and the hook's lax.cond skips the
++        # bank gathers and the projection for them.
++        steering = None
++        steering_bank = getattr(model_runner, "steering_bank", None)
++        if steering_bank is not None:
++            # device_array builds each shard from the host copy every process already holds.
++            # jax.device_put would first check that copy against every other host, one
++            # allgather per array per forward pass on a multi-host mesh.
++            token_sharding = NamedSharding(model_runner.mesh, PartitionSpec("data"))
++            if batch.steering_feature is None:
++                slot, alpha, threshold = steering_bank.all_off(
++                    len(batch.input_ids), token_sharding, device_array
++                )
++            else:
++                slot, alpha, threshold = steering_bank.resolve(
++                    batch.steering_feature, batch.steering_alpha, batch.steering_threshold
++                )
++                slot, alpha, threshold = device_array(
++                    (slot, alpha, threshold), sharding=token_sharding
++                )
++            steering = steering_bank.batch(slot, alpha, threshold)
++
+         obj = cls(
+             bid=batch.bid,
+             forward_mode=batch.forward_mode,
+@@ -502,6 +540,7 @@ class ForwardBatch:
+             recurrent_cow_src_indices=recurrent_cow_src_indices,
+             recurrent_track_indices=recurrent_track_indices,
+             recurrent_track_mask=recurrent_track_mask,
++            steering=steering,
+         )
+         obj.multimodal_batch = multimodal_batch
+ 
+diff --git a/python/sgl_jax/srt/model_executor/model_runner.py b/python/sgl_jax/srt/model_executor/model_runner.py
+index d9af0f6..bf9e15a 100644
+--- a/python/sgl_jax/srt/model_executor/model_runner.py
++++ b/python/sgl_jax/srt/model_executor/model_runner.py
+@@ -27,6 +27,7 @@ from sgl_jax.srt.layers.routed_experts_capturer import (
+     set_global_experts_capturer,
+ )
+ from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
++from sgl_jax.srt.layers.steering import SteeringBank
+ from sgl_jax.srt.lora.context_manager import LoraBatchContext
+ from sgl_jax.srt.managers.schedule_batch import (
+     GLOBAL_SERVER_ARGS_KEYS,
+@@ -201,7 +202,15 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
+ 
+         self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
+         self._sampler_step = jax.device_put(np.int32(0), NamedSharding(self.mesh, P()))
++
++        # Only the target runner loads the bank. A draft model carries no steering hook, and
++        # its ModelRunner gets the target's server_args, so it would refuse to start. The pair
++        # never gets this far anyway: check_server_args refuses --enable-steering with
++        # --speculative-algorithm, because the verify pass drops the per-token steering.
++        self.steering_bank = None
+         if not self.is_draft_worker:
++            # Before initialize_jit(), since nnx.split() bakes steering_layer into model_def.
++            self._setup_steering()
+             self.initialize_jit()
+ 
+         # Init memory pool and attention backends
+@@ -249,6 +258,45 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
+             mesh=self.mesh,
+         )
+ 
++    def _setup_steering(self):
++        """Load the steering bank and tell the model which layer the hook sits after.
++
++        Called after load_model() and before initialize_jit(), because steering_layer is baked
++        into model_def during nnx.split(). The bank itself goes to device here and stays there,
++        so a request pays for three per-token arrays and nothing else.
++        """
++        if not getattr(self.server_args, "enable_steering", False):
++            return
++        if not self.server_args.steering_bank:
++            raise ValueError("--enable-steering needs --steering-bank")
++
++        inner_model = getattr(self.model, "model", None)
++        if inner_model is None or not hasattr(inner_model, "steering_layer"):
++            raise ValueError(
++                f"{type(self.model).__name__} has no steering hook, so --enable-steering "
++                "would run unsteered"
++            )
++        num_layers = self.model_config.num_hidden_layers
++        layer = self.server_args.steering_layer
++        if not 0 <= layer < num_layers:
++            raise ValueError(
++                f"--steering-layer {layer} is outside 0..{num_layers - 1} for this model"
++            )
++
++        self.steering_bank = SteeringBank.load(
++            self.server_args.steering_bank,
++            self.mesh,
++            self.model_config.hidden_size,
++            steering_layer=layer,
++        )
++        inner_model.steering_layer = layer
++        logger.info(
++            "Steering enabled after layer %d with %d feature(s) from %s",
++            layer,
++            self.steering_bank.features.shape[0],
++            self.server_args.steering_bank,
++        )
++
+     def init_routed_experts_capturer(self):
+         set_global_experts_capturer(
+             RoutedExpertsCapturer.create(
+diff --git a/python/sgl_jax/srt/models/gemma4.py b/python/sgl_jax/srt/models/gemma4.py
+index 9a6ca45..ed44004 100644
+--- a/python/sgl_jax/srt/models/gemma4.py
++++ b/python/sgl_jax/srt/models/gemma4.py
+@@ -18,6 +18,7 @@ from sgl_jax.srt.layers.linear import LinearBase
+ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+ from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
+ from sgl_jax.srt.layers.radix_attention import RadixAttention
++from sgl_jax.srt.layers.steering import apply_steering
+ from sgl_jax.srt.mem_cache.memory_pool import KVCache
+ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+ from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
+@@ -531,6 +532,10 @@ class Gemma4Model(nnx.Module):
+         )
+         self.hidden_size = config.hidden_size
+         self.layers_to_capture = []
++        # Which layer the steering hook sits after. A Python int, so the site bakes into
++        # model_def; the vector, the strength and the predicate stay operands. None means the
++        # server was started without --enable-steering.
++        self.steering_layer = None
+ 
+     def __call__(
+         self,
+@@ -559,6 +564,11 @@ class Gemma4Model(nnx.Module):
+                 forward_batch,
+                 token_to_kv_pool,
+             )
++            if layer_id == self.steering_layer:
++                # The shift lands on the stream leaving this layer, which is the stream
++                # layers_to_capture reports for the next one. Returns float32 and the stream
++                # stays wide from here down, because rounding back to bf16 drops the shift.
++                hidden_states = apply_steering(hidden_states, forward_batch.steering)
+             layers_kv_fused.append(kv_fused)
+             layers_callback_flag.extend(callback_flag)
+             layers_topk_ids.append(topk_ids)
+diff --git a/python/sgl_jax/srt/server_args.py b/python/sgl_jax/srt/server_args.py
+index 37d3998..2937744 100644
+--- a/python/sgl_jax/srt/server_args.py
++++ b/python/sgl_jax/srt/server_args.py
+@@ -273,6 +273,11 @@ class ServerArgs:
+     expert_distribution_recorder_buffer_size: int = 100
+     expert_distribution_recorder_output_file: str | None = None
+ 
++    # Causal activation steering.
++    enable_steering: bool = False
++    steering_bank: str | None = None
++    steering_layer: int = 0
++
+     # Prefill-Decode disaggregation settings.
+     disaggregation_mode: str = "null"
+     disaggregation_bootstrap_url: str | None = None
+@@ -1782,6 +1787,25 @@ class ServerArgs:
+             action="store_true",
+             help="Enable returning routed experts of each layer with responses.",
+         )
++        parser.add_argument(
++            "--enable-steering",
++            action="store_true",
++            help="Enable causal activation steering. Needs --steering-bank.",
++        )
++        parser.add_argument(
++            "--steering-bank",
++            type=str,
++            default=ServerArgs.steering_bank,
++            help="Path to an .npz of steering directions: features, vectors, probes and "
++            "thresholds. A request names one of its features.",
++        )
++        parser.add_argument(
++            "--steering-layer",
++            type=int,
++            default=ServerArgs.steering_layer,
++            help="Which decoder layer the steering hook sits after. The shift lands on the "
++            "residual stream leaving this layer.",
++        )
+         parser.add_argument(
+             "--disaggregation-enable-d2h",
+             action=argparse.BooleanOptionalAction,
+@@ -2070,6 +2094,11 @@ class ServerArgs:
+         # Check LoRA configuration
+         self.check_lora_server_args()
+ 
++        # The verify pass builds its batch without the per-token steering arrays, so a steered
++        # request would steer its prefill and none of the tokens after it.
++        if self.enable_steering and self.speculative_algorithm is not None:
++            raise ValueError("--enable-steering doesn't work with --speculative-algorithm")
++
+         # Speculative overlap uses a fused linear-chain path or DFlash's
+         # dedicated relay-backed draft/verify path.
+         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:

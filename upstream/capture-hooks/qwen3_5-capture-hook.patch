@@ -1,0 +1,110 @@
+Subject: [PATCH] feat(qwen3_5): add layers_to_capture hook to Qwen3_5MoeModel
+
+Qwen3.5 has no layers_to_capture hook, so --enable-return-hidden-states
+refuses to start on it. Adds the same hook gemma4.py, llama.py and qwen3.py
+already carry.
+
+Qwen3_5MoeModel accumulates aux_hidden_states for layers in layers_to_capture
+and returns them. Qwen3_5MoeForCausalLM passes the tuple straight through, and
+Qwen3_5MoeForConditionalGeneration gates on capture_aux_hidden_states and
+forwards them to the logits processor. Qwen3_5ForConditionalGeneration inherits
+both.
+
+Qwen3.5 nests the text backbone one level deeper than the text-only models, at
+language_model.model. A read-only `model` property on the entry class puts it
+where callers that set layers_to_capture look for it.
+
+Uses the None-residual form. Qwen3.5 carries residual separately, and it's
+None on layer 0. EAGLE3 never captures layer 0, but the hidden-states flag
+does.
+---
+ python/sgl_jax/srt/models/qwen3_5.py | 40 +++++++++++++++++++++++++++++++-----
+ 1 file changed, 35 insertions(+), 5 deletions(-)
+
+diff --git a/python/sgl_jax/srt/models/qwen3_5.py b/python/sgl_jax/srt/models/qwen3_5.py
+index 5db3871f..efc0c85d 100644
+--- a/python/sgl_jax/srt/models/qwen3_5.py
++++ b/python/sgl_jax/srt/models/qwen3_5.py
+@@ -527,6 +527,7 @@ class Qwen3_5MoeModel(nnx.Module):
+             ]
+         )
+         self.norm = GemmaRMSNorm(text_cfg.hidden_size, epsilon=text_cfg.rms_norm_eps)
++        self.layers_to_capture = []
+ 
+     def __call__(self, forward_batch: ForwardBatch, memory_pools):
+         input_embeds = (
+@@ -545,7 +546,14 @@ class Qwen3_5MoeModel(nnx.Module):
+         layers_rec_buffers = []
+         layers_conv_buffers = []
+         layers_topk_ids = []
+-        for layer in self.layers:
++        aux_hidden_states = []
++        for layer_id, layer in enumerate(self.layers):
++            if layer_id in self.layers_to_capture:
++                # residual is None on layer 0, and the hidden-states flag marks
++                # every layer, so this has to tolerate it.
++                aux_hidden_states.append(
++                    hidden_states + residual if residual is not None else hidden_states
++                )
+             hidden_states, residual, attn_state, topk_ids = layer(
+                 positions,
+                 hidden_states,
+@@ -569,6 +577,7 @@ class Qwen3_5MoeModel(nnx.Module):
+         hidden_states = self.norm(hidden_states)
+         return (
+             hidden_states,
++            aux_hidden_states,
+             layers_kv_fused,
+             (layers_rec_buffers, layers_conv_buffers),
+             layers_topk_ids,
+@@ -611,6 +620,17 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
+     def get_input_embeddings(self):
+         return self.language_model.model.embed_tokens
+ 
++    @property
++    def model(self):
++        """The text backbone, one hop down through the language model.
++
++        Callers that set layers_to_capture look for it on `.model` of the entry
++        class. Qwen3.5 nests the backbone one level deeper than the text-only
++        models do, so expose it here. Read only, so nnx.split still sees a
++        single reference to the backbone.
++        """
++        return self.language_model.model
++
+     def precompile_multimodal(self):
+         if self.visual is not None:
+             self.visual.precompile()
+@@ -659,6 +679,7 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
+             mesh=mesh,
+             enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+         )
++        self.capture_aux_hidden_states = False
+ 
+     def __call__(
+         self,
+@@ -666,11 +687,20 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
+         memory_pools: MemoryPools,
+         logits_metadata: LogitsMetadata,
+     ):
+-        hidden_states, layers_kv_fused, layers_rec_state, layers_topk_ids = self.language_model(
+-            forward_batch, memory_pools
+-        )
++        (
++            hidden_states,
++            aux_hidden_states,
++            layers_kv_fused,
++            layers_rec_state,
++            layers_topk_ids,
++        ) = self.language_model(forward_batch, memory_pools)
++        if not self.capture_aux_hidden_states:
++            aux_hidden_states = None
++
+         head = self.language_model.model.embed_tokens if self.tie_word_embeddings else self.lm_head
+-        output = self.logits_processor(hidden_states, head, logits_metadata)
++        output = self.logits_processor(
++            hidden_states, head, logits_metadata, aux_hidden_states=aux_hidden_states
++        )
+         return (
+             output,
+             {

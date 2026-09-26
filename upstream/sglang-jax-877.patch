@@ -1,0 +1,2341 @@
+From 2b96fbbb2abfd348a8e4f31fdd040f685ffab653 Mon Sep 17 00:00:00 2001
+From: zhengkezhou1 <zhengke.zhou.dev@gmail.com>
+Date: Mon, 21 Sep 2026 21:34:52 -0400
+Subject: [PATCH] feat: support per-layer hidden states extraction via Engine
+ API
+
+Rebase of #877 onto main (329 commits later), plus the changes below.
+
+Adds --enable-return-hidden-states. When set, the model runner marks every layer for capture before nnx.split() bakes layers_to_capture into model_def, and the scheduler reshapes the flat result to [seq_len, num_layers, hidden_dim] so any layer's state is addressable as hidden_states[token, layer, :].
+
+Changes from the original #877:
+
+- llama.py captured `hidden_states + residual` unconditionally. residual is None on layer 0. EAGLE3 never captures layer 0, but this flag captures every layer, so that path crashed. Now it adds residual only when there's one, the form qwen3.py already had. The original PR tested on Qwen3-8B, which is why this never showed up.
+- Host transfer used .astype(float), which is float64 in numpy and upcast bf16 4x on the prefill path. Now .astype(np.float32).
+- Dropped the unrelated device-mesh logger.info in scheduler.py and the pr-test.yml change, which main has since superseded.
+- The prefill slice read len(req.origin_input_ids) rows, and only in the pass where a request's prefill finished. A prompt split across passes lost its earlier chunks and took the next request's rows in their place, and every later request in the pass read from the wrong offset. The row count still matched, so nothing raised. Now every request advances the offset by its own extend length in every pass, a chunked prompt appends one chunk per pass, and scheduler.py collects extend_input_len_per_req for hidden states as well as logprobs.
+- With data parallelism each rank's rows sit in their own padded block, and the prefill and decode paths read the hidden states as one packed run, so a request on rank 1 or later would get other requests' rows. Until those offsets follow the ranks, check_server_args refuses --enable-return-hidden-states with --dp-size above 1, and the scheduler aborts a request that sets return_hidden_states when dp_size is above 1.
+- A request for hidden states could match a cached radix prefix. Its prefill rows then covered only the uncached tail, while prompt_tokens counted the whole prompt. adjust_max_prefix_ids now caps its prefix match at 0, the way return_logprob caps it at logprob_start_len.
+- On a model without the layers_to_capture hook, LogitsProcessor stored the final normed hidden state, and the scheduler cut it into per-layer slices that weren't layers, or killed the server when the layer count didn't divide hidden_size. _setup_hidden_states_capture now refuses to start.
+- The scheduler put entries in output_hidden_states only for requests that asked, and tokenizer_manager reads the list by position in rids. One request got another's rows, and the next index killed the server. Both hidden-state lists now hold one entry per rid, and tokenizer_manager sets meta_info["hidden_states"] only for a request that asked.
+- A request for hidden states in an extend batch turned off the padded input logprob path, and the fallback raises on jax 0.11.1, so a logprob request in the same batch stopped the scheduler. Extend batches now always take the padded path. With return_logprob on, the sampler also rebuilt the logits output without hidden_states, and capture dropped those rows with no error. tp_worker now carries them across.
+- A retracted request kept its rows, and its second prefill appended them again. Under the overlap scheduler, the in-flight prefill of a retracted request appended too. The scheduler now records where each request's rows start, and the output processor keeps only the positions a request doesn't hold yet, so a retraction leaves one row per position. The start comes from prefix_lens, the positions the forward pass runs at. With --enable-mixed-chunk under the overlap scheduler, a running request's decode step rides in another request's prefill chunk before its input token reaches output_ids, so a start read from fill_ids is one short. A pass that covers a position the request holds, outside a retraction, logs a warning.
+- check_server_args refuses the flag with --speculative-algorithm, because capture overwrites the layers EAGLE3 and DFLASH capture for their draft, and with --pd-disaggregation, whose prefill path asserts on a request for hidden states. It refuses --disaggregation-mode prefill and decode too. There the decode server takes the prompt's KV from the prefill server and runs only the last prompt position, so its reply held one prompt row while prompt_tokens counted every one. The scheduler aborts such a request under either PD mode, the way it does above --dp-size 1.
+- filter_batch now derives return_hidden_states again from the requests it keeps, as it does return_logprob. The running batch used to stay in capture mode after the last request that asked left, so every later decode step concatenated every layer and copied it to the host though no request read it. test_capture_mode_propagation.py checks that filter_batch derives every flag merge_batch ORs in.
+- A request that doesn't stream gets its rows once, in the output that finishes it. The scheduler forces an output every 50 tokens, and each one sent the whole list again through the detokenizer, only for the tokenizer manager to drop it. A streamed chunk still carries every row so far, the form upstream sglang streams.
+- tokenizer_manager refuses return_hidden_states on a server started without the flag, so the caller gets the error and the scheduler never sees it.
+- The non-stream /generate branch returned numpy arrays through FastAPI's default encoder, which answered every request for hidden states with a 500. It now returns ORJSONResponse, the stream branch's encoder.
+- The negative control in test_capture_mode_propagation.py popped a key and checked that it was gone, so it couldn't fail. It now mutates the parsed source and runs the same judgment on the result.
+- test_pd_prefill_overlap.py drives run_batch with a stub batch that sets the fields run_batch reads, and run_batch reads return_hidden_states now. The stub sets it beside return_logprob.
+- test_hidden_states_alignment.py and _tp.py share one base class in test_utils.py, and the three TPU tests take their Engine settings from one helper there. The base class reads every prefill chunk rather than the first, and the tokenizers nothing read are gone.
+- --return-hidden-states-layers names the capture slots to return, as separate integers the way --precompile-token-paddings takes its list: --return-hidden-states-layers 15 20. Each reply is then [seq_len, len(slots), hidden_dim], and the device concatenates and copies those slots alone. Capture used to move every layer to the host whatever the caller kept, 36 slots on Qwen3-8B for an SAE that trains on one. Unset, the flag returns every slot as before, and slot k still holds the residual stream entering layer k. The hook appends in layer order, so check_server_args refuses a list out of ascending order, which would put a slot where the caller doesn't look for it. It also refuses an empty list, a slot listed twice, a negative slot, and the flag without --enable-return-hidden-states. The model runner refuses a slot at or past the model's layer count.
+
+Only gemma4, llama and qwen3 carry the layers_to_capture hook today, and qwen3_vl reaches it through its QWen3Model backbone. The flag refuses to start on any other model. Adding the hook is three lines per model.
+
+Tests: test_return_hidden_states.py checks shape and non-zero content; test_hidden_states_alignment.py and _tp.py compare every layer against a HuggingFace CPU float32 reference at tp=1 and tp=4. test_return_hidden_states_cpu.py runs the real Engine on CPU with a tiny random Qwen3: a cached prefix, a mixed batch, logprobs beside hidden states, HTTP /generate, what each output of a streamed and an unstreamed request carries, both retraction routes, decode steps inside another request's prefill chunks under the overlap scheduler, a request to a server without the flag, a model without the hook, the settings that refuse to start, and the layer filter: the reply shape, the order of slots, each refusal, and a kept slot's rows against the same slot from a server that returns every slot.
+
+Co-authored-by: Willis Zhang <34315237+WandLZhang@users.noreply.github.com>
+---
+ python/sgl_jax/srt/entrypoints/engine.py      |   4 +
+ python/sgl_jax/srt/entrypoints/http_server.py |   4 +-
+ python/sgl_jax/srt/managers/io_struct.py      |   3 +
+ python/sgl_jax/srt/managers/schedule_batch.py |  25 +-
+ python/sgl_jax/srt/managers/scheduler.py      |  42 +-
+ .../scheduler_output_processor_mixin.py       | 144 ++-
+ .../sgl_jax/srt/managers/tokenizer_manager.py |  14 +-
+ python/sgl_jax/srt/managers/tp_worker.py      |   3 +
+ .../srt/model_executor/model_runner.py        |  46 +
+ python/sgl_jax/srt/models/llama.py            |   7 +-
+ python/sgl_jax/srt/server_args.py             |  75 ++
+ python/sgl_jax/test/test_utils.py             | 163 +++
+ .../disaggregation/test_pd_prefill_overlap.py |   1 +
+ test/srt/run_suite.py                         |   9 +
+ test/srt/test_capture_mode_propagation.py     | 225 +++++
+ test/srt/test_hidden_states_alignment.py      |  32 +
+ test/srt/test_hidden_states_alignment_tp.py   |  42 +
+ test/srt/test_return_hidden_states.py         | 113 +++
+ test/srt/test_return_hidden_states_cpu.py     | 932 ++++++++++++++++++
+ 19 files changed, 1859 insertions(+), 25 deletions(-)
+ create mode 100644 test/srt/test_capture_mode_propagation.py
+ create mode 100644 test/srt/test_hidden_states_alignment.py
+ create mode 100644 test/srt/test_hidden_states_alignment_tp.py
+ create mode 100644 test/srt/test_return_hidden_states.py
+ create mode 100644 test/srt/test_return_hidden_states_cpu.py
+
+diff --git a/python/sgl_jax/srt/entrypoints/engine.py b/python/sgl_jax/srt/entrypoints/engine.py
+index c8fca74d..3b62dc2f 100644
+--- a/python/sgl_jax/srt/entrypoints/engine.py
++++ b/python/sgl_jax/srt/entrypoints/engine.py
+@@ -167,6 +167,7 @@ class Engine(EngineBase):
+         *,
+         image_data: MultimodalDataInputFormat | None = None,
+         video_data: MultimodalDataInputFormat | None = None,
++        return_hidden_states: bool | None = False,
+     ) -> dict | Iterator[dict]:
+         """
+         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
+@@ -189,6 +190,7 @@ class Engine(EngineBase):
+             return_routed_experts=return_routed_experts,
+             image_data=image_data,
+             video_data=video_data,
++            return_hidden_states=return_hidden_states,
+         )
+         generator = self.tokenizer_manager.generate_request(obj, None)
+ 
+@@ -223,6 +225,7 @@ class Engine(EngineBase):
+         *,
+         image_data: MultimodalDataInputFormat | None = None,
+         video_data: MultimodalDataInputFormat | None = None,
++        return_hidden_states: bool | None = False,
+     ) -> dict | AsyncIterator[dict]:
+         """
+         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
+@@ -245,6 +248,7 @@ class Engine(EngineBase):
+             return_routed_experts=return_routed_experts,
+             image_data=image_data,
+             video_data=video_data,
++            return_hidden_states=return_hidden_states,
+         )
+         generator = self.tokenizer_manager.generate_request(obj, None)
+ 
+diff --git a/python/sgl_jax/srt/entrypoints/http_server.py b/python/sgl_jax/srt/entrypoints/http_server.py
+index 9ac2f59a..90145ab3 100644
+--- a/python/sgl_jax/srt/entrypoints/http_server.py
++++ b/python/sgl_jax/srt/entrypoints/http_server.py
+@@ -312,7 +312,9 @@ async def generate_request(obj: GenerateReqInput, request: Request):
+     else:
+         try:
+             ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
+-            return ret
++            # The same encoder as the stream branch. meta_info carries numpy arrays, hidden
++            # states among them, which FastAPI's default encoder refuses with a 500.
++            return ORJSONResponse(ret)
+         except ValueError as e:
+             logger.error("[http_server] Error: %s", e)
+             return _create_error_response(e)
+diff --git a/python/sgl_jax/srt/managers/io_struct.py b/python/sgl_jax/srt/managers/io_struct.py
+index 8e904e48..e685644d 100644
+--- a/python/sgl_jax/srt/managers/io_struct.py
++++ b/python/sgl_jax/srt/managers/io_struct.py
+@@ -350,6 +350,8 @@ class GenerateReqInput:
+     bootstrap_room: list[int] | int | None = None
+     disagg_prefill_dp_rank: list[int] | int | None = None
+     disagg_transfer_id: list[str] | str | None = None
++    # Whether to return hidden states
++    return_hidden_states: bool | None = None
+ 
+     def contains_mm_input(self) -> bool:
+         return (
+@@ -624,6 +626,7 @@ class GenerateReqInput:
+                 if isinstance(self.disagg_transfer_id, list)
+                 else self.disagg_transfer_id
+             ),
++            return_hidden_states=self.return_hidden_states,
+         )
+ 
+ 
+diff --git a/python/sgl_jax/srt/managers/schedule_batch.py b/python/sgl_jax/srt/managers/schedule_batch.py
+index 16a5fe5c..ae0481e8 100644
+--- a/python/sgl_jax/srt/managers/schedule_batch.py
++++ b/python/sgl_jax/srt/managers/schedule_batch.py
+@@ -378,6 +378,12 @@ class Req:
+                 self.output_token_ids_logprobs_idx
+             ) = None
+         self.hidden_states: list[list[float]] = []
++        # How many positions hidden_states covers, from position 0. A retracted request keeps
++        # both, so its second prefill appends only the positions past this one.
++        self.hidden_state_rows = 0
++        # True from a retraction until the prefill that replays it finishes. Only that prefill
++        # covers positions the request holds already.
++        self.hidden_state_replay = False
+ 
+         # The number of cached tokens that were already cached in the KV cache
+         self.cached_tokens = 0
+@@ -530,6 +536,11 @@ class Req:
+         if self.return_logprob:
+             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+ 
++        if self.return_hidden_states:
++            # A cached prefix skips its forward pass, so its rows never reach the capture, and
++            # the reply would cover the uncached tail while prompt_tokens counts the whole prompt.
++            max_prefix_len = 0
++
+         max_prefix_len = max(max_prefix_len, 0)
+         return self.fill_ids[:max_prefix_len]
+ 
+@@ -673,6 +684,8 @@ class Req:
+         self.cache_lock_params = None
+         self.extend_input_len = 0
+         self.is_retracted = True
++        # hidden_states stays. The next prefill starts at position 0 and covers rows it holds.
++        self.hidden_state_replay = True
+         self.input_token_logprobs = None
+         self.temp_input_top_logprobs_val = None
+         self.temp_input_top_logprobs_idx = None
+@@ -986,6 +999,7 @@ class ScheduleBatch:
+             spec_algorithm=spec_algorithm,
+             is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in all_reqs),
+             return_routed_experts=any(req.return_routed_experts for req in all_reqs),
++            return_hidden_states=any(req.return_hidden_states for req in all_reqs),
+             dp_size=dp_size,
+         )
+ 
+@@ -1946,11 +1960,15 @@ class ScheduleBatch:
+             )
+             self.has_stream = any(req.stream for req in all_reqs)
+             self.has_grammar = any(req.grammar for req in all_reqs)
++            # Capture mode concatenates every layer and copies it to the host each step, so it
++            # ends when the last request that asked leaves the batch.
++            self.return_hidden_states = any(req.return_hidden_states for req in all_reqs)
+         else:
+             self.return_logprob = False
+             self.return_output_logprob_only = False
+             self.has_stream = False
+             self.has_grammar = False
++            self.return_hidden_states = False
+ 
+     def merge_batch(self, other: ScheduleBatch):
+         """Merge another batch into this batch (unified for all dp_size >= 1).
+@@ -3244,8 +3262,11 @@ class ScheduleBatch:
+         # extend+logprob always uses the padded path: the legacy fallback slices
+         # hidden_states per req under P("data","tensor") and crashes when the row
+         # count isn't divisible by dp (dp>1). The padded path supports top_logprobs /
+-        # token_ids / overlap at any dp. return_hidden_states still falls back.
+-        use_padded_input_logprob = self.forward_mode.is_extend() and not self.return_hidden_states
++        # token_ids / overlap at any dp. return_hidden_states takes it too: the capture
++        # stores every row on either path, and the fallback raises on jax 0.11.1 at
++        # every dp, which stopped the scheduler for a logprob request batched beside a
++        # request for hidden states.
++        use_padded_input_logprob = self.forward_mode.is_extend()
+         input_logprob_indices = None
+         merged_extend_input_logprob_token_ids = None
+         if self.return_logprob:
+diff --git a/python/sgl_jax/srt/managers/scheduler.py b/python/sgl_jax/srt/managers/scheduler.py
+index cc9a5fbb..eca5806c 100644
+--- a/python/sgl_jax/srt/managers/scheduler.py
++++ b/python/sgl_jax/srt/managers/scheduler.py
+@@ -169,6 +169,8 @@ class GenerationBatchResult:
+ 
+     num_accepted_tokens: int | None = None
+     accept_lens: np.ndarray | None = None
++    # The position each request's first row sits at, for requests that return hidden states.
++    extend_prefix_len_per_req: list[int] | None = None
+ 
+ 
+ def validate_dflash_request(req) -> str | None:
+@@ -1250,6 +1252,27 @@ class Scheduler(
+             self._add_request_to_queue(req)
+             return
+ 
++        # Hidden-state rows for DP rank 1 and later sit in their own padded blocks, which the
++        # output processor doesn't walk, so a request there would get other requests' rows.
++        if req.return_hidden_states and self.server_args.dp_size > 1:
++            req.set_finish_with_abort("return_hidden_states needs --dp-size 1")
++            self._add_request_to_queue(req)
++            return
++        # The Pathways prefill path asserts on such a request, which stops the server.
++        if req.return_hidden_states and self.server_args.pd_disaggregation:
++            req.set_finish_with_abort("return_hidden_states doesn't work with --pd-disaggregation")
++            self._add_request_to_queue(req)
++            return
++        # A multi-process PD decode server runs only the last prompt position, so its reply
++        # would hold one prompt row while prompt_tokens counts every one.
++        if req.return_hidden_states and self.server_args.disaggregation_mode != "null":
++            req.set_finish_with_abort(
++                "return_hidden_states doesn't work with --disaggregation-mode "
++                f"{self.server_args.disaggregation_mode}"
++            )
++            self._add_request_to_queue(req)
++            return
++
+         if self.spec_algorithm is not None and self.spec_algorithm.is_dflash_family():
+             dflash_err = validate_dflash_request(req)
+             if dflash_err is not None:
+@@ -2519,8 +2542,9 @@ class Scheduler(
+         # These 2 values are needed for processing the output, but the values can be
+         # modified by overlap schedule. So we have to copy them here so that
+         # we can use the correct values in output processing.
+-        if batch.return_logprob:
+-            # Collect extend_input_len from all DP ranks
++        if batch.return_logprob or batch.return_hidden_states:
++            # Collect extend_input_len from all DP ranks. Hidden states need it too: by the time
++            # the result arrives, req.extend_input_len may already hold the next pass's value.
+             extend_input_len_per_req = []
+             for info in batch.reqs_info:
+                 if info.reqs:
+@@ -2537,6 +2561,19 @@ class Scheduler(
+                     )
+         else:
+             extend_logprob_start_len_per_req = None
++        if batch.return_hidden_states and batch.forward_mode.is_extend():
++            # The position each request's rows start at. A retracted request prefills from
++            # position 0 again, and this is how the output processor tells the rows it already
++            # holds from the ones it lacks. Read it from prefix_lens, where prepare_for_extend
++            # and mix_with_running put the positions the forward pass runs at. fill_ids is one
++            # short for a running request that mix_with_running adds under the overlap
++            # scheduler, because its input token isn't in output_ids yet.
++            extend_prefix_len_per_req = []
++            for info in batch.reqs_info:
++                if info.reqs:
++                    extend_prefix_len_per_req.extend(int(p) for p in info.prefix_lens)
++        else:
++            extend_prefix_len_per_req = None
+         spec_relay_buffers = None
+         prefill_relay_future_indices = None
+         if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+@@ -2563,6 +2600,7 @@ class Scheduler(
+             cache_miss_count=cache_miss_count,
+             spec_relay_buffers=spec_relay_buffers,
+             prefill_relay_future_indices=prefill_relay_future_indices,
++            extend_prefix_len_per_req=extend_prefix_len_per_req,
+         )
+         if (
+             self.spec_algorithm is not None
+diff --git a/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py b/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
+index e1574d67..69a193ca 100644
+--- a/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
+@@ -58,6 +58,41 @@ def _num_input_logprobs(
+     return extend_input_len_per_req[req_idx] - extend_logprob_start_len_per_req[req_idx]
+ 
+ 
++def _captured_slots(server_args, model_config) -> int | None:
++    """How many slots each row splits into, or None on a server without the flag.
++
++    The model runner captures the slots --return-hidden-states-layers names, or every slot when
++    it's unset, and the logits processor joins them along the last axis.
++    """
++    if not server_args.enable_return_hidden_states:
++        return None
++    layers = server_args.return_hidden_states_layers
++    return model_config.num_hidden_layers if layers is None else len(layers)
++
++
++def _keep_hidden_state_rows(req: Req, hs: np.ndarray, first: int, num_layers: int | None) -> None:
++    """Append the rows for positions first, first + 1, ... to req.hidden_states.
++
++    Prompt positions go in as one chunk. Each position past the prompt goes in as a chunk of its
++    own, the shape a decode step appends. A retracted request prefills its output again, so this
++    is what gives it the chunk list it would have had without the retraction.
++    """
++    if first > req.hidden_state_rows:
++        logger.warning(
++            "hidden states for request %s skip positions %d to %d",
++            req.rid,
++            req.hidden_state_rows,
++            first - 1,
++        )
++    if num_layers is not None:
++        hs = hs.reshape(hs.shape[0], num_layers, -1)
++    prompt = min(max(len(req.origin_input_ids) - first, 0), hs.shape[0])
++    if prompt:
++        req.hidden_states.append(hs[:prompt])
++    req.hidden_states.extend(hs[prompt:])
++    req.hidden_state_rows = first + hs.shape[0]
++
++
+ def _input_logprob_lens_per_dp(batch: ScheduleBatch) -> list[int] | None:
+     if not batch.forward_mode.is_extend():
+         return None
+@@ -193,6 +228,57 @@ class SchedulerOutputProcessorMixin:
+             )
+         hidden_state_offset = 0
+         per_dp_bs_size = batch.per_dp_bs_size
++        extend_prefix_len_per_req = getattr(result, "extend_prefix_len_per_req", None)
++
++        # Capture runs at dp_size 1: check_server_args refuses the flag above it, and
++        # handle_generate_request aborts a request for hidden states. There every request
++        # in the pass owns extend_input_len_per_req[req_idx] consecutive rows of
++        # logits_output.hidden_states, in visiting order, whether its prefill finishes in this
++        # pass, continues in the next one, or gets skipped. A running request that a mixed
++        # batch carries owns one row. Advance past each request's rows every time, and keep the
++        # positions a request asked for and doesn't hold yet. A chunked prompt then appends one
++        # chunk per pass, and every request after it still reads its own rows.
++        def take_hidden_states(req, req_idx, keep=True):
++            nonlocal hidden_state_offset
++            if logits_output.hidden_states is None or extend_input_len_per_req is None:
++                return
++            rows = extend_input_len_per_req[req_idx]
++            if keep and req.return_hidden_states:
++                first = (
++                    extend_prefix_len_per_req[req_idx]
++                    if extend_prefix_len_per_req is not None
++                    else req.hidden_state_rows
++                )
++                # A retracted request prefills its prompt and its output again, from position 0,
++                # and so does one retracted while this pass ran. Skipping the positions it holds
++                # keeps one row per position. Nothing else covers a position twice.
++                skip = min(max(req.hidden_state_rows - first, 0), rows)
++                logger.debug(
++                    "hidden states for request %s: an extend pass over positions %d to %d, "
++                    "%d held already",
++                    req.rid,
++                    first,
++                    first + rows - 1,
++                    skip,
++                )
++                if skip and not req.hidden_state_replay:
++                    logger.warning(
++                        "hidden states for request %s repeat positions %d to %d",
++                        req.rid,
++                        first,
++                        first + skip - 1,
++                    )
++                if skip < rows:
++                    hs = jax.device_get(
++                        logits_output.hidden_states[
++                            hidden_state_offset + skip : hidden_state_offset + rows
++                        ]
++                    ).astype(np.float32)
++                    # A server with the flag returns [rows, slots, hidden]. The multimodal
++                    # stage asks for the flat rows on a server without it.
++                    num_layers = _captured_slots(self.server_args, self.model_config)
++                    _keep_hidden_state_rows(req, hs, first + skip, num_layers)
++            hidden_state_offset += rows
+ 
+         logprob_pt = 0
+         # Flat index across all DP ranks. logprob arrays in `logits_output`
+@@ -219,6 +305,10 @@ class SchedulerOutputProcessorMixin:
+             for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
+                 if req.finished() or req.is_retracted:
+                     # release_kv_cache owns over-allocated KV; freeing here would double-free.
++                    # A retracted request keeps the rows it had in flight. A finished one sent
++                    # its last reply already. Under the overlap scheduler its row here is its
++                    # last token's, which no reply carries.
++                    take_hidden_states(req, req_idx, keep=not req.finished())
+                     req_idx += 1
+                     continue
+ 
+@@ -265,17 +355,9 @@ class SchedulerOutputProcessorMixin:
+                         )
+                         logprob_pt += num_input_logprobs
+ 
+-                    if req.return_hidden_states and logits_output.hidden_states is not None:
+-                        req.hidden_states.append(
+-                            jax.device_get(
+-                                logits_output.hidden_states[
+-                                    hidden_state_offset : (
+-                                        hidden_state_offset := hidden_state_offset
+-                                        + len(req.origin_input_ids)
+-                                    )
+-                                ]
+-                            ).astype(float)
+-                        )
++                    take_hidden_states(req, req_idx)
++                    # A replay after a retraction ends with the prefill that finishes here.
++                    req.hidden_state_replay = False
+ 
+                     # Update grammar state after token sampling
+                     if req.grammar is not None:
+@@ -295,6 +377,7 @@ class SchedulerOutputProcessorMixin:
+                         req.grammar.finished = req.finished()
+                 else:
+                     # being chunked reqs' prefill is not finished
++                    take_hidden_states(req, req_idx)
+                     req.is_chunked -= 1
+                     if self._pending_chunked_abort_reqs[dp_rank] is req:
+                         assert req.to_finish is not None
+@@ -575,9 +658,15 @@ class SchedulerOutputProcessorMixin:
+                 if req.return_hidden_states and logits_output.hidden_states is not None:
+                     # NOTE: hidden_states is not yet reordered through
+                     # logits_indices_selector. Decode-mode hidden_states is
+-                    # DP-interleaved like the raw next_token_logprobs were.
+-                    # Tracking as a follow-up; not in scope for this fix.
+-                    req.hidden_states.append(logits_output.hidden_states[i])
++                    # DP-interleaved like the raw next_token_logprobs were, so
++                    # row i is request i only at dp_size 1. check_server_args
++                    # and handle_generate_request hold hidden states there.
++                    hs = jax.device_get(logits_output.hidden_states[i]).astype(np.float32)
++                    num_layers = _captured_slots(self.server_args, self.model_config)
++                    if num_layers is not None:
++                        hs = hs.reshape(num_layers, -1)
++                    req.hidden_states.append(hs)
++                    req.hidden_state_rows += 1
+                 req_idx += 1
+ 
+         # Collect all requests from all DP ranks for stream output
+@@ -816,6 +905,7 @@ class SchedulerOutputProcessorMixin:
+         spec_accepted_tokens = []
+         output_hidden_states = None
+         output_routed_experts = None
++        hidden_states_per_rid = []
+ 
+         output_hidden_states_for_mm = None
+         if return_logprob:
+@@ -972,15 +1062,33 @@ class SchedulerOutputProcessorMixin:
+                         )
+                     if req.return_output_logprob_only:
+                         req.send_output_token_logprobs_offset = len(req.output_token_logprobs_val)
+-                if req.return_hidden_states:
+-                    if output_hidden_states_for_mm is None:
+-                        output_hidden_states_for_mm = []
+-                    output_hidden_states_for_mm.append(req.hidden_states)
++                # A streamed chunk carries every row the request holds so far, the form upstream
++                # sglang streams. A request that doesn't stream keeps only the output that
++                # finishes it, so the outputs forced before that send no rows. They used to send
++                # the whole list each time, and the tokenizer manager dropped it.
++                sends_rows = req.return_hidden_states and (req.stream or req.finished())
++                hidden_states_per_rid.append(req.hidden_states if sends_rows else None)
++                if sends_rows:
++                    logger.debug(
++                        "hidden states for request %s: this output sends %d position(s) in %d "
++                        "chunk(s)",
++                        req.rid,
++                        req.hidden_state_rows,
++                        len(req.hidden_states),
++                    )
+ 
+                 # if req.return_routed_experts:
+                 if output_routed_experts is None:
+                     output_routed_experts = []
+                 output_routed_experts.append(req.routed_experts)
++        # The tokenizer manager and the multimodal stage read both lists by position in rids,
++        # so each holds one entry per request sent, [] for a request that didn't ask. A list
++        # of the askers alone hands one request another's rows, then runs off the end.
++        if any(entry is not None for entry in hidden_states_per_rid):
++            output_hidden_states = [
++                entry if entry is not None else [] for entry in hidden_states_per_rid
++            ]
++            output_hidden_states_for_mm = output_hidden_states
+         # Send to detokenizer
+         if rids:
+             out = BatchTokenIDOut(
+diff --git a/python/sgl_jax/srt/managers/tokenizer_manager.py b/python/sgl_jax/srt/managers/tokenizer_manager.py
+index a748f8cc..a6d22f49 100644
+--- a/python/sgl_jax/srt/managers/tokenizer_manager.py
++++ b/python/sgl_jax/srt/managers/tokenizer_manager.py
+@@ -317,6 +317,15 @@ class TokenizerManager:
+         self.auto_create_handle_loop()
+         obj.normalize_batch_and_arguments()
+ 
++        # Refuse here, where the caller gets the error. Past this point the request reaches
++        # the scheduler, and a failure there stops the server for every caller.
++        if getattr(obj, "return_hidden_states", False) and not getattr(
++            self.server_args, "enable_return_hidden_states", False
++        ):
++            raise ValueError(
++                "return_hidden_states needs a server started with --enable-return-hidden-states"
++            )
++
+         # Acquire LoRA ID if lora_path is provided
+         if isinstance(obj, GenerateReqInput) and self.server_args.enable_lora and obj.lora_path:
+             obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
+@@ -460,6 +469,7 @@ class TokenizerManager:
+             extra_key=obj.extra_key,
+             return_routed_experts=obj.return_routed_experts,
+             mm_inputs=mm_inputs,
++            return_hidden_states=obj.return_hidden_states,
+         )
+ 
+         disagg_mode = getattr(self.server_args, "disaggregation_mode", "null")
+@@ -1180,7 +1190,9 @@ class TokenizerManager:
+                     }
+                 )
+ 
+-            if getattr(recv_obj, "output_hidden_states", None):
++            if getattr(recv_obj, "output_hidden_states", None) and getattr(
++                state.obj, "return_hidden_states", False
++            ):
+                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+ 
+             if getattr(recv_obj, "output_routed_experts", None):
+diff --git a/python/sgl_jax/srt/managers/tp_worker.py b/python/sgl_jax/srt/managers/tp_worker.py
+index 3ec0c5fb..ca540943 100644
+--- a/python/sgl_jax/srt/managers/tp_worker.py
++++ b/python/sgl_jax/srt/managers/tp_worker.py
+@@ -581,6 +581,9 @@ class ModelWorker:
+                 logprobs = self.model_runner.compute_logprobs(token_logprobs, next_token_ids_device)
+                 logits_output.next_token_logprobs = jax.device_get(logprobs)[selector]
+         if new_logits_output is not None:
++            # The sampler builds its output from the logprob fields alone. Carry the captured
++            # hidden states across, or a batch with a logprob request drops them silently.
++            new_logits_output.hidden_states = logits_output.hidden_states
+             logits_output = new_logits_output
+             self._materialize_logprobs_to_host(logits_output, model_worker_batch, selector)
+ 
+diff --git a/python/sgl_jax/srt/model_executor/model_runner.py b/python/sgl_jax/srt/model_executor/model_runner.py
+index 988c24d9..68512bd2 100644
+--- a/python/sgl_jax/srt/model_executor/model_runner.py
++++ b/python/sgl_jax/srt/model_executor/model_runner.py
+@@ -181,6 +181,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
+         self.init_attention_backend()
+         self.load_model()
+ 
++        # Enable per-layer hidden states capture if requested.
++        # Must be set before initialize_jit() since layers_to_capture
++        # is baked into model_def during nnx.split().
++        if server_args.enable_return_hidden_states:
++            self._setup_hidden_states_capture()
++
+         # Check if the model is using hybrid SWA
+         if (
+             not self.server_args.disable_hybrid_swa_memory
+@@ -263,6 +269,46 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
+             )
+         )
+ 
++    def _setup_hidden_states_capture(self):
++        """Configure the model to capture the slots --return-hidden-states-layers names.
++
++        Unset, that's every slot. Slot k is the residual stream entering layer k.
++
++        Must be called after load_model() and before initialize_jit(),
++        because layers_to_capture is baked into model_def during nnx.split().
++
++        A model without the hook refuses to start. Its LogitsProcessor would store the final
++        normed hidden state, and the scheduler would cut that into per-layer slices that aren't
++        layers, or stop the server when the layer count doesn't divide the hidden size.
++        """
++        num_layers = self.model_config.num_hidden_layers
++        # Set layers_to_capture on the inner model (e.g., QWen3Model)
++        inner_model = getattr(self.model, "model", None)
++        if inner_model is None or not hasattr(inner_model, "layers_to_capture"):
++            raise ValueError(
++                f"{type(self.model).__name__} has no layers_to_capture hook, so "
++                "--enable-return-hidden-states can't return per-layer hidden states"
++            )
++        layers = self.server_args.return_hidden_states_layers
++        if layers is None:
++            layers = list(range(num_layers))
++        # check_server_args holds the list ascending, so its last slot is its largest.
++        elif layers[-1] >= num_layers:
++            raise ValueError(
++                f"--return-hidden-states-layers asks for slot {layers[-1]}, and "
++                f"{type(self.model).__name__} has {num_layers} slots, 0 to {num_layers - 1}"
++            )
++        inner_model.layers_to_capture = [int(slot) for slot in layers]
++        logger.info(
++            "Hidden states capture enabled for %d of %d slots: %s",
++            len(layers),
++            num_layers,
++            inner_model.layers_to_capture,
++        )
++        # Some models gate aux_hidden_states behind this flag (e.g., Llama)
++        if hasattr(self.model, "capture_aux_hidden_states"):
++            self.model.capture_aux_hidden_states = True
++
+     def initialize_jit(self):
+         model_def, model_state = nnx.split(self.model)
+         # note export for external modification
+diff --git a/python/sgl_jax/srt/models/llama.py b/python/sgl_jax/srt/models/llama.py
+index 138aa9c9..0dc6fc5b 100644
+--- a/python/sgl_jax/srt/models/llama.py
++++ b/python/sgl_jax/srt/models/llama.py
+@@ -366,7 +366,12 @@ class LlamaModel(nnx.Module):
+         aux_hidden_states = []
+         for layer_id, layer in enumerate(self.layers):
+             if layer_id in self.layers_to_capture:
+-                aux_hidden_states.append(hidden_states + residual)
++                # residual is None on layer 0. EAGLE3 never captures layer 0, but
++                # --enable-return-hidden-states captures every layer, so this has
++                # to tolerate it. Matches the form already used in qwen3.py.
++                aux_hidden_states.append(
++                    hidden_states + residual if residual is not None else hidden_states
++                )
+             hidden_states, residual, kv_fused, callback_flag = layer(
+                 forward_batch.positions,
+                 hidden_states,
+diff --git a/python/sgl_jax/srt/server_args.py b/python/sgl_jax/srt/server_args.py
+index 174a1cd3..ee3660b1 100644
+--- a/python/sgl_jax/srt/server_args.py
++++ b/python/sgl_jax/srt/server_args.py
+@@ -264,6 +264,9 @@ class ServerArgs:
+     mm_processor_worker_num: int = 0
+ 
+     enable_return_routed_experts: bool = False
++    enable_return_hidden_states: bool = False
++    # The capture slots --enable-return-hidden-states returns, ascending. None returns every slot.
++    return_hidden_states_layers: list[int] | None = None
+     enable_expert_balance_debug: bool = False
+     expert_balance_segment_counter: int = 100
+     expert_balance_output_file: str | None = None
+@@ -1951,6 +1954,21 @@ class ServerArgs:
+             default=ServerArgs.disaggregation_channel_number,
+             help="Parallel transfer channels per (P, D) pair.",
+         )
++        parser.add_argument(
++            "--enable-return-hidden-states",
++            action="store_true",
++            help="Enable returning per-layer hidden states with responses.",
++        )
++        parser.add_argument(
++            "--return-hidden-states-layers",
++            type=int,
++            nargs="+",
++            default=ServerArgs.return_hidden_states_layers,
++            help="The capture slots --enable-return-hidden-states returns, ascending, for "
++            "example 15 20. Slot k is the residual stream entering layer k, so slot 0 is the "
++            "embedding output. Each reply is then [tokens, len(slots), hidden]. Unset returns "
++            "every slot.",
++        )
+ 
+     @classmethod
+     def from_cli_args(cls, args: argparse.Namespace):
+@@ -2004,9 +2022,66 @@ class ServerArgs:
+         )
+         return hf_config
+ 
++    def _check_return_hidden_states_layers(self, layers):
++        """Refuse a --return-hidden-states-layers list the capture can't return as written.
++
++        The hook appends in layer order, so the reply's layer axis runs in ascending slot order.
++        A list in another order, or one that names a slot twice, would put a slot where the
++        caller doesn't look for it. The model runner refuses a slot at or past the layer count,
++        because that count comes from the checkpoint.
++        """
++        flag = "--return-hidden-states-layers"
++        if not self.enable_return_hidden_states:
++            raise ValueError(f"{flag} needs --enable-return-hidden-states")
++        if len(layers) == 0:
++            raise ValueError(f"{flag} needs at least one slot")
++        for slot in layers:
++            if isinstance(slot, bool) or not hasattr(slot, "__index__"):
++                raise ValueError(f"{flag} takes integer slots, got {slot!r}")
++            if slot < 0:
++                raise ValueError(f"{flag} got slot {slot}, and slots start at 0")
++        repeated = sorted({int(slot) for slot in layers if list(layers).count(slot) > 1})
++        if repeated:
++            raise ValueError(f"{flag} lists slot {repeated[0]} twice")
++        for before, after in zip(layers, layers[1:]):
++            if after < before:
++                raise ValueError(
++                    f"{flag} lists slot {after} after slot {before}. List the slots in "
++                    "ascending order, the order the reply returns them in"
++                )
++
+     def check_server_args(self):
+         assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+ 
++        if self.enable_return_hidden_states:
++            # Each DP rank's rows sit in their own padded block, and the output processor reads
++            # the hidden states as one packed run, so a request on rank 1 or later would get
++            # rows that belong to other requests.
++            if self.dp_size > 1:
++                raise ValueError("--enable-return-hidden-states needs --dp-size 1")
++            # EAGLE3 and DFLASH set layers_to_capture to the layers their draft reads. Capture
++            # sets its own list instead, and the draft then gets a width it wasn't built for.
++            if self.speculative_algorithm is not None:
++                raise ValueError(
++                    "--enable-return-hidden-states doesn't work with --speculative-algorithm"
++                )
++            # The Pathways prefill path asserts that no request asks for hidden states.
++            if self.pd_disaggregation:
++                raise ValueError(
++                    "--enable-return-hidden-states doesn't work with --pd-disaggregation"
++                )
++            # Under multi-process PD the decode server takes the prompt's KV from the prefill
++            # server and runs only the last prompt position, so its reply would hold one prompt
++            # row while prompt_tokens counts every one.
++            if self.disaggregation_mode != "null":
++                raise ValueError(
++                    "--enable-return-hidden-states doesn't work with --disaggregation-mode "
++                    f"{self.disaggregation_mode}"
++                )
++
++        if self.return_hidden_states_layers is not None:
++            self._check_return_hidden_states_layers(self.return_hidden_states_layers)
++
+         if self.moe_dp_size < 1:
+             raise ValueError("--moe-dp-size must be at least 1")
+ 
+diff --git a/python/sgl_jax/test/test_utils.py b/python/sgl_jax/test/test_utils.py
+index 9beb03c2..7e8f7124 100644
+--- a/python/sgl_jax/test/test_utils.py
++++ b/python/sgl_jax/test/test_utils.py
+@@ -835,3 +835,166 @@ class GDNAttnBackendForTest(KDAAttnBackendForTest):
+     and to make ``test_gdn_attention*.py`` self-contained without leaking
+     KDA-specific imports.
+     """
++
++
++# --- Hidden states alignment utilities ---
++
++EARLY_LAYER_MAE_THRESHOLD = 5e-2  # layers 0 to num_layers//4
++OVERALL_MAE_THRESHOLD = 5e-1  # all layers
++
++
++def assert_hidden_states_aligned(
++    test_case: unittest.TestCase,
++    hf_hidden_states: tuple,
++    sgl_hidden_states: np.ndarray,
++    prompt: str,
++    early_threshold: float = EARLY_LAYER_MAE_THRESHOLD,
++    overall_threshold: float = OVERALL_MAE_THRESHOLD,
++):
++    """Compare per-layer hidden states between HF and SGLang-JAX.
++
++    Args:
++        test_case: unittest.TestCase instance (for assertions).
++        hf_hidden_states: HF output_hidden_states tuple, each (1, seq_len, hidden_dim).
++        sgl_hidden_states: SGLang prefill hidden states, shape (seq_len, num_layers, hidden_dim).
++        prompt: The prompt string (for error messages and logging).
++        early_threshold: MAE threshold for early layers (first quarter).
++        overall_threshold: MAE threshold for all layers.
++    """
++    import torch
++
++    num_layers = sgl_hidden_states.shape[1]
++    early_cutoff = num_layers // 4
++
++    print(f"\nPrompt: {prompt!r}")
++    print(f"SGLang prefill shape: {sgl_hidden_states.shape}")
++    print(f"HF layers (including embedding): {len(hf_hidden_states)}")
++    print(f"Comparing {num_layers} transformer layers...")
++    print(f"  Early layers [0, {early_cutoff}): MAE < {early_threshold}")
++    print(f"  All layers [0, {num_layers}): MAE < {overall_threshold}")
++
++    test_case.assertEqual(
++        len(hf_hidden_states),
++        num_layers + 1,
++        "HF should have num_layers + 1 outputs (layer inputs + final normed output)",
++    )
++
++    all_passed = True
++    for layer_idx in range(num_layers):
++        hf_layer = hf_hidden_states[layer_idx]
++        if isinstance(hf_layer, torch.Tensor):
++            hf_layer = hf_layer[0].float().numpy()
++        elif isinstance(hf_layer, np.ndarray) and hf_layer.ndim == 3:
++            hf_layer = hf_layer[0].astype(np.float32)
++        sgl_layer = np.array(sgl_hidden_states[:, layer_idx, :], dtype=np.float32)
++
++        mae = np.abs(hf_layer - sgl_layer).mean()
++        max_abs_err = np.abs(hf_layer - sgl_layer).max()
++
++        threshold = early_threshold if layer_idx < early_cutoff else overall_threshold
++        passed = mae < threshold
++        status = "PASS" if passed else "FAIL"
++
++        if layer_idx % 4 == 0 or layer_idx == num_layers - 1 or not passed:
++            print(
++                f"  [{status}] Layer {layer_idx:2d}: "
++                f"MAE={mae:.4e}, max_err={max_abs_err:.4e} "
++                f"(threshold={threshold:.0e})"
++            )
++
++        if not passed:
++            all_passed = False
++
++    test_case.assertTrue(
++        all_passed,
++        f"Some layers exceeded MAE threshold for prompt: {prompt!r}",
++    )
++    print(f"  All {num_layers} layers passed.")
++
++
++def hidden_states_engine_args(model_path: str, tp_size: int) -> dict:
++    """The TPU Engine settings every hidden-state test starts from."""
++    return dict(
++        model_path=model_path,
++        trust_remote_code=True,
++        tp_size=tp_size,
++        device="tpu",
++        random_seed=3,
++        node_rank=0,
++        mem_fraction_static=0.6,
++        chunked_prefill_size=1024,
++        download_dir="/tmp",
++        dtype="bfloat16",
++        precompile_bs_paddings=[8],
++        max_running_requests=8,
++        skip_server_warmup=True,
++        attention_backend="fa",
++        precompile_token_paddings=[1024],
++        page_size=64,
++        log_requests=False,
++        enable_return_hidden_states=True,
++    )
++
++
++class HiddenStatesAlignmentCase(CustomTestCase):
++    """Prefill hidden states per layer against a HuggingFace CPU float32 reference.
++
++    A subclass sets model_path and tp_size and names its tests. This class holds no test, so a
++    runner that collects it runs nothing and starts no engine.
++    """
++
++    model_path: str
++    tp_size: int
++
++    @classmethod
++    def setUpClass(cls):
++        import torch
++        from transformers import AutoModelForCausalLM, AutoTokenizer
++
++        from sgl_jax.srt.entrypoints.engine import Engine
++
++        print(f"Loading HuggingFace model: {cls.model_path} on CPU...")
++        cls.hf_tokenizer = AutoTokenizer.from_pretrained(cls.model_path, trust_remote_code=True)
++        cls.hf_model = AutoModelForCausalLM.from_pretrained(
++            cls.model_path,
++            trust_remote_code=True,
++            dtype=torch.float32,
++        ).eval()
++        print("HuggingFace model loaded.")
++
++        print(f"Loading SGLang-JAX engine: {cls.model_path} on TPU (tp_size={cls.tp_size})...")
++        cls.engine = Engine(**hidden_states_engine_args(cls.model_path, cls.tp_size))
++        print("SGLang-JAX engine loaded.")
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.engine.shutdown()
++        del cls.hf_model
++
++    def _get_hf_hidden_states(self, prompt):
++        """Run the HuggingFace forward pass and return its per-layer hidden states."""
++        import torch
++
++        inputs = self.hf_tokenizer(prompt, return_tensors="pt")
++        with torch.no_grad():
++            outputs = self.hf_model(**inputs, output_hidden_states=True)
++        return outputs.hidden_states
++
++    def _get_sgl_prefill_hidden_states(self, prompt):
++        """The prompt's rows from the Engine, [seq_len, num_layers, hidden_dim].
++
++        Each prefill pass returns one chunk, so a prompt split across passes comes back as
++        several. With max_new_tokens 1 no decode step runs, so every chunk is a prefill chunk.
++        """
++        outputs = self.engine.generate(
++            prompt=[prompt],
++            sampling_params={"temperature": 0, "max_new_tokens": 1},
++            return_hidden_states=True,
++        )
++        chunks = outputs[0]["meta_info"]["hidden_states"]
++        return np.concatenate([np.asarray(chunk) for chunk in chunks])
++
++    def _compare_per_layer(self, prompt):
++        hf_hs = self._get_hf_hidden_states(prompt)
++        sgl_hs = self._get_sgl_prefill_hidden_states(prompt)
++        assert_hidden_states_aligned(self, hf_hs, sgl_hs, prompt)
+diff --git a/test/srt/disaggregation/test_pd_prefill_overlap.py b/test/srt/disaggregation/test_pd_prefill_overlap.py
+index c613cc43..13006653 100644
+--- a/test/srt/disaggregation/test_pd_prefill_overlap.py
++++ b/test/srt/disaggregation/test_pd_prefill_overlap.py
+@@ -474,6 +474,7 @@ def test_run_batch_to_resolve_to_native_chunk_handoff():
+     scheduler.tp_worker = Worker()
+     batch = scheduler.cur_batch
+     batch.return_logprob = False
++    batch.return_hidden_states = False
+     batch.get_model_worker_batch = lambda *_: NS(bid=1)
+     snapshots = scheduler._snapshot_prefill_handoffs(batch)
+     scheduler._disagg_prefill_compute[id(req)] = 1
+diff --git a/test/srt/run_suite.py b/test/srt/run_suite.py
+index 1a4f332c..61793bff 100644
+--- a/test/srt/run_suite.py
++++ b/test/srt/run_suite.py
+@@ -297,6 +297,8 @@ suites = {
+         TestFile("python/sgl_jax/test/layers/test_group_rmsnorm.py", 0.1, runner="pytest"),
+         TestFile("test/srt/lora/test_bgmv_backend.py", 7),
+         TestFile("test/srt/lora/test_align_lora_accuracy.py", 5.5),
++        TestFile("test/srt/test_return_hidden_states.py", 10),
++        TestFile("test/srt/test_capture_mode_propagation.py", 1),
+         TestFile("python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"),
+         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
+         TestFile("test/srt/kernels/dsa/test_streamindex_topk.py", 3, runner="pytest"),
+@@ -355,6 +357,11 @@ suites = {
+         TestFile("test/srt/disaggregation/test_pd_logprob_stream.py", 0.1, runner="pytest"),
+         TestFile("test/srt/disaggregation/test_raiden_loader.py", 0.1, runner="pytest"),
+         TestFile("test/srt/test_generate_stream_numpy.py", 0.1, runner="pytest"),
++        TestFile(
++            "test/srt/test_return_hidden_states_cpu.py",
++            6,
++            env={"JAX_PLATFORMS": "cpu"},
++        ),
+         TestFile(
+             "python/sgl_jax/test/test_model_runner_kv_cache_mixin.py",
+             0.2,
+@@ -573,6 +580,7 @@ suites = {
+         TestFile("test/srt/lora/test_bgmv_backend.py", 6),
+         TestFile("test/srt/lora/test_dynamic_lora.py", 10),
+         TestFile("test/srt/lora/test_static_lora.py", 10),
++        TestFile("test/srt/test_hidden_states_alignment.py", 10),
+         # Dense (non-hybrid) class only. The recurrent (GDN-hybrid) class is a
+         # heavy 4-chip / 35B determinism run kept out of per-PR CI (nightly
+         # recurrent gate: #1425).
+@@ -612,6 +620,7 @@ suites = {
+         TestFile("test/srt/rl/test_return_routed_experts.py", 2),
+         TestFile("test/srt/rl/test_multi_engines_in_one_process.py", 1),
+         TestFile("test/srt/multimodal/test_wan2_1_models.py", 4),
++        TestFile("test/srt/test_hidden_states_alignment_tp.py", 10),
+         TestFile("test/srt/multimodal/test_flux1_dev_models.py", 2),
+     ],
+ }
+diff --git a/test/srt/test_capture_mode_propagation.py b/test/srt/test_capture_mode_propagation.py
+new file mode 100644
+index 00000000..dc067a84
+--- /dev/null
++++ b/test/srt/test_capture_mode_propagation.py
+@@ -0,0 +1,225 @@
++"""Every per-request capture flag must reach the batch that consumes it.
++
++This catches a class of bug the source-inspection tests miss. A field can exist
++on Req, exist on ScheduleBatch, be read correctly downstream, and still never be
++populated, because nothing aggregates it in init_new. The chain then looks whole
++in every file and produces nothing at runtime.
++
++The same holds on the way out. merge_batch ORs a flag in from the batch it
++merges, and filter_batch has to derive it again from the requests it keeps. A
++flag it skips stays set after the last request that asked leaves, and every
++later step of the running batch pays for a mode nobody reads.
++
++    python3 test/srt/test_capture_mode_propagation.py
++"""
++
++import ast
++import copy
++import pathlib
++import sys
++
++SRC = pathlib.Path(__file__).resolve().parents[2] / "python/sgl_jax/srt/managers/schedule_batch.py"
++
++
++def _tree():
++    return ast.parse(SRC.read_text())
++
++
++def _class(tree, name):
++    for n in ast.walk(tree):
++        if isinstance(n, ast.ClassDef) and n.name == name:
++            return n
++    raise AssertionError(f"class {name} not found")
++
++
++def _annotated_fields(cls):
++    return {
++        n.target.id
++        for n in cls.body
++        if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)
++    }
++
++
++def _init_new_kwargs(cls):
++    """kwargs of the cls(...) call in init_new, with local names resolved once.
++
++    `return_logprob=return_logprob` is just as valid an aggregation as an inline
++    generator, so resolve a local binding before judging the expression.
++    """
++    for fn in cls.body:
++        if isinstance(fn, ast.FunctionDef) and fn.name == "init_new":
++            locals_ = {}
++            for n in fn.body:
++                if (
++                    isinstance(n, ast.Assign)
++                    and len(n.targets) == 1
++                    and isinstance(n.targets[0], ast.Name)
++                ):
++                    locals_[n.targets[0].id] = ast.unparse(n.value)
++            for n in ast.walk(fn):
++                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "cls":
++                    out = {}
++                    for kw in n.keywords:
++                        if not kw.arg:
++                            continue
++                        expr = ast.unparse(kw.value)
++                        out[kw.arg] = locals_.get(expr, expr)
++                    return out
++    raise AssertionError("init_new cls(...) call not found")
++
++
++def _judge(batch, flags):
++    """Per flag, the expression init_new passes and whether it derives the flag from the reqs."""
++    kwargs = _init_new_kwargs(batch)
++    out = {}
++    for f in flags:
++        expr = kwargs.get(f)
++        out[f] = (expr, expr is not None and "all_reqs" in expr)
++    return out
++
++
++def _mutated(tree, flag, value):
++    """A copy of the tree whose init_new cls(...) call drops `flag`, or passes `value` for it."""
++    tree = copy.deepcopy(tree)
++    for fn in _class(tree, "ScheduleBatch").body:
++        if isinstance(fn, ast.FunctionDef) and fn.name == "init_new":
++            for n in ast.walk(fn):
++                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "cls":
++                    if value is None:
++                        n.keywords = [kw for kw in n.keywords if kw.arg != flag]
++                    else:
++                        for kw in n.keywords:
++                            if kw.arg == flag:
++                                kw.value = value
++                    return tree
++    raise AssertionError("init_new cls(...) call not found")
++
++
++def _method(cls, name):
++    for fn in cls.body:
++        if isinstance(fn, ast.FunctionDef) and fn.name == name:
++            return fn
++    raise AssertionError(f"{name} not found")
++
++
++def _is_self_attr(node):
++    return (
++        isinstance(node, ast.Attribute)
++        and isinstance(node.value, ast.Name)
++        and node.value.id == "self"
++    )
++
++
++def _ored_in_merge(batch):
++    """The flags merge_batch ORs in from the other batch: `self.flag |= other.flag`."""
++    return sorted(
++        n.target.attr
++        for n in ast.walk(_method(batch, "merge_batch"))
++        if isinstance(n, ast.AugAssign) and isinstance(n.op, ast.BitOr) and _is_self_attr(n.target)
++    )
++
++
++def _recomputed_in_filter(batch):
++    """The flags filter_batch assigns from the requests it keeps, the `all_reqs` it builds."""
++    return {
++        t.attr
++        for n in ast.walk(_method(batch, "filter_batch"))
++        if isinstance(n, ast.Assign) and "all_reqs" in ast.unparse(n.value)
++        for t in n.targets
++        if _is_self_attr(t)
++    }
++
++
++class _DropAssign(ast.NodeTransformer):
++    """Drops every `self.<flag> = ...` statement."""
++
++    def __init__(self, flag):
++        self.flag = flag
++
++    def visit_Assign(self, node):
++        if any(_is_self_attr(t) and t.attr == self.flag for t in node.targets):
++            return ast.Pass()
++        return node
++
++
++def _filter_mutated(tree, flag):
++    """A copy of the tree whose filter_batch never assigns `flag`."""
++    tree = copy.deepcopy(tree)
++    fn = _method(_class(tree, "ScheduleBatch"), "filter_batch")
++    _DropAssign(flag).visit(fn)
++    return tree
++
++
++def main():
++    tree = _tree()
++    req = _class(tree, "Req")
++    batch = _class(tree, "ScheduleBatch")
++
++    req_fields = _annotated_fields(req) | {
++        t.attr
++        for fn in req.body
++        if isinstance(fn, ast.FunctionDef) and fn.name == "__init__"
++        for t in ast.walk(fn)
++        if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id == "self"
++    }
++    batch_fields = _annotated_fields(batch)
++
++    # Any return_* flag that lives on BOTH Req and ScheduleBatch has to be
++    # aggregated from the reqs in init_new, or the batch keeps its default.
++    shared = sorted(f for f in batch_fields & req_fields if f.startswith("return_"))
++    assert shared, "expected at least one shared return_* flag; the heuristic has drifted"
++
++    print(f"shared per-request flags on ScheduleBatch: {', '.join(shared)}\n")
++    failures = 0
++    for f, (expr, ok) in _judge(batch, shared).items():
++        print(f"  [{'PASS' if ok else 'FAIL'}] {f:<28} init_new passes: {expr!r}")
++        if not ok:
++            failures += 1
++            print(f"         {f} defaults on the batch and nothing derives it from the reqs.")
++
++    # Negative controls. Mutate the parsed source so init_new drops each flag, or passes a
++    # constant for it, and run the same parse and the same judgment on the result. Each has to
++    # read as not aggregated, or the check above can't fail either.
++    print()
++    for f in shared:
++        for label, value in (("dropped", None), ("pinned to False", ast.Constant(value=False))):
++            mutated = _class(_mutated(tree, f, value), "ScheduleBatch")
++            caught = not _judge(mutated, shared)[f][1]
++            print(f"  control ({f} {label}): {'detected' if caught else 'NOT DETECTED'}")
++            if not caught:
++                print("  FAIL: the control didn't fail, so this test detects nothing.")
++                failures += 1
++
++    # On the way out: every flag merge_batch ORs in, filter_batch derives again from the
++    # requests it keeps.
++    ored = _ored_in_merge(batch)
++    assert ored, "expected merge_batch to OR in at least one flag; the heuristic has drifted"
++    recomputed = _recomputed_in_filter(batch)
++    print(f"\nflags merge_batch ORs in: {', '.join(ored)}\n")
++    for f in ored:
++        ok = f in recomputed
++        print(f"  [{'PASS' if ok else 'FAIL'}] filter_batch derives {f} from the requests it keeps")
++        if not ok:
++            failures += 1
++            print(f"         {f} stays set after the last request that asked leaves the batch.")
++
++    # Negative controls. The same judgment on a filter_batch that never assigns the flag.
++    print()
++    for f in ored:
++        mutated = _class(_filter_mutated(tree, f), "ScheduleBatch")
++        caught = f not in _recomputed_in_filter(mutated)
++        print(f"  control ({f} never reassigned): {'detected' if caught else 'NOT DETECTED'}")
++        if not caught:
++            print("  FAIL: the control didn't fail, so this test detects nothing.")
++            failures += 1
++
++    print()
++    if failures:
++        print(f"FAILED: {failures} check(s)")
++        return 1
++    print("All checks passed.")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/test/srt/test_hidden_states_alignment.py b/test/srt/test_hidden_states_alignment.py
+new file mode 100644
+index 00000000..98b3b967
+--- /dev/null
++++ b/test/srt/test_hidden_states_alignment.py
+@@ -0,0 +1,32 @@
++import unittest
++
++from sgl_jax.test.test_utils import (
++    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
++    HiddenStatesAlignmentCase,
++)
++
++
++class TestHiddenStatesAlignment(HiddenStatesAlignmentCase):
++    """
++    Hidden states alignment test: SGLang-JAX,HuggingFace Transformers.
++
++    Compares prefill-phase per-layer hidden states from SGLang-JAX engine against
++    HuggingFace Transformers reference (CPU, float32).
++    """
++
++    model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST  # Qwen/Qwen3-1.7B
++    tp_size = 1
++
++    def test_single_prompt_alignment(self):
++        """Per-layer hidden states match HF within tolerance for a single prompt."""
++        self._compare_per_layer("The capital of France is")
++
++    def test_multi_prompt_alignment(self):
++        """Two more prompts, one generate call each, and each matches HF on its own."""
++        prompts = ["Hello world", "The future of AI is"]
++        for prompt in prompts:
++            self._compare_per_layer(prompt)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/srt/test_hidden_states_alignment_tp.py b/test/srt/test_hidden_states_alignment_tp.py
+new file mode 100644
+index 00000000..719ef359
+--- /dev/null
++++ b/test/srt/test_hidden_states_alignment_tp.py
+@@ -0,0 +1,42 @@
++"""
++TP hidden states alignment test.
++
++Verifies hidden states remain numerically correct when model weights
++and computation are sharded across multiple TPU chips via Tensor Parallelism.
++
++Environment: TPU v6e-4, tp_size=4
++Model: Qwen/Qwen3-8B (36 layers, hidden_dim=4096)
++"""
++
++import unittest
++
++from sgl_jax.test.test_utils import (
++    DEFAULT_MODEL_NAME_FOR_TEST,
++    HiddenStatesAlignmentCase,
++)
++
++
++class TestHiddenStatesAlignmentTP(HiddenStatesAlignmentCase):
++    """
++    TP hidden states alignment test (v6e-4, tp_size=4).
++
++    Compares prefill-phase per-layer hidden states from SGLang-JAX engine
++    (with 4-way TP) against HuggingFace Transformers reference (CPU, float32).
++    """
++
++    model_path = DEFAULT_MODEL_NAME_FOR_TEST  # Qwen/Qwen3-8B
++    tp_size = 4
++
++    def test_tp_single_prompt_alignment(self):
++        """Per-layer hidden states match HF after TP all-reduce."""
++        self._compare_per_layer("The capital of France is")
++
++    def test_tp_multi_prompt_alignment(self):
++        """Two more prompts under TP, one generate call each."""
++        prompts = ["Hello world", "The future of AI is"]
++        for prompt in prompts:
++            self._compare_per_layer(prompt)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/srt/test_return_hidden_states.py b/test/srt/test_return_hidden_states.py
+new file mode 100644
+index 00000000..edec8f66
+--- /dev/null
++++ b/test/srt/test_return_hidden_states.py
+@@ -0,0 +1,113 @@
++"""
++Usage:
++python3 -m unittest test_return_hidden_states.TestReturnHiddenStates.test_return_hidden_states
++"""
++
++import unittest
++
++import numpy as np
++
++from sgl_jax.srt.entrypoints.engine import Engine
++from sgl_jax.test.test_utils import QWEN3_8B, CustomTestCase, hidden_states_engine_args
++
++# Qwen3-8B has 36 hidden layers and hidden_dim=4096
++EXPECTED_NUM_LAYERS = 36
++EXPECTED_HIDDEN_DIM = 4096
++
++
++class TestReturnHiddenStates(CustomTestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.model_path = QWEN3_8B
++        cls.engine = Engine(**hidden_states_engine_args(cls.model_path, tp_size=1))
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.engine.shutdown()
++
++    def test_return_hidden_states(self):
++        prompts = [
++            "The capital of France is",
++            "The future of AI is",
++        ]
++
++        sampling_params = {
++            "temperature": 0,
++            "max_new_tokens": 10,
++        }
++
++        outputs = self.engine.generate(
++            prompt=prompts,
++            sampling_params=sampling_params,
++            return_hidden_states=True,
++        )
++
++        self.assertEqual(len(outputs), 2)
++        for prompt, output in zip(prompts, outputs):
++            for i in range(len(output["meta_info"]["hidden_states"])):
++                hs = output["meta_info"]["hidden_states"][i]
++                if not isinstance(hs, np.ndarray):
++                    output["meta_info"]["hidden_states"][i] = np.array(hs)
++
++            prompt_tokens = output["meta_info"]["prompt_tokens"]
++            completion_tokens = output["meta_info"]["completion_tokens"]
++            total_tokens = prompt_tokens + completion_tokens
++
++            print("===============================")
++            print(
++                f"Prompt: {prompt}\n"
++                f"Generated text: {output['text']}\n"
++                f"Prompt_Tokens: {prompt_tokens}\t"
++                f"Completion_tokens: {completion_tokens}"
++            )
++
++            raw_hs = output["meta_info"]["hidden_states"]
++            print(f"Number of hidden state chunks: {len(raw_hs)}")
++            for idx, h in enumerate(raw_hs):
++                print(f"  Chunk {idx} shape: {h.shape}")
++
++            # Concatenate: expand decode [num_layers, hidden_dim] to [1, num_layers, hidden_dim]
++            hidden_states = np.concatenate(
++                [np.expand_dims(h, 0) if h.ndim == 2 else h for h in raw_hs]
++            )
++            print(f"Combined hidden states shape: {hidden_states.shape}")
++            # Expected: [prompt_tokens + completion_tokens - 1, num_layers, hidden_dim]
++            self.assertEqual(hidden_states.shape[0], total_tokens - 1)
++            self.assertEqual(hidden_states.shape[1], EXPECTED_NUM_LAYERS)
++            self.assertEqual(hidden_states.shape[2], EXPECTED_HIDDEN_DIM)
++
++            # Verify per-layer hidden states aren't all zeros
++            for layer_idx in [0, EXPECTED_NUM_LAYERS // 2, EXPECTED_NUM_LAYERS - 1]:
++                layer_hs = hidden_states[0, layer_idx, :]
++                self.assertGreater(
++                    np.abs(layer_hs).max(),
++                    0,
++                    f"Layer {layer_idx} hidden states are all zeros",
++                )
++
++            print()
++
++            self.assertIsNotNone(hidden_states)
++            self.assertGreater(hidden_states.size, 0)
++
++    def test_no_hidden_states_by_default(self):
++        prompts = ["The capital of France is"]
++
++        sampling_params = {
++            "temperature": 0,
++            "max_new_tokens": 5,
++        }
++
++        outputs = self.engine.generate(
++            prompt=prompts,
++            sampling_params=sampling_params,
++        )
++
++        self.assertEqual(len(outputs), 1)
++        hidden_states = outputs[0]["meta_info"].get("hidden_states")
++        if hidden_states is not None:
++            self.assertEqual(len(hidden_states), 0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/srt/test_return_hidden_states_cpu.py b/test/srt/test_return_hidden_states_cpu.py
+new file mode 100644
+index 00000000..51d9e77c
+--- /dev/null
++++ b/test/srt/test_return_hidden_states_cpu.py
+@@ -0,0 +1,932 @@
++"""--enable-return-hidden-states through the real Engine, on CPU, with a tiny random model.
++
++    JAX_PLATFORMS=cpu python3 test/srt/test_return_hidden_states_cpu.py
++
++The model is a four-layer Qwen3 with random weights, written into a temporary directory, so the
++test needs no download and no chip. Each scenario starts its own Engine in a child process. A
++request that stops the server then fails its own test and not the whole run, and the test can
++read the scheduler's log.
++
++The contract under test: row i of a request's hidden states is position i. Prefill chunks
++arrive as [tokens, layers, hidden] and cover the prompt. Each decode step adds one
++[layers, hidden] chunk. A request returns prompt_tokens + completion_tokens - 1 rows, because
++no forward pass reads the last token it generates. Where a check compares values, it compares
++against the same prompt run alone, so a row filed under the wrong position fails even when the
++count is right. With --return-hidden-states-layers the layer axis holds the slots it names, in
++ascending order, and each equals the same slot of a server that returns every slot.
++"""
++
++import argparse
++import asyncio
++import json
++import os
++import subprocess
++import sys
++import tempfile
++import unittest
++
++import numpy as np
++
++HERE = os.path.abspath(__file__)
++LAYERS = 4
++VOCAB = 512
++# Rows computed in different batches go through different padded shapes, which moves a float32
++# sum by a few ulp. A row filed under the wrong position misses by far more.
++ROW_TOL = 1e-4
++# The slots the filter test keeps: slot 0, where residual is None, and the last slot.
++KEPT_SLOTS = [0, 3]
++
++
++# --------------------------------------------------------------------------------------
++# the tiny model
++# --------------------------------------------------------------------------------------
++
++
++def write_tiny_model(path, arch="qwen3", seed=0):
++    """A random-weight checkpoint in the HuggingFace layout the loader reads.
++
++    qwen3 carries the layers_to_capture hook and qwen2 doesn't.
++    """
++    from safetensors.numpy import save_file
++    from transformers import Qwen2Config, Qwen3Config
++
++    # qwen2 has no head_dim field, so its head is hidden_size / heads. Two heads over 256 keep it
++    # at 128, the width the attention backend works in.
++    heads, kv_heads, head_dim, hidden = (4, 2, 128, 128) if arch == "qwen3" else (2, 2, 128, 256)
++    common = dict(
++        vocab_size=VOCAB,
++        hidden_size=hidden,
++        intermediate_size=256,
++        num_hidden_layers=LAYERS,
++        num_attention_heads=heads,
++        num_key_value_heads=kv_heads,
++        max_position_embeddings=2048,
++        rms_norm_eps=1e-6,
++        rope_theta=10000.0,
++        tie_word_embeddings=False,
++        bos_token_id=1,
++        eos_token_id=2,
++    )
++    if arch == "qwen3":
++        config = Qwen3Config(head_dim=head_dim, **common)
++        config.architectures = ["Qwen3ForCausalLM"]
++    else:
++        config = Qwen2Config(**common)
++        config.architectures = ["Qwen2ForCausalLM"]
++    os.makedirs(path, exist_ok=True)
++    config.save_pretrained(path)
++
++    rng = np.random.default_rng(seed)
++    q_width, kv_width = heads * head_dim, kv_heads * head_dim
++
++    def normal(*shape):
++        return (rng.normal(size=shape) * 0.08).astype(np.float32)
++
++    tensors = {
++        "model.embed_tokens.weight": normal(VOCAB, hidden),
++        "model.norm.weight": np.ones(hidden, np.float32),
++        "lm_head.weight": normal(VOCAB, hidden),
++    }
++    for i in range(LAYERS):
++        p = f"model.layers.{i}"
++        tensors.update(
++            {
++                f"{p}.self_attn.q_proj.weight": normal(q_width, hidden),
++                f"{p}.self_attn.k_proj.weight": normal(kv_width, hidden),
++                f"{p}.self_attn.v_proj.weight": normal(kv_width, hidden),
++                f"{p}.self_attn.o_proj.weight": normal(hidden, q_width),
++                f"{p}.mlp.gate_proj.weight": normal(256, hidden),
++                f"{p}.mlp.up_proj.weight": normal(256, hidden),
++                f"{p}.mlp.down_proj.weight": normal(hidden, 256),
++                f"{p}.input_layernorm.weight": np.ones(hidden, np.float32),
++                f"{p}.post_attention_layernorm.weight": np.ones(hidden, np.float32),
++            }
++        )
++        if arch == "qwen3":
++            tensors[f"{p}.self_attn.q_norm.weight"] = np.ones(head_dim, np.float32)
++            tensors[f"{p}.self_attn.k_norm.weight"] = np.ones(head_dim, np.float32)
++        else:
++            tensors[f"{p}.self_attn.q_proj.bias"] = normal(q_width)
++            tensors[f"{p}.self_attn.k_proj.bias"] = normal(kv_width)
++            tensors[f"{p}.self_attn.v_proj.bias"] = normal(kv_width)
++    save_file(tensors, os.path.join(path, "model.safetensors"), metadata={"format": "pt"})
++    with open(os.path.join(path, "generation_config.json"), "w") as fh:
++        json.dump({"bos_token_id": 1, "eos_token_id": 2}, fh)
++
++
++def engine_args(model, **overrides):
++    args = dict(
++        model_path=model,
++        skip_tokenizer_init=True,
++        device="cpu",
++        tp_size=1,
++        dtype="float32",
++        attention_backend="fa",
++        max_total_tokens=2048,
++        max_running_requests=4,
++        chunked_prefill_size=64,
++        disable_precompile=True,
++        skip_server_warmup=True,
++        grammar_backend="none",
++        mem_fraction_static=0.3,
++        random_seed=3,
++        log_level="info",
++        enable_return_hidden_states=True,
++        # On CPU the overlap scheduler gives a batched greedy request other tokens than the
++        # same request alone, capture or no capture, so the value checks run without it.
++        disable_overlap_schedule=True,
++    )
++    args.update(overrides)
++    return args
++
++
++# --------------------------------------------------------------------------------------
++# the child process
++# --------------------------------------------------------------------------------------
++
++
++def report(**fields):
++    print("RESULT " + json.dumps(fields), flush=True)
++
++
++def rows_of(output):
++    """A reply's chunks stacked to [rows, layers, hidden], and the rows prefill returned."""
++    chunks = [np.asarray(c, np.float32) for c in output["meta_info"].get("hidden_states", [])]
++    if not chunks:
++        return np.zeros((0,), np.float32), 0
++    prompt = sum(c.shape[0] for c in chunks if c.ndim == 3)
++    return np.concatenate([c if c.ndim == 3 else c[None] for c in chunks]), prompt
++
++
++def describe(output):
++    stacked, prompt_rows = rows_of(output)
++    meta = output["meta_info"]
++    return {
++        "rows": int(stacked.shape[0]),
++        "prompt_rows": int(prompt_rows),
++        "prompt_tokens": int(meta["prompt_tokens"]),
++        "completion_tokens": int(meta["completion_tokens"]),
++        "cached_tokens": int(meta.get("cached_tokens") or 0),
++        "chunk_shapes": [list(np.shape(c)) for c in meta.get("hidden_states", [])],
++        "has_key": "hidden_states" in meta,
++        "output_ids": [int(t) for t in output.get("output_ids", [])],
++    }
++
++
++def max_rel(a, b):
++    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
++    if a.shape != b.shape or not b.size:
++        return float("inf")
++    return float(np.abs(a - b).max() / max(np.abs(b).max(), 1e-12))
++
++
++def prompt_ids(seed, length):
++    return np.random.default_rng(seed).integers(3, VOCAB, size=length).tolist()
++
++
++GREEDY = {"temperature": 0.0, "ignore_eos": True}
++
++
++def scenario_main(engine):
++    """A cached prefix, a mixed batch, logprobs, HTTP /generate, and what each output sends."""
++    # A cached prefix: `first` fills the radix cache and `second` shares its first 10 tokens.
++    first = prompt_ids(1, 16)
++    second = first[:10] + prompt_ids(2, 6)
++    one = {**GREEDY, "max_new_tokens": 1}
++    engine.generate(input_ids=first, sampling_params=one)
++    control = engine.generate(input_ids=first[:10] + prompt_ids(3, 6), sampling_params=one)
++    hit = engine.generate(input_ids=second, sampling_params=one, return_hidden_states=True)
++    engine.flush_cache()
++    alone = engine.generate(input_ids=second, sampling_params=one, return_hidden_states=True)
++    report(
++        case="cached_prefix",
++        control_cached_tokens=int(control["meta_info"]["cached_tokens"]),
++        hit=describe(hit),
++        rel_to_alone=max_rel(rows_of(hit)[0], rows_of(alone)[0]),
++    )
++
++    # A request for hidden states beside one that doesn't ask. The plain one streams a chunk
++    # every step, so while it runs, the step the other finishes on sends both in one output.
++    plain_ids, asker_ids = prompt_ids(4, 12), prompt_ids(5, 9)
++    three = {**GREEDY, "max_new_tokens": 3}
++
++    async def mixed():
++        asker_task = asyncio.ensure_future(
++            engine.async_generate(
++                input_ids=asker_ids, sampling_params=three, return_hidden_states=True
++            )
++        )
++        plain = await engine.async_generate(
++            input_ids=plain_ids, sampling_params={**GREEDY, "max_new_tokens": 48}, stream=True
++        )
++        chunks, after = [], 0
++        async for chunk in plain:
++            chunks.append(chunk)
++            after += asker_task.done()
++        return chunks, await asker_task, after
++
++    plain_chunks, asker, streamed_after = engine.loop.run_until_complete(mixed())
++    asker_alone = engine.generate(
++        input_ids=asker_ids, sampling_params=three, return_hidden_states=True
++    )
++    report(
++        case="mixed_batch",
++        plain_chunks=len(plain_chunks),
++        plain_chunks_after_asker=streamed_after,
++        plain_got_key=any("hidden_states" in c["meta_info"] for c in plain_chunks),
++        asker=describe(asker),
++        rel_to_alone=max_rel(rows_of(asker)[0], rows_of(asker_alone)[0]),
++    )
++
++    # Logprobs and hidden states in one request, then in two requests of one batch.
++    ids = prompt_ids(6, 10)
++    four = {**GREEDY, "max_new_tokens": 4}
++    both = engine.generate(
++        input_ids=ids,
++        sampling_params=four,
++        return_logprob=True,
++        logprob_start_len=0,
++        return_hidden_states=True,
++    )
++    hidden_only = engine.generate(input_ids=ids, sampling_params=four, return_hidden_states=True)
++
++    async def logprob_beside_hidden():
++        # The logprob request streams, so a chunk that arrives after the other request finished
++        # shows the two decoded in one batch.
++        hidden = asyncio.ensure_future(
++            engine.async_generate(input_ids=ids, sampling_params=four, return_hidden_states=True)
++        )
++        logprob = await engine.async_generate(
++            input_ids=prompt_ids(7, 11),
++            sampling_params={**GREEDY, "max_new_tokens": 24},
++            return_logprob=True,
++            logprob_start_len=0,
++            stream=True,
++        )
++        after = 0
++        async for _ in logprob:
++            after += hidden.done()
++        return await hidden, after
++
++    beside, logprob_after = engine.loop.run_until_complete(logprob_beside_hidden())
++    report(
++        case="logprobs",
++        both=describe(both),
++        input_logprobs=len(both["meta_info"].get("input_token_logprobs") or []),
++        rel_to_hidden_only=max_rel(rows_of(both)[0], rows_of(hidden_only)[0]),
++        beside=describe(beside),
++        beside_rel=max_rel(rows_of(beside)[0], rows_of(hidden_only)[0]),
++        logprob_chunks_after_hidden=logprob_after,
++    )
++
++    # HTTP /generate through the real FastAPI app, bound to this engine's tokenizer manager.
++    body = {"input_ids": ids, "sampling_params": {**GREEDY, "max_new_tokens": 2}}
++    plain_http = post_generate(engine, {**body, "return_hidden_states": True})
++    streamed = post_generate(engine, {**body, "return_hidden_states": True, "stream": True})
++    events = [
++        json.loads(line[len("data: ") :])
++        for line in streamed.text.splitlines()
++        if line.startswith("data: {")
++    ]
++    report(
++        case="http",
++        status=plain_http.status_code,
++        shapes=(
++            [list(np.shape(c)) for c in plain_http.json()["meta_info"]["hidden_states"]]
++            if plain_http.status_code == 200
++            else plain_http.text
++        ),
++        stream_status=streamed.status_code,
++        stream_shapes=(
++            [list(np.shape(c)) for c in events[-1]["meta_info"]["hidden_states"]]
++            if events
++            else None
++        ),
++    )
++
++    # What each output carries. The request that doesn't stream decodes past the output the
++    # scheduler forces every 50 tokens, and only the output that finishes it carries rows. Each
++    # chunk of the streamed request carries every row so far.
++    sends = record_sends(engine)
++    quiet = engine.generate(
++        input_ids=prompt_ids(8, 10),
++        sampling_params={**GREEDY, "max_new_tokens": 60},
++        return_hidden_states=True,
++    )
++
++    async def streamed_request():
++        stream = await engine.async_generate(
++            input_ids=prompt_ids(9, 7),
++            sampling_params={**GREEDY, "max_new_tokens": 4},
++            return_hidden_states=True,
++            stream=True,
++        )
++        return [chunk async for chunk in stream]
++
++    chunks = engine.loop.run_until_complete(streamed_request())
++    report(
++        case="sends",
++        quiet=describe(quiet),
++        quiet_sends=[n for rid, n in sends if rid == quiet["meta_info"]["id"]],
++        streamed=describe(chunks[-1]),
++        streamed_sends=[n for rid, n in sends if rid == chunks[-1]["meta_info"]["id"]],
++        streamed_chunks=[len(c["meta_info"].get("hidden_states", [])) for c in chunks],
++    )
++
++
++def record_sends(engine):
++    """(rid, chunks) for every request an output that reaches the tokenizer manager sends rows for.
++
++    Wraps the manager's result dispatcher, which its handle loop looks up for every output.
++    """
++    manager = engine.tokenizer_manager
++    dispatch = manager._result_dispatcher
++    sends = []
++
++    def recording(recv_obj):
++        entries = getattr(recv_obj, "output_hidden_states", None) or []
++        for rid, entry in zip(getattr(recv_obj, "rids", None) or [], entries):
++            if len(entry):
++                sends.append((rid, len(entry)))
++        return dispatch(recv_obj)
++
++    manager._result_dispatcher = recording
++    return sends
++
++
++def post_generate(engine, body):
++    """POST /generate to the real app in this process, on the engine's event loop."""
++    import httpx
++
++    from sgl_jax.srt.entrypoints import http_server
++
++    http_server.set_global_state(
++        http_server._GlobalState(
++            tokenizer_manager=engine.tokenizer_manager,
++            template_manager=engine.template_manager,
++            scheduler_info=engine.scheduler_info,
++        )
++    )
++
++    async def post():
++        # An error in the app comes back as the 500 a real server would send.
++        transport = httpx.ASGITransport(app=http_server.app, raise_app_exceptions=False)
++        async with httpx.AsyncClient(transport=transport, base_url="http://engine") as client:
++            return await client.post("/generate", json=body, timeout=300)
++
++    return engine.loop.run_until_complete(post())
++
++
++def scenario_retract(engine):
++    """Two requests that outgrow a small KV pool, so the scheduler retracts one during decode.
++
++    The test runs this with SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION=1, so admission counts one new
++    token per request and lets both in, and they outgrow the pool before they finish. The
++    retracted request prefills its prompt and its output again, then decodes the rest.
++    """
++    prompts = [prompt_ids(10, 4), prompt_ids(11, 5)]
++    greedy = {"temperature": 0.0, "max_new_tokens": 16}
++    # One call sends both, so they reach the same scheduling round.
++    crowded = engine.generate(input_ids=prompts, sampling_params=greedy, return_hidden_states=True)
++    for i, (ids, out) in enumerate(zip(prompts, crowded)):
++        alone = engine.generate(input_ids=ids, sampling_params=greedy, return_hidden_states=True)
++        report(
++            case="retract",
++            index=i,
++            crowded=describe(out),
++            alone=describe(alone),
++            rel_to_alone=max_rel(rows_of(out)[0], rows_of(alone)[0]),
++        )
++
++
++def scenario_retract_in_flight(engine):
++    """A request retracted while its own prefill still runs, under the overlap scheduler.
++
++    Two prompts fill both 64-token pages of the pool. The overlap scheduler builds the next
++    decode batch before the prefill result lands, finds no page for the next token, and
++    retracts a request whose rows are still in flight.
++    """
++    one = {"temperature": 0.0, "max_new_tokens": 1}
++
++    async def behind_a_warmup():
++        # The warm-up takes a page, so neither prompt fits beside it, and its first compile
++        # holds the scheduler for seconds. Both prompts wait in the queue meanwhile and reach
++        # the same scheduling round once the warm-up's page frees up.
++        warmup = asyncio.ensure_future(
++            engine.async_generate(input_ids=prompt_ids(42, 3), sampling_params=one)
++        )
++        prompts = asyncio.ensure_future(
++            engine.async_generate(
++                input_ids=[prompt_ids(40, 64), prompt_ids(41, 60)],
++                sampling_params=one,
++                return_hidden_states=True,
++            )
++        )
++        await warmup
++        return await prompts
++
++    for i, out in enumerate(engine.loop.run_until_complete(behind_a_warmup())):
++        report(case="retract_in_flight", index=i, crowded=describe(out))
++
++
++def leading_agreement(a, b):
++    """How many leading tokens two outputs share."""
++    n = 0
++    for x, y in zip(a, b):
++        if x != y:
++            break
++        n += 1
++    return n
++
++
++def scenario_mixed_chunk(engine):
++    """A request that decodes inside another request's prefill chunks, under the overlap scheduler.
++
++    With enable_mixed_chunk, each extend batch that carries a prefill chunk also carries one decode
++    step for every running request. A streams, and B arrives once A has three tokens, so B's four
++    chunks carry A's decode steps. Under the overlap scheduler, A's input token for such a step
++    isn't in its output_ids yet.
++    """
++    a_ids, b_ids = prompt_ids(50, 6), prompt_ids(51, 60)
++    a_params = {**GREEDY, "max_new_tokens": 40}
++    b_params = {**GREEDY, "max_new_tokens": 3}
++
++    async def crowded():
++        a_stream = await engine.async_generate(
++            input_ids=a_ids, sampling_params=a_params, return_hidden_states=True, stream=True
++        )
++        b_task, last, seen = None, None, 0
++        async for chunk in a_stream:
++            last, seen = chunk, seen + 1
++            if seen == 3:
++                b_task = asyncio.ensure_future(
++                    engine.async_generate(
++                        input_ids=b_ids, sampling_params=b_params, return_hidden_states=True
++                    )
++                )
++        return last, await b_task
++
++    a_out, b_out = engine.loop.run_until_complete(crowded())
++    for label, ids, params, out in (("A", a_ids, a_params, a_out), ("B", b_ids, b_params, b_out)):
++        alone = engine.generate(input_ids=ids, sampling_params=params, return_hidden_states=True)
++        got, ref = describe(out), describe(alone)
++        # On CPU the overlap scheduler sometimes computes a step of a batched request wrong, with
++        # or without this patch. The row for that step and the token it picks differ from the
++        # same request alone, and so does every step after it. Row i picks the token at i + 1,
++        # so compare the rows before the one that picked the first token that differs.
++        agree = leading_agreement(got["output_ids"], ref["output_ids"])
++        compared = len(ids) + agree - 1 if agree < len(ref["output_ids"]) else ref["rows"]
++        report(
++            case="mixed_chunk",
++            req=label,
++            rid=out["meta_info"]["id"],
++            crowded=got,
++            alone=ref,
++            rows_compared=compared,
++            rel_to_alone=max_rel(rows_of(out)[0][:compared], rows_of(alone)[0][:compared]),
++        )
++
++
++def scenario_flag_off(engine):
++    """A server without the flag refuses the request, tells the caller why, and stays up."""
++    ids = prompt_ids(20, 8)
++    try:
++        engine.generate(
++            input_ids=ids, sampling_params={"max_new_tokens": 2}, return_hidden_states=True
++        )
++        refused = None
++    except ValueError as exc:
++        refused = str(exc)
++    over_http = post_generate(
++        engine,
++        {"input_ids": ids, "sampling_params": {"max_new_tokens": 2}, "return_hidden_states": True},
++    )
++    after = engine.generate(input_ids=ids, sampling_params={"max_new_tokens": 2})
++    report(
++        case="flag_off",
++        refused=refused,
++        http_status=over_http.status_code,
++        http_body=over_http.text,
++        served_after=len(after["output_ids"]),
++    )
++
++
++def scenario_start(engine):
++    """Start, serve one request, and describe what came back."""
++    out = engine.generate(
++        input_ids=prompt_ids(30, 8),
++        sampling_params={"max_new_tokens": 2},
++        return_hidden_states=engine.server_args.enable_return_hidden_states,
++    )
++    report(case="start", served=describe(out))
++
++
++def scenario_rows(engine):
++    """Serve one prompt with decode steps, and save its rows where ROWS_OUT names."""
++    out = engine.generate(
++        input_ids=prompt_ids(60, 12),
++        sampling_params={**GREEDY, "max_new_tokens": 3},
++        return_hidden_states=True,
++    )
++    np.save(os.environ["ROWS_OUT"], rows_of(out)[0])
++    report(case="rows", served=describe(out))
++
++
++SCENARIOS = {
++    "main": scenario_main,
++    "retract": scenario_retract,
++    "retract_in_flight": scenario_retract_in_flight,
++    "mixed_chunk": scenario_mixed_chunk,
++    "flag_off": scenario_flag_off,
++    "start": scenario_start,
++    "rows": scenario_rows,
++}
++
++
++def child(argv):
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--scenario", required=True)
++    parser.add_argument("--engine-args", required=True)
++    args = parser.parse_args(argv)
++    kwargs = json.loads(args.engine_args)
++
++    if args.scenario == "check_args":
++        # What Engine runs first, before it starts any process.
++        from sgl_jax.srt.server_args import ServerArgs
++
++        try:
++            ServerArgs(**kwargs).check_server_args()
++            report(case="check_args", error=None)
++        except (ValueError, AssertionError) as exc:
++            report(case="check_args", error=str(exc))
++        return 0
++
++    if args.scenario == "command_line":
++        # What launch_server does with its argv. Here the engine args are that argv.
++        from sgl_jax.srt.server_args import ServerArgs
++
++        try:
++            parsed = ServerArgs.from_cli(kwargs)
++            report(case="command_line", layers=parsed.return_hidden_states_layers, error=None)
++        except SystemExit as exc:
++            report(case="command_line", layers=None, error=f"argparse exited {exc.code}")
++        return 0
++
++    from sgl_jax.srt.entrypoints.engine import Engine
++
++    try:
++        engine = Engine(**kwargs)
++    except ValueError as exc:
++        report(case="refused_at_start", error=str(exc))
++        return 0
++    SCENARIOS[args.scenario](engine)
++    engine.shutdown()
++    return 0
++
++
++# --------------------------------------------------------------------------------------
++# the tests
++# --------------------------------------------------------------------------------------
++
++
++def run_child(scenario, env=None, argv=None, **kwargs):
++    """Run one scenario in a child process. Returns (returncode, results, log).
++
++    The child gets kwargs as Engine keywords, or argv as a command line when argv is set.
++    """
++    child_env = dict(os.environ)
++    child_env.setdefault("JAX_PLATFORMS", "cpu")
++    # tp_size 1 wants one device, whatever device count the caller forced for itself.
++    child_env["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1"
++    child_env.update(env or {})
++    proc = subprocess.run(
++        [
++            sys.executable,
++            HERE,
++            "--scenario",
++            scenario,
++            "--engine-args",
++            json.dumps(kwargs if argv is None else argv),
++        ],
++        capture_output=True,
++        text=True,
++        env=child_env,
++        timeout=900,
++    )
++    results = [
++        json.loads(line[len("RESULT ") :])
++        for line in proc.stdout.splitlines()
++        if line.startswith("RESULT ")
++    ]
++    return proc.returncode, results, proc.stdout + proc.stderr
++
++
++class TestReturnHiddenStatesCPU(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        # Every scenario starts the Engine in a child. One import check up front turns a missing
++        # dependency into one clear error instead of the same traceback from every child.
++        probe = subprocess.run(
++            [
++                sys.executable,
++                "-c",
++                "import sgl_jax.srt.entrypoints.engine, sgl_jax.srt.entrypoints.http_server",
++            ],
++            capture_output=True,
++            text=True,
++        )
++        if probe.returncode != 0:
++            raise RuntimeError(
++                "the Engine can't start in this environment, so no scenario can run:\n"
++                + probe.stderr
++            )
++        cls.workdir = tempfile.TemporaryDirectory()
++        cls.qwen3 = os.path.join(cls.workdir.name, "qwen3")
++        cls.qwen2 = os.path.join(cls.workdir.name, "qwen2")
++        write_tiny_model(cls.qwen3, "qwen3")
++        write_tiny_model(cls.qwen2, "qwen2")
++        cls._main = None
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.workdir.cleanup()
++
++    @classmethod
++    def main_run(cls):
++        """The main scenario, run once for the five tests that read it."""
++        if cls._main is None:
++            cls._main = run_child("main", **engine_args(cls.qwen3))
++        return cls._main
++
++    def result(self, run, case):
++        code, results, log = run
++        found = [r for r in results if r.get("case") == case]
++        self.assertTrue(found, f"no {case} result; the child exited {code}. Log:\n{log}")
++        return found
++
++    def assertContract(self, got):
++        """One row per position: every prompt token from prefill, then one per decode step."""
++        self.assertEqual(got["prompt_rows"], got["prompt_tokens"], got)
++        self.assertEqual(got["rows"], got["prompt_tokens"] + got["completion_tokens"] - 1, got)
++        decode_chunks = [s for s in got["chunk_shapes"] if len(s) == 2]
++        self.assertEqual(len(decode_chunks), got["completion_tokens"] - 1, got)
++
++    def assertNoMisfiledRows(self, log):
++        """The output processor warns when a pass skips a position or covers one twice."""
++        for warning in ("skip positions", "repeat positions"):
++            misfiled = [line for line in log.splitlines() if warning in line]
++            self.assertFalse(misfiled, misfiled)
++
++    def test_cached_prefix_returns_every_prompt_row(self):
++        (r,) = self.result(self.main_run(), "cached_prefix")
++        # Control: the cache is live, so a request that shares the prefix without asking for
++        # hidden states reuses it.
++        self.assertGreaterEqual(r["control_cached_tokens"], 10, r)
++        self.assertEqual(r["hit"]["cached_tokens"], 0, r)
++        self.assertContract(r["hit"])
++        self.assertLess(r["rel_to_alone"], ROW_TOL, r)
++
++    def test_mixed_batch_keeps_rows_with_their_request(self):
++        (r,) = self.result(self.main_run(), "mixed_batch")
++        # Control: the plain request kept streaming after the other one finished, so the step
++        # that finished it sent both, or this reads nothing.
++        self.assertGreater(r["plain_chunks_after_asker"], 0, r)
++        self.assertFalse(r["plain_got_key"], r)
++        self.assertContract(r["asker"])
++        self.assertLess(r["rel_to_alone"], ROW_TOL, r)
++
++    def test_logprobs_beside_hidden_states(self):
++        (r,) = self.result(self.main_run(), "logprobs")
++        # Controls: the request asked for input logprobs and got them, and the logprob request
++        # kept decoding after the other one finished, so the two shared decode batches.
++        self.assertEqual(r["input_logprobs"], r["both"]["prompt_tokens"], r)
++        self.assertGreater(r["logprob_chunks_after_hidden"], 0, r)
++        self.assertContract(r["both"])
++        self.assertLess(r["rel_to_hidden_only"], ROW_TOL, r)
++        self.assertContract(r["beside"])
++        self.assertLess(r["beside_rel"], ROW_TOL, r)
++
++    def test_http_generate_returns_hidden_states(self):
++        (r,) = self.result(self.main_run(), "http")
++        # Control: the stream branch, which encoded numpy arrays all along.
++        self.assertEqual(r["stream_status"], 200, r)
++        self.assertEqual(r["status"], 200, r)
++        self.assertEqual(r["shapes"], r["stream_shapes"], r)
++
++    def test_non_stream_request_gets_its_rows_once(self):
++        (r,) = self.result(self.main_run(), "sends")
++        # Control: each chunk of the streamed request carries every row so far, and the recording
++        # sees each of those outputs, so it reads what the outputs carry.
++        steps = list(range(1, r["streamed"]["completion_tokens"] + 1))
++        self.assertEqual(r["streamed_sends"], steps, r)
++        self.assertEqual(r["streamed_chunks"], steps, r)
++        self.assertContract(r["streamed"])
++        # The request that doesn't stream passed the output forced at 50 tokens, and only the
++        # output that finished it carried rows.
++        self.assertGreater(r["quiet"]["completion_tokens"], 50, r)
++        self.assertEqual(r["quiet_sends"], [len(r["quiet"]["chunk_shapes"])], r)
++        self.assertContract(r["quiet"])
++
++    def test_retraction_keeps_one_row_per_position(self):
++        run = run_child(
++            "retract",
++            env={"SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION": "1"},
++            **engine_args(self.qwen3, max_total_tokens=30, chunked_prefill_size=8),
++        )
++        results = self.result(run, "retract")
++        # Control: the pool is small enough that the scheduler retracts, or this reads nothing.
++        self.assertIn("Retract requests. #retracted_reqs: 1", run[2])
++        self.assertEqual(len(results), 2, results)
++        for r in results:
++            self.assertEqual(r["crowded"]["output_ids"], r["alone"]["output_ids"], r)
++            self.assertContract(r["crowded"])
++            self.assertLess(r["rel_to_alone"], ROW_TOL, r)
++        # The second prefill covers positions the request holds, and that's no misfiling.
++        self.assertNoMisfiledRows(run[2])
++
++    def test_retraction_with_rows_in_flight(self):
++        run = run_child(
++            "retract_in_flight",
++            **engine_args(
++                self.qwen3,
++                max_total_tokens=128,
++                page_size=64,
++                chunked_prefill_size=128,
++                disable_overlap_schedule=False,
++            ),
++        )
++        results = self.result(run, "retract_in_flight")
++        # Control: the overlap scheduler retracted a request, or this reads nothing.
++        self.assertIn("Retract requests. #retracted_reqs: 1", run[2])
++        self.assertEqual(len(results), 2, results)
++        for r in results:
++            self.assertContract(r["crowded"])
++        self.assertNoMisfiledRows(run[2])
++
++    def test_mixed_chunk_under_overlap_keeps_rows_in_place(self):
++        run = run_child(
++            "mixed_chunk",
++            **engine_args(
++                self.qwen3,
++                enable_mixed_chunk=True,
++                chunked_prefill_size=16,
++                disable_overlap_schedule=False,
++                log_level="debug",
++            ),
++        )
++        results = {r["req"]: r for r in self.result(run, "mixed_chunk")}
++        self.assertEqual(sorted(results), ["A", "B"], results)
++        a = results["A"]
++        # Control: A's prompt fits one pass, so every extend pass for A after that one is a
++        # decode step that one of B's chunks carried, or this reads nothing.
++        a_passes = [
++            line
++            for line in run[2].splitlines()
++            if f"hidden states for request {a['rid']}: an extend pass" in line
++        ]
++        self.assertGreater(len(a_passes), 1, a_passes)
++        # A had three tokens before B arrived, so the two runs agree at least that far, and the
++        # comparison covers decode rows.
++        self.assertGreater(a["rows_compared"], a["crowded"]["prompt_tokens"] + 1, a)
++        for r in results.values():
++            self.assertContract(r["crowded"])
++            self.assertLess(r["rel_to_alone"], ROW_TOL, r)
++        self.assertNoMisfiledRows(run[2])
++
++    def test_request_without_the_server_flag_is_refused(self):
++        run = run_child("flag_off", **engine_args(self.qwen3, enable_return_hidden_states=False))
++        (r,) = self.result(run, "flag_off")
++        self.assertIsNotNone(r["refused"], r)
++        self.assertIn("--enable-return-hidden-states", r["refused"])
++        self.assertEqual(r["http_status"], 400, r)
++        self.assertIn("--enable-return-hidden-states", r["http_body"])
++        self.assertEqual(r["served_after"], 2, r)
++
++    def test_model_without_the_hook_refuses_to_start(self):
++        code, results, log = run_child("start", **engine_args(self.qwen2))
++        self.assertFalse(any(r.get("case") == "start" for r in results), results)
++        self.assertIn("Qwen2ForCausalLM has no layers_to_capture hook", log)
++        # Control: the same checkpoint starts and serves with the flag off, so the refusal is
++        # the flag's and not a broken checkpoint's.
++        run = run_child("start", **engine_args(self.qwen2, enable_return_hidden_states=False))
++        (r,) = self.result(run, "start")
++        self.assertFalse(r["served"]["has_key"], r)
++        self.assertEqual(len(r["served"]["output_ids"]), 2, r)
++
++    def test_settings_that_break_capture_refuse_to_start(self):
++        # Multi-process PD needs a bootstrap URL and 128-token pages before it gets this far.
++        peer = {
++            "disaggregation_bootstrap_url": "http://127.0.0.1:8998",
++            "page_size": 128,
++            "chunked_prefill_size": 128,
++        }
++        for overrides, flag in (
++            ({"dp_size": 2}, "--dp-size 1"),
++            ({"speculative_algorithm": "EAGLE3"}, "--speculative-algorithm"),
++            ({"pd_disaggregation": "pathways"}, "--pd-disaggregation"),
++            ({"disaggregation_mode": "decode", **peer}, "--disaggregation-mode decode"),
++            ({"disaggregation_mode": "prefill", **peer}, "--disaggregation-mode prefill"),
++        ):
++            with self.subTest(**overrides):
++                run = run_child("start", **engine_args(self.qwen3, **overrides))
++                (r,) = self.result(run, "refused_at_start")
++                self.assertIn("--enable-return-hidden-states", r["error"])
++                self.assertIn(flag, r["error"])
++                # Control: without the flag, the same setting passes this check.
++                run = run_child(
++                    "check_args",
++                    **engine_args(self.qwen3, enable_return_hidden_states=False, **overrides),
++                )
++                (c,) = self.result(run, "check_args")
++                self.assertNotIn("--enable-return-hidden-states", c["error"] or "", c)
++
++    def test_layer_filter_returns_the_named_slots(self):
++        # --return-hidden-states-layers 0 3: a reply holds those two slots, in that order.
++        with tempfile.TemporaryDirectory() as tmp:
++            full_out, kept_out = os.path.join(tmp, "full.npy"), os.path.join(tmp, "kept.npy")
++            full_run = run_child("rows", env={"ROWS_OUT": full_out}, **engine_args(self.qwen3))
++            kept_run = run_child(
++                "rows",
++                env={"ROWS_OUT": kept_out},
++                **engine_args(self.qwen3, return_hidden_states_layers=KEPT_SLOTS),
++            )
++            (full,) = self.result(full_run, "rows")
++            (kept,) = self.result(kept_run, "rows")
++            full_rows, kept_rows = np.load(full_out), np.load(kept_out)
++        self.assertIn(f"capture enabled for 2 of {LAYERS} slots: {KEPT_SLOTS}", kept_run[2])
++        # The reply shape: prefill chunks [tokens, 2, hidden], decode chunks [2, hidden], and the
++        # same rows the unfiltered run returns. Control: the unfiltered run carries every slot.
++        hidden = full["served"]["chunk_shapes"][0][-1]
++        self.assertContract(kept["served"])
++        self.assertEqual(kept["served"]["output_ids"], full["served"]["output_ids"], kept)
++        for shape in kept["served"]["chunk_shapes"]:
++            self.assertEqual(shape[-2:], [len(KEPT_SLOTS), hidden], kept)
++        for shape in full["served"]["chunk_shapes"]:
++            self.assertEqual(shape[-2:], [LAYERS, hidden], full)
++        self.assertEqual(kept_rows.shape, (full_rows.shape[0], len(KEPT_SLOTS), hidden))
++        # Position j of the reply holds slot KEPT_SLOTS[j], equal to that slot of the unfiltered
++        # run. Control: every other slot of the unfiltered run misses by far more, so a slot filed
++        # at the wrong position, or read from the wrong layer, fails.
++        for position, slot in enumerate(KEPT_SLOTS):
++            with self.subTest(position=position, slot=slot):
++                self.assertLess(max_rel(kept_rows[:, position], full_rows[:, slot]), ROW_TOL)
++                for other in range(LAYERS):
++                    if other != slot:
++                        miss = max_rel(kept_rows[:, position], full_rows[:, other])
++                        self.assertGreater(miss, 100 * ROW_TOL, (other, miss))
++
++    def test_layer_filter_refuses_bad_slot_lists(self):
++        for overrides, message in (
++            ({"return_hidden_states_layers": []}, "needs at least one slot"),
++            ({"return_hidden_states_layers": [1, 1]}, "lists slot 1 twice"),
++            ({"return_hidden_states_layers": [-1]}, "got slot -1"),
++            ({"return_hidden_states_layers": [3, 1]}, "lists slot 1 after slot 3"),
++            (
++                {"return_hidden_states_layers": [1], "enable_return_hidden_states": False},
++                "needs --enable-return-hidden-states",
++            ),
++        ):
++            with self.subTest(**overrides):
++                (c,) = self.result(run_child("check_args", **engine_args(self.qwen3, **overrides)),
++                                   "check_args")
++                self.assertIn("--return-hidden-states-layers", c["error"] or "", c)
++                self.assertIn(message, c["error"], c)
++        # Control: an ascending list of slots the model holds passes the same check.
++        run = run_child("check_args", **engine_args(self.qwen3, return_hidden_states_layers=[0, 3]))
++        (c,) = self.result(run, "check_args")
++        self.assertIsNone(c["error"], c)
++        # A slot at the layer count passes that check, and the model runner refuses it at
++        # startup, where the layer count is known. The control is the filter test above, where
++        # slot 3, the last one, starts and serves.
++        code, results, log = run_child(
++            "start", **engine_args(self.qwen3, return_hidden_states_layers=[1, LAYERS])
++        )
++        self.assertFalse(any(r.get("case") == "start" for r in results), results)
++        self.assertIn(
++            f"--return-hidden-states-layers asks for slot {LAYERS}, and Qwen3ForCausalLM has "
++            f"{LAYERS} slots, 0 to {LAYERS - 1}",
++            log,
++        )
++
++    def test_layer_filter_command_line(self):
++        # launch_server takes the slots as separate integers after the flag, the way
++        # --precompile-token-paddings takes its list.
++        base = ["--model-path", self.qwen3, "--device", "cpu", "--enable-return-hidden-states"]
++        run = run_child("command_line", argv=base + ["--return-hidden-states-layers", "0", "3"])
++        (r,) = self.result(run, "command_line")
++        self.assertEqual(r, {"case": "command_line", "layers": [0, 3], "error": None})
++        # Unset means every slot, which the model runner reads as None.
++        (r,) = self.result(run_child("command_line", argv=base), "command_line")
++        self.assertEqual(r["layers"], None, r)
++        self.assertIsNone(r["error"], r)
++        # Control: a comma list isn't an integer, and argparse refuses it before anything loads.
++        run = run_child("command_line", argv=base + ["--return-hidden-states-layers", "0,3"])
++        (r,) = self.result(run, "command_line")
++        self.assertEqual(r["error"], "argparse exited 2", r)
++        self.assertIn("invalid int value: '0,3'", run[2])
++
++
++if __name__ == "__main__":
++    if "--scenario" in sys.argv:
++        sys.exit(child(sys.argv[1:]))
++    unittest.main()
+-- 
+2.43.0
+

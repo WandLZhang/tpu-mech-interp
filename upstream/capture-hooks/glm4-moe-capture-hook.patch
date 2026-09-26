@@ -1,0 +1,96 @@
+Subject: [PATCH] feat(glm4_moe): add layers_to_capture hook to Glm4MoeModel
+
+GLM-4.5 and GLM-4.6 have no layers_to_capture hook, so
+--enable-return-hidden-states refuses to start on them. Adds the same hook
+gemma4.py, llama.py and qwen3.py already carry.
+
+Glm4MoeModel accumulates aux_hidden_states for layers in layers_to_capture and
+returns them. Glm4MoeForCausalLM gates on capture_aux_hidden_states and
+forwards them to the logits processor on both the tied and untied head paths.
+
+Uses the None-residual form. GLM4 carries residual separately into a fused
+rmsnorm, and it's None on layer 0. EAGLE3 never captures layer 0, but the
+hidden-states flag does.
+---
+ python/sgl_jax/srt/models/glm4_moe.py | 32 +++++++++++++++++++++++++++-----
+ 1 file changed, 27 insertions(+), 5 deletions(-)
+
+diff --git a/python/sgl_jax/srt/models/glm4_moe.py b/python/sgl_jax/srt/models/glm4_moe.py
+index 284550cc..ea80a0fd 100644
+--- a/python/sgl_jax/srt/models/glm4_moe.py
++++ b/python/sgl_jax/srt/models/glm4_moe.py
+@@ -437,6 +437,7 @@ class Glm4MoeModel(nnx.Module):
+         self.norm = RMSNorm(
+             config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="norm"
+         )
++        self.layers_to_capture = []
+ 
+     def __call__(
+         self,
+@@ -447,10 +448,17 @@ class Glm4MoeModel(nnx.Module):
+         residual = None
+         layers_kv_fused = []
+         layers_topk_ids = []
++        aux_hidden_states = []
+ 
+         token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+ 
+-        for layer in self.layers:
++        for layer_id, layer in enumerate(self.layers):
++            if layer_id in self.layers_to_capture:
++                # residual is None on layer 0, and the hidden-states flag marks
++                # every layer, so this has to tolerate it.
++                aux_hidden_states.append(
++                    hidden_states + residual if residual is not None else hidden_states
++                )
+             hidden_states, residual, kv_fused, topk_ids = layer(
+                 forward_batch.positions,
+                 hidden_states,
+@@ -470,7 +478,7 @@ class Glm4MoeModel(nnx.Module):
+         else:
+             hidden_states = rmsnorm_forward(hidden_states, None, self.norm.scale, self.norm.epsilon)
+ 
+-        return hidden_states, layers_kv_fused, layers_topk_ids
++        return hidden_states, aux_hidden_states, layers_kv_fused, layers_topk_ids
+ 
+ 
+ class Glm4MoeForCausalLM(nnx.Module):
+@@ -498,6 +506,7 @@ class Glm4MoeForCausalLM(nnx.Module):
+             mesh=self.mesh,
+             enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+         )
++        self.capture_aux_hidden_states = False
+ 
+     def __call__(
+         self,
+@@ -506,14 +515,27 @@ class Glm4MoeForCausalLM(nnx.Module):
+         logits_metadata: LogitsMetadata,
+     ):
+         kv_pool = memory_pools.token_to_kv_pool
+-        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
++        hidden_states, aux_hidden_states, layers_kv_fused, layers_topk_ids = self.model(
+             forward_batch,
+             kv_pool,
+         )
++        if not self.capture_aux_hidden_states:
++            aux_hidden_states = None
++
+         if not getattr(self.config, "tie_word_embeddings", False):
+-            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
++            output = self.logits_processor(
++                hidden_states,
++                self.lm_head,
++                logits_metadata,
++                aux_hidden_states=aux_hidden_states,
++            )
+         else:
+-            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
++            output = self.logits_processor(
++                hidden_states,
++                self.model.embed_tokens,
++                logits_metadata,
++                aux_hidden_states=aux_hidden_states,
++            )
+         return output, layers_kv_fused, True, layers_topk_ids
+ 
+     def load_weights(self, model_config: ModelConfig):
