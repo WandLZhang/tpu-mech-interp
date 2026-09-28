@@ -14,11 +14,11 @@
 
 """Correctness gate for the Kimi K3 model patch and its capture hook.
 
-Runs on CPU with a forced 8-device mesh. No TPU needed.
+Runs on CPU with a forced 8-device mesh, and 32 devices for check 12. No TPU needed.
 
     python3 upstream/models/test_kimi_k3_model.py
 
-Eleven checks. Every check runs the patched source, either pulled out of the
+Twelve checks. Every check runs the patched source, either pulled out of the
 patched file by AST or imported from the patched checkout. Nothing here retypes
 the implementation, and every architecture claim is measured against the
 published `config.json`, safetensors headers and tensor bytes rather than
@@ -28,7 +28,8 @@ against a constant in this file.
    `sglang-jax-877.patch` and both steering patches on it, the tree
    `scripts/bootstrap_tpu_vm.sh` builds, and every file they touch compiles.
 2. MXFP4 dequantization and the sliced block reader, against an E2M1 decoder
-   written from the bit fields.
+   written from the bit fields, and the device decode the resident experts
+   run, against `dequantize_mxfp4` bit for bit.
 3. The `situ` activation, against the published formula in float64 and against
    `SituAndMul` out of the modeling file the checkpoint repo ships.
 4. `attn_res_mix`, against a float64 mixture written with unfolded weights and
@@ -46,7 +47,8 @@ against a constant in this file.
    model and the state pools alike.
 9. The model the loader builds: the runtime flags the server writes, every
    weight mapping against the published checkpoint's own shapes, and the MXFP4
-   expert stacks read into the parameters `nnx.eval_shape` builds.
+   expert stacks read into the parameters `nnx.eval_shape` builds, decoded at
+   load and resident.
 10. The served model. A tiny checkpoint in the published layout goes through
     the real `JAXModelLoader`, `ModelRunner`, startup precompile and the
     scheduler's batch code, and its logits after prefill and two decode steps
@@ -56,8 +58,14 @@ against a constant in this file.
     `--ep-dispatch-algorithm` static and dynamic with two redundant experts.
     The default `--attention-backend fa` has to be refused off TPU by name, and
     `NativeAttention`'s TPU branch has to keep each data rank on its own KV.
+    The resident experts and the decode-at-load path have to serve the same
+    tokens, logits and captured layers bit for bit, in float32 and BF16, at
+    `--ep-size` 1 and 2.
 11. The loader's other paths: a BF16 load with the router bias and `A_log`, a
     dummy load, `--model-layer-nums`, and a quantization config.
+12. The full model at `--tp-size 32` on 32 simulated devices: one chip's
+    weights and decoded-layer temporary from shapes alone, against one
+    `v5p-64` chip.
 
 Every check carries mutants of the patched source, of the patched output, or of
 the weights. Every mutant has to be caught. A mutant that slips through fails
@@ -759,6 +767,254 @@ def check_mxfp4(sources):
         want,
     )
     failures += check_mxfp4_block(sources, group_size)
+    failures += check_mxfp4_jax(sources)
+    failures += check_resident_decode_order(sources)
+    return failures
+
+
+def mxfp4_jax_nodes(src):
+    return [
+        find_assign(src, "E2M1_VALUES"),
+        find_assign(src, "MXFP4_EXPONENT_BIAS"),
+        find_assign(src, "E8M0_SCALES"),
+        find_function(src, "dequantize_mxfp4_jax"),
+    ]
+
+
+def mxfp4_jax_namespace(sources, mutate=None):
+    nodes = mxfp4_jax_nodes(sources[MXFP4_FILE])
+    if mutate is not None:
+        mutate(_node_named(nodes, "dequantize_mxfp4_jax"))
+    return compile_nodes(nodes)
+
+
+def m_jax_nibble_order(fn):
+    """The high nibble read first, so every pair of elements swaps."""
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call) and ast.unparse(node).startswith("jnp.stack"):
+            node.args[0].elts = list(reversed(node.args[0].elts))
+            return
+    raise LookupError("no jnp.stack of the two nibbles in dequantize_mxfp4_jax")
+
+
+def m_jax_scale_step(fn):
+    """Every E8M0 code read one step high, so every scale doubles."""
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Subscript) and ast.unparse(node.value) == "jnp.asarray(E8M0_SCALES)":
+            node.slice = ast.BinOp(left=node.slice, op=ast.Add(), right=ast.Constant(value=1))
+            return
+    raise LookupError("no E8M0_SCALES lookup in dequantize_mxfp4_jax")
+
+
+def m_jax_offset_ignored(fn):
+    """A device's rows read the scale groups at the top of the tensor."""
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)
+                and isinstance(node.left, ast.Name) and node.left.id == "element_offset"):
+            node.left = ast.Constant(value=0)
+            return
+    raise LookupError("no `element_offset + ...` in dequantize_mxfp4_jax")
+
+
+MXFP4_JAX_MUTANTS = {
+    "device decode reads the high nibble first": m_jax_nibble_order,
+    "device decode reads each scale one exponent step high": m_jax_scale_step,
+    "device decode ignores element_offset": m_jax_offset_ignored,
+}
+
+
+def bit_differences(got, want):
+    """Elements whose bits differ. Two NaNs count as the same value."""
+    got, want = np.asarray(got), np.asarray(want)
+    bits = {2: np.uint16, 4: np.uint32}[got.dtype.itemsize]
+    nan = np.isnan(got.astype(np.float32)) & np.isnan(want.astype(np.float32))
+    return (got.view(bits) != want.view(bits)) & ~nan
+
+
+def check_mxfp4_jax(sources):
+    """`dequantize_mxfp4_jax`, the device decode the resident experts run.
+
+    It has to give `dequantize_mxfp4`'s bits in float32 and BF16 for every byte
+    value under every E8M0 code, in `EPMoE`'s `[experts, in, out]` layout. Code
+    0's scale, 2 ** -127, is itself subnormal, and codes 0 and 1 make products
+    below 2 ** -126. numpy keeps subnormals and XLA on CPU flushes them to
+    zero, operands and results alike, so at those two codes the gate is that
+    every difference is a zero where numpy kept a value. A device's rows of
+    `wo` start partway into the packed axis, so a slice read at an
+    `element_offset` that splits a scale group has to match the same rows of
+    the whole tensor.
+    """
+    import ml_dtypes
+
+    host = mxfp4_namespace(sources)["dequantize_mxfp4"]
+    device = mxfp4_jax_namespace(sources)["dequantize_mxfp4_jax"]
+    failures = 0
+    group = 32
+    # Row r of the file carries E8M0 code r in every group, and every row holds
+    # every byte value.
+    rows, columns = 256, 1024
+    packed = np.tile(np.arange(256, dtype=np.uint8), (rows, columns // 512))
+    scale = np.repeat(np.arange(256, dtype=np.uint8)[:, None], columns // group, axis=1)
+    for name, dtype in (("float32", np.float32), ("bfloat16", ml_dtypes.bfloat16)):
+        with np.errstate(over="ignore", invalid="ignore"):
+            want = host(packed, scale, group_size=group, dtype=dtype).T
+        got = np.asarray(jax.jit(lambda p, s, d=dtype: device(p, s, dtype=d, group_size=group))(
+            packed.T[None], scale.T[None]))[0]
+        differ = bit_differences(got, want)
+        normal = int(differ[:, 2:].sum())
+        low = differ[:, :2]
+        flushed = bool(np.all(got[:, :2][low].astype(np.float32) == 0)) and bool(
+            np.all(np.abs(want[:, :2][low].astype(np.float64)) < 2.0**-124))
+        print(f"      dequantize_mxfp4_jax {name}, 256 byte values x 256 E8M0 codes: "
+              f"{normal} of {differ[:, 2:].size} bits differ at codes 2 to 255; "
+              f"{int(low.sum())} differ at codes 0 and 1, "
+              f"{'each a zero where numpy kept a value below 2 ** -124' if flushed else 'NOT ALL FLUSHED'}")
+        if normal or not flushed:
+            failures += 1
+
+    # One device's rows of a larger tensor, starting mid-group.
+    rng = np.random.default_rng(23)
+    file_packed = rng.integers(0, 256, size=(5, 48), dtype=np.uint8)
+    file_scale = rng.integers(118, 135, size=(5, 3), dtype=np.uint8)
+    whole = host(file_packed, file_scale, group_size=group).T
+    offset_fn = jax.jit(lambda p, s, o: device(p, s, dtype=jnp.float32, group_size=group,
+                                               element_offset=o))
+    part = np.asarray(offset_fn(file_packed.T[None, 12:24], file_scale.T[None], 24))[0]
+    wrong = int(bit_differences(part, whole[24:48]).sum())
+    print(f"      rows 24 to 47 of 96 at element_offset 24, which splits a group: "
+          f"{wrong} of {part.size} bits differ")
+    if wrong:
+        failures += 1
+
+    # Every mutant runs on scales around the bias and on the offset slice.
+    check_scale = rng.integers(120, 135, size=(6, 5)).astype(np.uint8)
+    check_packed = rng.integers(0, 256, size=(6, 80), dtype=np.uint8)
+    want_check = host(check_packed, check_scale, group_size=group).T
+
+    def run(fn):
+        whole_rows = np.asarray(fn(check_packed.T[None], check_scale.T[None],
+                                   dtype=jnp.float32, group_size=group))[0]
+        rows_at = np.asarray(fn(file_packed.T[None, 12:24], file_scale.T[None],
+                                dtype=jnp.float32, group_size=group, element_offset=24))[0]
+        return np.concatenate([whole_rows.ravel(), rows_at.ravel()])
+
+    failures += report_mutants(
+        MXFP4_JAX_MUTANTS,
+        lambda mutate: mxfp4_jax_namespace(sources, mutate=mutate)["dequantize_mxfp4_jax"],
+        run,
+        np.concatenate([want_check.ravel(), whole[24:48].ravel()]),
+    )
+    print(f"  [{'FAIL' if failures else 'PASS'}] dequantize_mxfp4_jax matches dequantize_mxfp4")
+    return failures
+
+
+MOE_FILE = f"{SRT}/layers/moe.py"
+BARRIERED_SCALES = (
+    "(packed, scale), _ = jax.lax.optimization_barrier(((packed, scale), anchor))"
+)
+
+
+def decode_method(sources, mutate_decode=None, mutate_dequant=None):
+    """`EPMoE._decode_mxfp4` from the patched source, with the patched device decode."""
+    fn = find_method(sources[MOE_FILE], "EPMoE", "_decode_mxfp4")
+    if mutate_decode is not None:
+        mutate_decode(fn)
+    dequant = mxfp4_jax_namespace(sources, mutate=mutate_dequant)["dequantize_mxfp4_jax"]
+    return compile_nodes([fn], extra={"mxfp4": Stub(dequantize_mxfp4_jax=dequant)})["_decode_mxfp4"]
+
+
+def m_scales_unbarriered(fn):
+    """The scales skip the barrier, as they did when the v5p-64 asked for 196 GB."""
+    text = ast.unparse(fn)
+    if BARRIERED_SCALES not in text:
+        raise LookupError("no barrier over the codes and the scales in _decode_mxfp4")
+    text = text.replace(BARRIERED_SCALES, "packed, _ = jax.lax.optimization_barrier((packed, anchor))")
+    fn.body = ast.parse(text).body[0].body
+
+
+def m_factor_per_element(fn):
+    """Every row takes the per-element factor, an f32 array the size of the decoded stack."""
+    for node in ast.walk(fn):
+        if isinstance(node, ast.If) and "isinstance(element_offset, int)" in ast.unparse(node.test):
+            node.test = ast.Constant(value=False)
+            return
+    raise LookupError("no aligned-rows branch in dequantize_mxfp4_jax")
+
+
+def _all_eqns(jaxpr):
+    for eqn in jaxpr.eqns:
+        yield eqn
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, (list, tuple)) else (param,):
+                inner = getattr(sub, "jaxpr", sub)
+                if hasattr(inner, "eqns"):
+                    yield from _all_eqns(inner)
+
+
+def decode_structure(fn):
+    """What the traced decode does with the scales, from its jaxpr.
+
+    Returns whether the first equation that reads the scale argument is an
+    optimization barrier that also takes the anchor, and the element count of
+    the largest array the E8M0 table lookup makes, beside the decoded count.
+    """
+    experts, rows, groups, columns = 4, 128, 4, 48
+    packed = jax.ShapeDtypeStruct((experts, rows // 2, columns), jnp.uint8)
+    scale = jax.ShapeDtypeStruct((experts, groups, columns), jnp.uint8)
+    anchor = jax.ShapeDtypeStruct((16, rows), jnp.bfloat16)
+    stub = Stub(tp_size=1, dtype=jnp.bfloat16, mxfp4_group_size=32)
+    closed = jax.make_jaxpr(lambda p, s, a: fn(stub, p, s, a, False))(packed, scale, anchor)
+    _, s_var, a_var = closed.jaxpr.invars
+    waits = False
+    for eqn in closed.jaxpr.eqns:
+        if any(v is s_var for v in eqn.invars):
+            waits = eqn.primitive.name == "optimization_barrier" and any(
+                v is a_var for v in eqn.invars)
+            break
+    factor = 0
+    for eqn in _all_eqns(closed.jaxpr):
+        if eqn.primitive.name != "gather":
+            continue
+        table = eqn.invars[0].aval
+        if tuple(table.shape) == (256,) and table.dtype == jnp.float32:
+            factor = max(factor, int(np.prod(eqn.outvars[0].aval.shape)))
+    return waits, factor, experts * rows * columns
+
+
+def check_resident_decode_order(sources):
+    """The resident decode reads its scales after its layer's activation, one factor a group.
+
+    On 2026-09-27 the first extend precompile on the v5p-64 asked for 196.32 GB
+    of HLO temporaries. Only the packed codes went through the barrier that ties
+    a decode to its layer, and the scale expansion reads nothing else, so XLA
+    ran all 92 layers' expansions early and held them, each a per-element index
+    and factor the size of its decoded stack. The first reader of the scale argument
+    has to be that barrier, and the E8M0 lookup has to make one value per
+    32-element group. A TPU cross-compile of the full published config asks for
+    201.83 GB of temporaries a chip before the fix and 5.63 GiB after.
+    """
+    failures = 0
+    waits, factor, decoded = decode_structure(decode_method(sources))
+    print(f"      _decode_mxfp4: first reader of the scales is the barrier with the anchor: "
+          f"{waits}; E8M0 lookup makes {factor} values for {decoded} decoded")
+    if not waits or factor * 32 != decoded:
+        failures += 1
+    for label, kwargs in (
+        ("scales outside the barrier", {"mutate_decode": m_scales_unbarriered}),
+        ("factor per element", {"mutate_dequant": m_factor_per_element}),
+    ):
+        try:
+            got = decode_structure(decode_method(sources, **kwargs))
+        except LookupError as exc:
+            print(f"      control ({label}): MUTATION OPERATOR FOUND NO TARGET: {exc}")
+            failures += 1
+            continue
+        caught = not got[0] or got[1] * 32 != got[2]
+        print(f"      control ({label}): {'caught' if caught else 'NOT DETECTED'} "
+              f"barrier={got[0]} factor={got[1]}")
+        failures += 0 if caught else 1
+    print(f"  [{'FAIL' if failures else 'PASS'}] the resident decode waits for its layer, "
+          f"scales included")
     return failures
 
 
@@ -2685,6 +2941,12 @@ def check_expert_stack(kimi_k3, workdir):
     cuts the expert, input and output axes differently. Then the
     physical-to-logical map goes in as a permutation, so a loader that indexed
     the checkpoint by physical slot would read the wrong expert.
+
+    Both expert paths run. Decoded at load, each stack has to match the
+    bit-field decoder. Resident, each stack has to hold the file's codes and
+    scales as uint8 on the BF16 twin's expert sharding, every callback has to
+    return one device's shard and no more, and the device decode of the
+    resident arrays has to give the decode-at-load stack bit for bit.
     """
     from flax import nnx
 
@@ -2699,9 +2961,10 @@ def check_expert_stack(kimi_k3, workdir):
     mesh = create_device_mesh(ici_parallelism=[1, 8], dcn_parallelism=[1, 1])
     dense = tiny_dense_experts(tensors, text)
 
-    def build(ep_size):
+    def build(ep_size, resident=False):
         model_config = ModelConfig(model_path=path, dtype="float32", moe_backend="epmoe")
         write_runtime_flags(model_config.hf_config, ep_size=ep_size)
+        model_config.hf_config.mxfp4_resident_experts = resident
         with jax.set_mesh(mesh):
             model = nnx.eval_shape(
                 lambda: kimi_k3.KimiK3ForCausalLM(model_config.hf_config, mesh, jnp.float32)
@@ -2715,6 +2978,7 @@ def check_expert_stack(kimi_k3, workdir):
         order = range(count) if order is None else order
         return np.stack([dense[layer][int(e)][index].T for e in order])
 
+    decoded_at_load = {}
     for ep_size in (1, 2, 8):
         model_config, model = build(ep_size)
         loader = WeightLoader(model=model, model_config=model_config, mesh=mesh, dtype=jnp.float32)
@@ -2731,14 +2995,18 @@ def check_expert_stack(kimi_k3, workdir):
                 continue
             for _, param_name in kimi_k3.EXPERT_MATRICES:
                 got = getattr(layer.block_sparse_moe.experts, param_name).get_value()
+                decoded_at_load[ep_size, layer_idx, param_name] = np.asarray(got)
                 layouts.add(f"{param_name} {dict(got.sharding.mesh.shape)} {got.sharding.spec}")
                 worst = max(worst, rel_error(np.asarray(got, np.float64),
                                              want_stack(layer_idx, param_name)))
-        print(f"      ep_size={ep_size}: every routed stack read from MXFP4, rel={worst:.3e}")
+        print(f"      ep_size={ep_size}, decoded at load: every routed stack read from MXFP4, "
+              f"rel={worst:.3e}")
         for layout in sorted(layouts):
             print(f"        {layout}")
         if worst >= F32_TOL:
             failures += 1
+
+    failures += check_resident_stacks(kimi_k3, build, mesh, tensors, text, decoded_at_load)
 
     # The expert-location map, as a permutation of the eight experts.
     model_config, model = build(2)
@@ -2771,6 +3039,111 @@ def check_expert_stack(kimi_k3, workdir):
     print(f"      control (the expert-location map ignored): max abs difference {moved:.3e}")
     if moved == 0.0:
         failures += 1
+
+    # The same permutation through the resident reader, which takes the file's
+    # codes as they are.
+    model_config, model = build(2, resident=True)
+    loader = WeightLoader(model=model, model_config=model_config, mesh=mesh, dtype=jnp.float32)
+    experts = model.model.layers[1].block_sparse_moe.experts
+    target = experts.wi_0.get_value()
+    try:
+        with SequentialSafetensorManager() as files:
+            permuted = model._stack_raw_experts(
+                loader.checkpoint_index(), files, source, "w1.weight_packed", target,
+                kimi_k3.expert_sharding(experts, target), permutation,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"      resident experts permuted by the expert-location map: RAISED "
+              f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}")
+        return failures + 1
+    want = np.stack([tensors[f"{source}.{int(e)}.w1.weight_packed"].T for e in permutation])
+    same = np.array_equal(np.asarray(permuted), want)
+    print(f"      resident experts permuted by the expert-location map: codes "
+          f"{'match the file' if same else 'DIFFER FROM THE FILE'}")
+    if not same:
+        failures += 1
+    return failures
+
+
+def check_resident_stacks(kimi_k3, build, mesh, tensors, text, decoded_at_load):
+    """The resident expert arrays at three expert-parallel widths."""
+    from sgl_jax.srt.utils.quantization.mxfp4 import dequantize_mxfp4_jax
+    from sgl_jax.srt.utils.weight_utils import WeightLoader
+
+    failures = 0
+    want_specs = {
+        "wi_0": P("expert", None, "tensor"),
+        "wi_1": P("expert", None, "tensor"),
+        "wo": P("expert", "tensor", None),
+        "wi_0_mxfp4_scale": P("expert", None, "tensor"),
+        "wi_1_mxfp4_scale": P("expert", None, "tensor"),
+        "wo_mxfp4_scale": P("expert", None, None),
+    }
+    hf_of = {name: hf for hf, name in kimi_k3.EXPERT_MATRICES}
+    real_callback = jax.make_array_from_callback
+
+    for ep_size in (1, 2, 8):
+        model_config, model = build(ep_size, resident=True)
+        loader = WeightLoader(model=model, model_config=model_config, mesh=mesh, dtype=jnp.float32)
+        oversized = []
+
+        def recording(shape, sharding, callback, *args, oversized=oversized, **kwargs):
+            # Every block a callback hands back has to be one device's shard.
+            shard = sharding.shard_shape(shape)
+
+            def read(index):
+                block = callback(index)
+                if tuple(block.shape) != tuple(shard):
+                    oversized.append((tuple(block.shape), tuple(shard)))
+                return block
+
+            return real_callback(shape, sharding, read, *args, **kwargs)
+
+        jax.make_array_from_callback = recording
+        try:
+            model._load_routed_experts(loader)
+        except Exception as exc:  # noqa: BLE001 - the loader's own call has to work
+            print(f"      ep_size={ep_size}, resident: _load_routed_experts RAISED "
+                  f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}")
+            failures += 1
+            continue
+        finally:
+            jax.make_array_from_callback = real_callback
+        wrong_codes, wrong_layout, differ, compared = [], [], 0, 0
+        for layer_idx, layer in enumerate(model.model.layers):
+            if not layer.is_moe_layer:
+                continue
+            experts = layer.block_sparse_moe.experts
+            source = f"{kimi_k3.TEXT_PREFIX}.model.layers.{layer_idx}.block_sparse_moe.experts"
+            for name, spec in want_specs.items():
+                got = getattr(experts, name).get_value()
+                if got.dtype != jnp.uint8 or got.sharding.spec != spec:
+                    wrong_layout.append(f"{name} {got.dtype} {got.sharding.spec}")
+                matrix = name.split("_mxfp4")[0]
+                suffix = "weight_scale" if "mxfp4_scale" in name else "weight_packed"
+                file = np.stack([tensors[f"{source}.{e}.{hf_of[matrix]}.{suffix}"].T
+                                 for e in range(text["num_experts"])])
+                if not np.array_equal(np.asarray(got), file):
+                    wrong_codes.append(name)
+            for _, name in kimi_k3.EXPERT_MATRICES:
+                decoded = dequantize_mxfp4_jax(
+                    np.asarray(getattr(experts, name).get_value()),
+                    np.asarray(getattr(experts, f"{name}_mxfp4_scale").get_value()),
+                    dtype=jnp.float32,
+                )
+                reference = decoded_at_load.get((ep_size, layer_idx, name))
+                if reference is None:
+                    differ += 1
+                    continue
+                differ += int(bit_differences(np.asarray(decoded), reference).sum())
+                compared += reference.size
+        codes = "codes and scales equal the file" if not wrong_codes else f"WRONG {wrong_codes}"
+        layout = "layouts as declared" if not wrong_layout else f"WRONG {wrong_layout[:2]}"
+        print(f"      ep_size={ep_size}, resident: six uint8 arrays a layer, {codes}, {layout}; "
+              f"device decode against decoded at load: {differ} of {compared} values differ; "
+              f"{len(oversized)} callback blocks larger than one device shard")
+        if wrong_codes or wrong_layout or differ or oversized or not compared:
+            failures += 1
     return failures
 
 
@@ -3417,6 +3790,7 @@ def serve(ckpt, dp, ep, capture, attention_backend="native", overrides="{}", ext
         "lm_head_declared": P(*model.lm_head.kernel_axes),
         "expert_spec": stack.sharding.spec,
         "expert_mesh": dict(stack.sharding.mesh.shape),
+        "expert_dtype": jnp.dtype(stack.dtype).name,
     }
 
 
@@ -3638,9 +4012,161 @@ def _check_served(repo, workdir, sources):
     finally:
         gc.collect()
 
+    failures += check_resident_served(repo, ckpt)
     failures += check_native_tpu_dp(repo, sources)
     print(f"  [{'FAIL' if failures else 'PASS'}] the served model")
     return failures
+
+
+# --json-model-override-args for the decode-at-load path.
+DECODE_AT_LOAD = json.dumps({"mxfp4_resident_experts": False})
+
+
+def identical(a, b):
+    """Whether two served results carry the same tokens, logits and captured rows, bit for bit.
+
+    Returns the verdict and a line that says what was compared. Each result's
+    arrays came out of the engine in its serving dtype and went to float64,
+    which keeps every value, so equality here is equality there. A NaN makes
+    the two unequal.
+    """
+    arrays, differ, largest = 0, 0, 0.0
+    same_tokens = a["outputs"] == b["outputs"]
+    for field in ("served", "captured"):
+        if (a[field] is None) != (b[field] is None):
+            return False, f"one result has no {field} rows"
+        if a[field] is None:
+            continue
+        for rid, steps in a[field].items():
+            other = b[field].get(rid, [])
+            if len(other) != len(steps):
+                return False, f"{rid} has {len(steps)} {field} steps against {len(other)}"
+            for x, y in zip(steps, other):
+                arrays += 1
+                if np.shape(x) != np.shape(y) or not np.array_equal(x, y):
+                    differ += 1
+                    if np.shape(x) == np.shape(y):
+                        largest = max(largest, rel_error(x, y))
+    detail = (f"{arrays} logit and capture arrays, {differ} differ"
+              f"{f' (largest rel {largest:.3e})' if differ else ''}, "
+              f"tokens {'equal' if same_tokens else 'DIFFER'}")
+    return same_tokens and differ == 0, detail
+
+
+def installed_decode_mutant(sources, mutate):
+    """`mxfp4.dequantize_mxfp4_jax` swapped for a mutant built from the patched source.
+
+    `EPMoE` calls the decoder through the module, so the next model the engine
+    builds traces the mutant. Returns the function to put back.
+    """
+    from sgl_jax.srt.utils.quantization import mxfp4 as mxfp4_module
+
+    fn = strip_annotations(find_function(sources[MXFP4_FILE], "dequantize_mxfp4_jax"))
+    mutate(fn)
+    module = ast.Module(body=[fn], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = dict(vars(mxfp4_module))
+    exec(compile(module, "<mutant>", "exec"), namespace)  # noqa: S102
+    original = mxfp4_module.dequantize_mxfp4_jax
+    mxfp4_module.dequantize_mxfp4_jax = namespace["dequantize_mxfp4_jax"]
+    return lambda: setattr(mxfp4_module, "dequantize_mxfp4_jax", original)
+
+
+RESIDENT_MUTANTS = {
+    "nibble order swapped in the device decode": m_jax_nibble_order,
+    "every scale one exponent step high in the device decode": m_jax_scale_step,
+}
+
+
+def check_resident_served(repo, ckpt):
+    """The resident experts against the decode-at-load path, through the served engine.
+
+    Each pair serves the same checkpoint with capture on, once with the experts
+    kept MXFP4 on the device and once decoded at load by
+    `--json-model-override-args '{"mxfp4_resident_experts": false}'`. The
+    tokens, the logits of every step and every captured layer have to agree bit
+    for bit, in a float32 engine and a BF16 one, at `--ep-size` 1 and 2. Then
+    two mutants of the device decoder go into the served resident path, and
+    each has to break the agreement.
+
+    Each pair runs in a child process of its own. Every launch maps compiled
+    code into the process and keeps it, and a few capture launches on top of
+    the ones above pass the default `vm.max_map_count` of 65,530, where LLVM
+    aborts.
+    """
+    failures = 0
+    units = [(dtype, ep, "") for dtype in ("float32", "bfloat16") for ep in (1, 2)]
+    units += [("float32", 1, label) for label in RESIDENT_MUTANTS]
+    for dtype, ep, mutant in units:
+        done = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--resident-served", repo, ckpt, dtype,
+             str(ep), mutant],
+            capture_output=True, text=True, check=False,
+        )
+        report = [line for line in done.stdout.splitlines() if line.startswith("      ")]
+        for line in report:
+            print(line)
+        if done.returncode != 0 or not report:
+            print(done.stderr[-4000:])
+            print(f"      {dtype} ep_size {ep} {mutant or 'pair'}: FAILED, exit {done.returncode}")
+            failures += 1
+    return failures
+
+
+def resident_served_main(repo, ckpt, dtype, ep, mutant) -> int:
+    """One child of `check_resident_served`: a pair, or a mutant against its reference."""
+    import_patched(repo)
+    sources = {}
+    for rel in TOUCHED:
+        with open(os.path.join(repo, rel), encoding="utf-8") as fh:
+            sources[rel] = fh.read()
+    os.environ.update(ENGINE_ENV)
+    return 1 if _resident_served(sources, ckpt, dtype, int(ep), mutant) else 0
+
+
+def _resident_served(sources, ckpt, dtype, ep, mutant):
+    from sgl_jax.srt.eplb.expert_location import set_global_expert_location_metadata
+
+    def launch(key, overrides):
+        try:
+            return serve(ckpt, 1, ep, True, overrides=overrides, extra={"dtype": dtype})
+        except Exception as exc:  # noqa: BLE001 - the engine has to load and serve
+            print(f"      {key}: RAISED {type(exc).__name__}: {str(exc).splitlines()[0][:240]}")
+            return None
+        finally:
+            set_global_expert_location_metadata(None)
+            gc.collect()
+
+    loaded = launch("decoded at load", DECODE_AT_LOAD)
+    if loaded is None:
+        return 1
+    if not mutant:
+        resident = launch("resident", "{}")
+        if resident is None:
+            return 1
+        same, detail = identical(resident, loaded)
+        print(f"      {dtype} engine, ep_size {ep}, capture on: resident experts "
+              f"({resident['expert_dtype']}) against decoded at load "
+              f"({loaded['expert_dtype']}): {detail}")
+        good = same and resident["expert_dtype"] == "uint8" and loaded["expert_dtype"] == dtype
+        return 0 if good else 1
+
+    try:
+        restore = installed_decode_mutant(sources, RESIDENT_MUTANTS[mutant])
+    except LookupError as exc:
+        print(f"      control ({mutant}): MUTATION OPERATOR FOUND NO TARGET: {exc}")
+        return 1
+    try:
+        mutated = launch(mutant, "{}")
+    finally:
+        restore()
+    if mutated is None:
+        print(f"      control ({mutant}): caught, the launch raised")
+        return 0
+    same, detail = identical(mutated, loaded)
+    print(f"      control ({mutant}), {dtype} engine, ep_size {ep}: "
+          f"{'NOT DETECTED' if same else 'caught'}, {detail}")
+    return 1 if same else 0
 
 
 def one_rank_native_attention(sources, native_backend):
@@ -3964,6 +4490,155 @@ def check_loader_paths(workdir):
     return failures
 
 
+# ----------------------------------------------------------------------------
+# 12. the full-size model on one v5p-64, from shapes alone
+# ----------------------------------------------------------------------------
+
+# One v5p-64: 32 chips. What one chip offers the engine, and the share
+# --mem-fraction-static 0.8 reserves for weights and the KV and state pools.
+V5P64_CHIPS = 32
+V5P_USABLE_GIB = 95.73
+MEM_FRACTION_STATIC = 0.8
+GIB = 2**30
+
+
+def shard_bytes(leaf) -> int:
+    """Bytes one chip holds of an abstract array, from its shape, dtype and sharding."""
+    return int(np.prod(shard_shape(leaf), dtype=np.int64)) * jnp.dtype(leaf.dtype).itemsize
+
+
+def shard_shape(leaf) -> tuple[int, ...]:
+    """One chip's block of an abstract array, from its shape and sharding.
+
+    A dimension that doesn't split evenly rounds up, the way XLA pads it.
+    """
+    shape = list(leaf.shape)
+    sharding = getattr(leaf, "sharding", None)
+    spec = getattr(sharding, "spec", None) or P()
+    sizes = dict(sharding.mesh.shape) if sharding is not None else {}
+    for axis, names in enumerate(spec):
+        if names is None:
+            continue
+        names = names if isinstance(names, tuple) else (names,)
+        ways = int(np.prod([sizes[name] for name in names]))
+        shape[axis] = -(-shape[axis] // ways)
+    return tuple(shape)
+
+
+def full_size_weights(repo, tp_size, ep_size, resident):
+    """The full model under `nnx.eval_shape`, and one chip's bytes by group."""
+    from flax import nnx
+
+    KimiK3Config, kimi_k3 = import_patched(repo)
+    from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+
+    config = KimiK3Config(**copy.deepcopy(published_config()))
+    for name, value in dict(RUNTIME_FLAGS, ep_size=ep_size).items():
+        setattr(config, name, value)
+    config.mxfp4_resident_experts = resident
+    mesh = create_device_mesh(ici_parallelism=[1, tp_size], dcn_parallelism=[1, 1])
+    with jax.set_mesh(mesh):
+        model = nnx.eval_shape(lambda: kimi_k3.KimiK3ForCausalLM(config, mesh, jnp.bfloat16))
+    per_chip = {"routed experts": 0, "everything else": 0}
+    unsharded = 0
+    for path, leaf in jax.tree_util.tree_flatten_with_path(nnx.state(model, nnx.Param))[0]:
+        keys = [str(getattr(k, "key", getattr(k, "name", k))) for k in path]
+        group = "routed experts" if "experts" in keys and "shared_experts" not in keys else (
+            "everything else")
+        per_chip[group] += shard_bytes(leaf)
+        unsharded += getattr(leaf, "sharding", None) is None
+    moe = next(layer for layer in model.model.layers if layer.is_moe_layer)
+    return model, moe.block_sparse_moe.experts, per_chip, unsharded
+
+
+def check_full_size_memory(repo):
+    """Run the full-size memory report on 32 simulated devices, in a child process.
+
+    The rest of this file runs on 8 devices, and JAX fixes the count when it
+    starts, so the report runs in a child with 32.
+    """
+    env = dict(os.environ)
+    flags = " ".join(flag for flag in env.get("XLA_FLAGS", "").split()
+                     if not flag.startswith("--xla_force_host_platform_device_count"))
+    env["XLA_FLAGS"] = f"{flags} --xla_force_host_platform_device_count={V5P64_CHIPS}".strip()
+    done = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "--full-size-memory", repo],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    report = [line for line in done.stdout.splitlines() if line.startswith("      ")]
+    for line in report:
+        print(line)
+    if done.returncode != 0 or not report:
+        print(done.stdout[-4000:])
+        print(done.stderr[-4000:])
+        print("  [FAIL] the full-size model on one v5p-64")
+        return 1
+    print("  [PASS] the full-size model on one v5p-64")
+    return 0
+
+
+def full_size_memory_main(repo) -> int:
+    """One chip's weights and decode temporary for the full model at --tp-size 32.
+
+    Every figure comes from the shapes, dtypes and shardings `nnx.eval_shape`
+    builds, with no weights allocated. Two expert-parallel widths run on the 32
+    devices: `EPMoE` lays them out as `ep_size x (32 / ep_size)`.
+    """
+    import_patched(repo)
+    from sgl_jax.srt.utils.quantization.mxfp4 import dequantize_mxfp4_jax
+
+    if jax.device_count() != V5P64_CHIPS:
+        print(f"      need {V5P64_CHIPS} simulated devices, got {jax.device_count()}")
+        return 1
+    budget = V5P_USABLE_GIB * MEM_FRACTION_STATIC
+    failures = 0
+    print(f"      one v5p-64: {V5P64_CHIPS} chips at {V5P_USABLE_GIB} GiB usable, "
+          f"--mem-fraction-static {MEM_FRACTION_STATIC} reserves {budget:.2f} GiB a chip "
+          f"for weights and the KV and state pools")
+    totals = {}
+    for ep_size, resident in ((32, True), (8, True), (32, False)):
+        _, experts, per_chip, unsharded = full_size_weights(repo, V5P64_CHIPS, ep_size, resident)
+        total = sum(per_chip.values())
+        totals[ep_size, resident] = total
+        path = "MXFP4 resident" if resident else "decoded at load"
+        line = (f"      --tp-size 32 --dp-size 1 --ep-size {ep_size} ({experts.ep_size} x "
+                f"{experts.tp_size} EPMoE mesh, {experts.experts_per_device} experts a chip), "
+                f"{path}: routed experts {per_chip['routed experts'] / GIB:.2f} GiB + everything "
+                f"else {per_chip['everything else'] / GIB:.2f} GiB = {total / GIB:.2f} GiB a chip")
+        if unsharded:
+            line += f"; {unsharded} parameters carry no sharding and count whole"
+        print(line)
+        if not resident:
+            continue
+        # What one chip decodes for one layer, from the decoder's own output
+        # shapes: the local shard of each packed stack.
+        stacks = []
+        for name in ("wi_0", "wi_1", "wo"):
+            packed = getattr(experts, name).get_value()
+            scale = getattr(experts, f"{name}_mxfp4_scale").get_value()
+            local = jax.ShapeDtypeStruct(shard_shape(packed), jnp.uint8)
+            local_scale = jax.ShapeDtypeStruct(shard_shape(scale), jnp.uint8)
+            out = jax.eval_shape(
+                lambda p, q: dequantize_mxfp4_jax(p, q, dtype=jnp.bfloat16), local, local_scale)
+            stacks.append(out.size * jnp.dtype(out.dtype).itemsize)
+        one, three = max(stacks) / GIB, sum(stacks) / GIB
+        left = budget - total / GIB
+        print(f"        decoded temporary a chip, one MoE layer: {one:.2f} GiB for the one stack "
+              f"live at a time, {three:.2f} GiB if all three were; the static reservation leaves "
+              f"{left:.2f} GiB a chip for the KV and state pools, and "
+              f"{V5P_USABLE_GIB - budget:.2f} GiB sits outside it for activations")
+        if total / GIB >= budget or three >= V5P_USABLE_GIB - budget:
+            failures += 1
+    # Control: the decode-at-load path at the same mesh can't fit the chip, or
+    # the budget above couldn't tell the two paths apart.
+    loaded = totals[32, False] / GIB
+    print(f"      control (decoded at load, same mesh): {loaded:.2f} GiB a chip against "
+          f"{V5P_USABLE_GIB} GiB: {'refused' if loaded > V5P_USABLE_GIB else 'FITS'}")
+    if loaded <= V5P_USABLE_GIB:
+        failures += 1
+    return 1 if failures else 0
+
+
 def main():
     devices = jax.devices()
     if len(devices) < 8:
@@ -4003,6 +4678,7 @@ def main():
             ("9. the model the loader builds", lambda: check_loader(repo, sources, workdir)),
             ("10. the served model", lambda: check_served(repo, workdir, sources)),
             ("11. the loader's other paths", lambda: check_loader_paths(workdir)),
+            ("12. the full-size model on one v5p-64", lambda: check_full_size_memory(repo)),
         ]
         for title, run in checks:
             print(f"\n{title}")
@@ -4027,4 +4703,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 7 and sys.argv[1] == "--resident-served":
+        raise SystemExit(resident_served_main(*sys.argv[2:]))
+    if len(sys.argv) == 3 and sys.argv[1] == "--full-size-memory":
+        raise SystemExit(full_size_memory_main(sys.argv[2]))
     raise SystemExit(main())

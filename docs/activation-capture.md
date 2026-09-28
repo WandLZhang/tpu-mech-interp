@@ -30,7 +30,9 @@ uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cp
 ```
 
 `git -C` changes directory before it reads its arguments, so a patch path has to be absolute. A
-fresh VM has no git identity, and `git am` makes a commit.
+fresh VM has no git identity, and `git am` makes a commit. No recorded run typed the block. The
+measured runs took these steps through `bootstrap_tpu_vm.sh`, which also installs `tpu-info` and
+writes `~/.tpu_env`.
 
 | Pin | Why |
 |---|---|
@@ -62,15 +64,16 @@ One process holds the TPU at a time. After killing a run, wait for `/dev/vfio` t
 `rm /tmp/libtpu_lockfile`, or the next start reports the chip already in use.
 
 One VM can serve one model after another. `bootstrap_tpu_vm.sh --model NAME` builds a model from
-[`../upstream/models/`](../upstream/models/) into `~/w`: `gpt-oss`, `inkling`, `kimi-k3` or
-`nemotron3`. gpt-oss, Kimi K3 and Nemotron 3 all edit `layers/moe.py`, so one tree takes one of
-them. A rerun that asks for what `~/w` already holds keeps the tree: the same name, or no
-`--model` on a tree built without one. A run that asks for another model, or for none when `~/w`
-holds one, moves `~/w` aside to `~/w.stale-<time>` and builds the tree it asks for. Each run
-prints which it did. On fresh `v5p-8` VMs on 2026-09-25, bootstrap took 42.1 s and 40.0 s. Into a
-fresh tree on a VM that had bootstrapped once, it took 22 s. The first model's weights still fill
-`/dev/shm` when the second one fetches, and bootstrap lists them. Delete the ones you're done
-with, for example
+[`../upstream/models/`](../upstream/models/) into `~/w`: `deepseek-v41`, `glm5-next`, `gpt-oss`,
+`inkling`, `kimi-k3` or `nemotron3`. gpt-oss, Kimi K3 and Nemotron 3 all edit `layers/moe.py`,
+DeepSeek V4.1 collides with Kimi K3 and Nemotron 3, and GLM-5.3-Flash carries DeepSeek V4.1's
+runner hooks, so one tree takes one model. A rerun that asks for what `~/w` already holds keeps the
+tree: the same name, or no `--model` on a tree built without one. A run that asks for another
+model, or for none when `~/w` holds one, moves `~/w` aside to `~/w.stale-<time>` and builds the
+tree it asks for. Each run prints which it did. On fresh `v5p-8` VMs on 2026-09-25, bootstrap took
+42.1 s and 40.0 s. Into a fresh tree on a VM that had bootstrapped once, it took 22 s. The first
+model's weights still fill `/dev/shm` when the second one fetches, and bootstrap lists them. Delete
+the ones you're done with, for example
 `rm -rf /dev/shm/hf/hub/models--nvidia--NVIDIA-Nemotron-3-Super-120B-A12B-BF16`.
 
 A fetch you kill leaves `.incomplete` files in the cache. `huggingface_hub` resumes a dropped
@@ -173,10 +176,11 @@ through its `QWen3Model` backbone.
 `glm5_moe`, which serves GLM-5.3. [`../upstream/capture-hooks/`](../upstream/capture-hooks/)
 adds it to `kimi_linear`, `qwen3_5`, `deepseek_v3` and `glm4_moe`, one per architecture family.
 
-[`../upstream/models/`](../upstream/models/) writes the four models the engine has no file for,
-and hooks each one. `gpt-oss-model.patch` and `inkling-model.patch` carry the hook themselves.
-`kimi-k3-model.patch` and `nemotron3-model.patch` take `kimi-k3-capture-hook.patch` and
-`nemotron3-capture-hook.patch` on top. All four still need
+[`../upstream/models/`](../upstream/models/) writes the six models the engine has no file for,
+and hooks each one. `gpt-oss-model.patch`, `inkling-model.patch`, `deepseek-v41-model.patch` and
+`glm5-next-model.patch` carry the hook themselves. `kimi-k3-model.patch` and
+`nemotron3-model.patch` take `kimi-k3-capture-hook.patch` and `nemotron3-capture-hook.patch` on
+top. All six still need
 [`../upstream/sglang-jax-877.patch`](../upstream/sglang-jax-877.patch) for the flag and the
 reshape. On a model with no hook, the flag refuses to start.
 
@@ -189,6 +193,10 @@ prompt file and writes what [`../sae/train.py`](../sae/train.py) reads.
 python3 scripts/capture_activations.py --model-path MODEL --prompts prompts.txt \
     --out caps --layers 10,20,30 --shard-bytes 2147483648 --dtype float16 --tp-size 8
 ```
+
+Untested as written: no recorded run has taken this block. `MODEL` and `prompts.txt` are
+placeholders, and the measured captures ran through
+[`../scripts/measure_model.sh`](../scripts/measure_model.sh).
 
 `--tp-size` defaults to 1, where `check_capture.py`, `serve_throughput.py` and `compare.py`
 default to 8. Set it to the chips the host holds: 8 on a `v5litepod-8`, 4 on a `v5p-8`.
@@ -286,8 +294,9 @@ tree at eb061d8 with the three patches, and the engine needs the packages in
 
 Mark every layer and `aux_hidden_states` holds one full activation per layer, live until
 `logits_processor.py` runs `jnp.concat(aux_hidden_states, axis=-1)`. The concat allocates the
-same bytes a second time. The engine's default `chunked_prefill_size` is 4,096 tokens, and the
-table uses it. `capture_activations.py` pins 1,024, which puts the last two columns at a quarter.
+same bytes a second time. The table computes each figure from the layer count and width, at the
+engine's default `chunked_prefill_size` of 4,096 tokens. `capture_activations.py` pins 1,024, which
+puts the last two columns at a quarter.
 
 | Model | Layers × dim | Per token | Live at 4,096 tokens | Peak, with the concat |
 |---|---|---|---|---|
@@ -321,14 +330,15 @@ first:
 | Gemma 4 26B-A4B | 1 × 2,816 | 5,632 | 9,535.1 and 9,553.6 | 53.7 and 53.8 | 2026-09-25, with the layer filter |
 | gpt-oss-120b | 1 × 2,880 | 5,760 | 5,859.4 and 5,870.3 | 33.8 and 33.8 | 2026-09-25, with the layer filter |
 | Qwen3-8B | 1 × 4,096 | 8,192 | 16,210.5 | 132.8 | 2026-09-25, with the layer filter, `PROMPTS=1000` |
-| Nemotron 3 Super | 1 × 4,096 | 8,192 | 3,299.4 and 3,321.7 | 27.0 and 27.2 | 2026-09-25, with the layer filter |
+| Nemotron 3 Super | 1 × 4,096 | 8,192 | 2,979.4 and 2,999.0 | 24.4 and 24.6 | 2026-09-28, with the layer filter, after the patch's float32 shard sums |
 | Gemma 4 31B | 1 × 5,376 | 10,752 | 5,469.8 and 5,477.7 | 58.8 and 58.9 | 2026-09-25, with the layer filter |
 
 The capture script counts wire bytes as returned elements times the serving dtype's width, which
 is 2 for the BF16 every run above served, so each figure is `slots × dim × 2` by construction. It
 shows which slots came back for every token, and isn't a reading of the link. Every run above
 passed `--return-hidden-states-layers` and moved one slot. The Gemma 4 and Qwen3-8B runs served
-on a `v5litepod-8`, and gpt-oss-120b and Nemotron 3 Super on a `v5p-8`. Each rate runs from the
+on a `v5litepod-8` Spot slice in us-south1-a, and gpt-oss-120b and Nemotron 3 Super on a `v5p-8`
+Spot slice in europe-west4-b. The `v5p-64` runs are on their model pages. Each rate runs from the
 third progress line to the last one before the final shard closes. The model pages give each
 window, and Qwen3-8B's is in [The whole chain, measured](#the-whole-chain-measured).
 
@@ -351,8 +361,8 @@ reference, and at every layer the capture has to sit at least three times closer
 `test/srt/test_hidden_states_alignment.py` in the engine patch compares every layer too, but gates
 on mean absolute error alone, which hides a systematic shift.
 
-Measured on Gemma 4 26B-A4B, `v5litepod-8`, `tp_size=8`, on the patch as shipped, in the Run-it
-chain on 2026-09-25 with the layer filter:
+Measured on Gemma 4 26B-A4B, `v5litepod-8` Spot slice in us-south1-a, `tp_size=8`, on the patch as
+shipped, in the Run-it chain on 2026-09-25 with the layer filter:
 
 | Prompt | Tokens | Worst ratio to BF16 | Control | Diverged tokens, capture / BF16 |
 |---|---|---|---|---|
@@ -561,6 +571,9 @@ same counters out of `libtpu` from its own process, so it runs alongside the job
 uv pip install tpu-info
 python3 scripts/peak_hbm.py --seconds 600 --out peak_hbm.json    # in a second shell
 ```
+
+Untested as written: `measure_model.sh` runs the same sampler with `--seconds 14400 --every 2`
+beside every measured engine run.
 
 The runtime keeps no high-water mark, so this is the peak of what it sampled. Sample often enough
 to catch the load and report the sample count beside the number.

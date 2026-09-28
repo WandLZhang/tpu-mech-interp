@@ -2,8 +2,16 @@
 
 `deepseek-ai/DeepSeek-V4.1-Flash`
 
-**Status: not runnable.** No JAX implementation exists, and nothing here serves it. This page is
-a design.
+**Status: measured on TPU**, `v5p-64`, 2026-09-27, with the layer filter.
+[Measured on a v5p-64](#measured-on-a-v5p-64) has one capture check, the model's first run on a
+chip, and one measure run, on a Spot slice in us-east5-a.
+[`upstream/models/deepseek-v41-model.patch`](../upstream/models/deepseek-v41-model.patch) adds the
+text backbone to `sglang-jax` with per-layer capture: 40 layers, the four residual copies, the
+window and compressed attention, the indexer and its candidate pool, the experts, and both Engram
+tables. It serves a tiny checkpoint in the published format through the real engine on CPU, and
+the published config fits one `v5p-64` chip at 52.31 GiB of 76.58 GiB by its shapes, with eight
+capture requests. The capture reference runs DeepSeek's own `inference/model.py` on CPU. The
+DSpark draft blocks and the vision tower aren't ported.
 
 | | |
 |---|---|
@@ -25,30 +33,42 @@ port needs. The module builds no layers.
 
 ## Serve
 
-Engine: none. `sglang-jax` has no `deepseek_v41` model
-([survey](../upstream/capture-hook-survey.csv)).
+Engine: `sglang-jax` at `eb061d8` with `sglang-jax-877.patch`, the steering patches and
+[`deepseek-v41-model.patch`](../upstream/models/deepseek-v41-model.patch). Start it with
+`--disable-radix-cache`.
+
+```bash
+bash scripts/bootstrap_tpu_vm.sh --model deepseek-v41
+```
+
+The runs below took this tree through the `deepseek-v41` row of `scripts/multihost_run.sh`, on a
+`v5p-64` in us-east5-a on 2026-09-27. The row also applies `multihost-hidden-states.patch`.
 
 Slice: `v5p-64`, 32 chips, 3,040 GiB. The backbone at BF16 is 1,028 GiB. Keep the Engram tables in
 the FP8 the checkpoint ships and dequantize a row on lookup, the way `ParallelEngramEmbedding` does
 in the reference runtime, and they add 189 GiB rather than 366 GiB. A lookup is a gather, so the
-stored dtype costs no matmul throughput. That's 1,217 GiB of weights, 38.0 GiB a chip, and 57 GiB a
-chip left for KV and activations.
+stored dtype costs no matmul throughput. That's 1,217 GiB of weights, 38.0 GiB a chip if every
+weight shards, and 57 GiB a chip left for KV and activations. The port replicates 14.48 GiB of
+weights on every chip and holds 52.09 GiB a chip, which [What the port holds](#what-the-port-holds)
+breaks down.
 
 The [measured `v5p-8` runs](nemotron3-super.md#measured) keep weights in `/dev/shm`, which
 defaults to half the host's RAM. That host has 440 GB of RAM, less than this 475 GiB checkpoint,
-so the weights can't live there. Each of the 8 hosts in a `v5p-64` reads from the checkpoint. No
-run here has loaded a checkpoint this size.
+so the weights can't live there. Each of the 8 hosts in a `v5p-64` reads it from a GCS bucket
+through gcsfuse, as [Across hosts](../README.md#across-hosts) sets up.
 
-A port would confirm the chip count first, on all 8 hosts at once, as
-[gpt-oss-120b](gpt-oss-120b.md#scaling-out-to-v5p-64) describes. Untested: no run here has used a
-`v5p-64`. It reports 32.
+Confirm the chip count first, on all 8 hosts at once, as
+[gpt-oss-120b](gpt-oss-120b.md#scaling-out-to-v5p-64) describes. It reported 32 on every host on
+2026-09-27; `scripts/multihost_setup.sh` runs this check.
 
 ```bash
 python3 -c "import jax; jax.distributed.initialize(); print(jax.device_count())"
 ```
 
-The KV cache is small enough to stop being the constraint. 128 sequences at the full 1M context
-cost 112 GiB, 4% of the slice.
+In the packed formats the model card assumes, the KV cache is small enough to stop being the
+constraint. 128 sequences at the full 1M context cost 112 GiB, 4% of the slice. The port stores the
+cache unpacked in a pool replicated on every chip, at 3.2 GiB a sequence at that context
+([What the port holds](#what-the-port-holds)).
 
 Seven pieces of the engine decide what the port has to change, and each one has a specific site.
 
@@ -70,6 +90,38 @@ about `confidence_head.` keys it ignores. `models/dflash.py` builds its `fc` at
 `mtp.0.main_proj.weight`. `speculative/multi_layer_draft_worker.py` runs one model runner per
 `num_nextn_predict_layers`, so the three blocks arrive as three draft models with their own KV
 pools.
+
+## What the port holds
+
+[`upstream/models/README.md`](../upstream/models/README.md#deepseek-v41-modelpatch) has the file
+list and the test. What it decided, against the table above:
+
+| What the model needs | What the port does |
+|---|---|
+| A registry entry | `DeepseekV41ForCausalLM`, text only. The loader skips `mtp.*`, `vision.*`, `aligner.*`, `image_*` and `ffn.gate.bias_vl` |
+| A key map with no top-level prefix | Its own safetensors reader, keyed on the checkpoint's root names |
+| Four shared KV caches at two compression ratios | One per-request state pool: each owner's latents and index keys, each layer's window ring, each ratio-2 compressor's open group |
+| FP4 latents with a block scale | Stored at the compute dtype after the FP4 round trip, as the reference runtime stores them. 205 MiB a slot at a context of 65,536 |
+| An indexer map with three types | Each layer binds to its nearest KV owner and index source; the candidate source and the layers after it follow `candidate_source_layer_id` |
+| The Engram table read at FP8 | E4M3 rows with E8M0 exponents, split by row over all 32 chips, gathered locally with a mask and summed with one `psum`, widened a row at a time. The hash runs on device in 16-bit limbs |
+| A paged KV pool it doesn't read | One layer, and at most requests times context tokens |
+| SWA Bounded Replay | The window ring persists in the pool |
+
+The reference runtime has a bug the port doesn't copy. `Indexer.forward` publishes an owner's
+index keys only on a step where that owner closed a group, so on a decode step that closes no
+ratio-2 group, layers 2, 8 and 14 score against layer 20's keys from the step before. The port
+reads each owner's own keys.
+
+On one `v5p-64` at `--tp-size 32 --dp-size 1 --ep-size 32`, a chip holds 31.64 GiB of routed
+experts, 5.90 GiB of Engram rows, 14.48 GiB of replicated weights and 0.08 GiB of the head, 52.09
+GiB, by the shapes `nnx.eval_shape` builds. Eight capture requests at `--context-length 4096` add
+0.21 GiB. That leaves 24 GiB of the 76.58 GiB reservation. Attention runs replicated on every
+chip, which the fit allows and which spends compute a TP split would save.
+
+Two pieces stay for long context. The indexer scores every compressed position of a request per
+token in XLA, which is cheap at a 1,323-token capture prompt; at long context it needs the streamed
+top-k kernel `kernels/dsa` carries. The state pool is replicated on every chip and holds no prefix:
+a slot costs 3.2 GiB at the full 1,048,576-token context.
 
 ## Layer plan
 
@@ -301,10 +353,11 @@ the Hyper-Connections normalization.
 
 ## Capture
 
-No model, and no hook to hang on one. Per-layer capture needs the JAX model written first, then
-[`upstream/sglang-jax-877.patch`](../upstream/sglang-jax-877.patch) and a `layers_to_capture` hook.
+The port takes the ordinary hook: an unrolled loop over the 40 blocks. Slot `k` holds the
+collapsed attention input of layer `k`: the four copies after any Engram lookup, collapsed with
+the incoming `pre` mix, before `attn_norm`. That's 40 slots at 5,120.
 
-The scan and the ordinary hook don't compose, so pick one before writing the model.
+The two stack forms trade as follows.
 
 The ordinary hook is the None-residual append in
 [`upstream/glm5-capture-hook.patch`](../upstream/glm5-capture-hook.patch). It needs an unrolled
@@ -332,6 +385,30 @@ The collapsed input is the tensor an SAE wants, because it's what the sublayer r
 head takes a different collapse of the same stream, the plain mean over the four copies, at layers
 37, 38 and 39.
 
+### The capture reference
+
+`transformers` has no V4.1 class, so `scripts/check_capture.py --deepseek-inference` runs the
+checkpoint's own `inference/model.py` on the host CPU, with CPU stand-ins for its tilelang
+kernels, and hooks each layer's `attn_norm` input, the slot the engine captures. Blocks stream one
+at a time from the safetensors with `--offload-folder`; the Engram tables read their rows from the
+memory map.
+
+The dry run of the first 3 layers on the real checkpoint (`--reference-layers 3`, a 426-token and
+a 1,306-token prompt, float32 and the BF16 floor) took 1 minute 34 seconds on a `c4-highcpu-96` in
+`us-east5-b`, at a peak RSS of 114.9 GB. The BF16 floor's median per-token error was 0.6%, 1.2% and
+2.2% at layers 0, 1 and 2.
+
+The full reference, all 40 layers on a 441-token prompt and a 1,323-token joined prompt, ran on a
+`c4-highmem-96` in `us-east5-b` between 2026-09-26 17:40Z and 2026-09-27 00:56Z, beside another
+model's reference, so its own wall clock wasn't recorded. The check
+[below](#measured-on-a-v5p-64) gates against it.
+
+```bash
+python3 scripts/check_capture.py --model-path /mnt/data/deepseek-v4.1-flash --deepseek-inference \
+  --offload-folder /mnt/data/off --prompts-file prompts-deepseek-v41.jsonl --num-prompts 1 \
+  --reference-only ref-deepseek-v41.npz
+```
+
 ## Notes
 
 `scan/test_deepseek_v4_layers.py` checks the plan on CPU. It needs no checkpoint download.
@@ -353,8 +430,54 @@ the fault. Six more make the parser return a plan that's wrong but well formed, 
 wrong way, then confirm the checkpoint comparison, the prefix comparison, the run-key count and the
 placement arithmetic catch them, so no check is grading itself.
 
-A full implementation needs nine components the plan sizes but doesn't build: the Hyper-Connections
-residual stream with its Sinkhorn mixing, the two-level sparse indexer, the FP4 KV path, the Engram
-gather and its gate, the `sqrtsoftplus` router with its dual bias, the LoRA-factored query and the
-grouped output projection, the per-head attention sink, the ViT and its projector, and the DSpark
-draft loop with its Markov and confidence heads.
+The port builds seven of the nine components this plan sizes: the Hyper-Connections residual
+stream with its Sinkhorn mixing, the two-level sparse indexer, the Engram gather and its gate, the
+`sqrtsoftplus` router, the LoRA-factored query and the grouped output projection, and the per-head
+attention sink. The FP4 KV path stores values at the compute dtype, and the router reads one bias,
+the text one. The ViT with its projector and the DSpark draft loop with its Markov and confidence
+heads aren't built.
+
+`upstream/models/test_deepseek_v41_model.py` checks the port on CPU against DeepSeek's own
+runtime. See [`upstream/models/README.md`](../upstream/models/README.md#deepseek-v41-modelpatch).
+
+## Measured on a v5p-64
+
+A `v5p-64` Spot slice (32 chips, 8 hosts) in us-east5-a, 2026-09-27. sglang-jax eb061d8 with
+`sglang-jax-877.patch`, the steering patches, `multihost-hidden-states.patch` and
+`models/deepseek-v41-model.patch`, built by the `deepseek-v41` row of `scripts/multihost_run.sh`
+(engine args `disable_radix_cache=True ep_size=32 context_length=4096`, `mem_fraction_static=0.8`,
+`--tp-size 32`). Every host read the weights from a GCS bucket in us-east5 through gcsfuse.
+
+**Capture check**, `scripts/check_capture.py` against the float32 CPU reference
+`refs/ref-deepseek-v41.npz` (built with `--deepseek-inference` from the checkpoint's own
+`inference/model.py`) with the BF16 floor gate, 15:47 to 16:21Z, first run on a chip:
+
+| Prompt | Layers | Result | Worst ratio to the BF16 floor | Worst Pearson | Control |
+|---|---|---|---|---|---|
+| 441 tokens | 40 | all pass | 1.76 (layer 1) | 0.9946 (layer 17) | 4.92x, detected |
+| 1,323 tokens, split across prefill passes | 40 | all pass | 1.93 (layer 3) | 0.9941 (layer 17) | 5.17x, detected |
+
+Engine capture shapes `(441, 40, 5120)` and `(1323, 40, 5120)`.
+
+**Throughput and HBM**, `scripts/measure_model.sh` through `scripts/multihost_run.sh`
+(`PROMPTS=1000`, 440-token prompts, capture slot 20), 17:25 to 18:33Z:
+
+| | Tokens/s | Window | Peak HBM per chip (host 0's 4 chips) |
+|---|---|---|---|
+| Capture off | 3,414.5 | 30 batches of 8, first 2 discarded | 72.19 of 95.73 GiB (926 samples) |
+| Capture on, slot 20 | 2,570.2 | steady window 185 to 344 s, 408,320 tokens | 72.36 of 95.73 GiB (1,065 samples) |
+
+Capture costs 1.33x (3,414.5 over 2,570.2), and the wire carries 10,240 bytes a token (one
+5,120-wide BF16 slot) at 26.3 MB/s.
+
+To reproduce, stage the checkpoint and its reference as [Across hosts](../README.md#across-hosts)
+describes, with the checkpoint under `deepseek-v4.1-flash/` in the bucket, then run from the repo
+root:
+
+```bash
+BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE deepseek-v41 setup check measure
+```
+
+Notes: nobody has replayed that block as written from a clean start. The runs above came from the
+same script and row.
+

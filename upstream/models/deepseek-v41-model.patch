@@ -1,0 +1,1771 @@
+ python/sgl_jax/srt/configs/deepseek_v41.py         |  118 ++
+ python/sgl_jax/srt/hf_transformers_utils.py        |    2 +
+ .../srt/mem_cache/deepseek_v41_state_pool.py       |   76 +
+ .../model_executor/model_runner_kv_cache_mixin.py  |   20 +
+ python/sgl_jax/srt/models/deepseek_v41.py          | 1489 ++++++++++++++++++++
+ 5 files changed, 1705 insertions(+)
+
+diff --git a/python/sgl_jax/srt/configs/deepseek_v41.py b/python/sgl_jax/srt/configs/deepseek_v41.py
+new file mode 100644
+index 00000000..a5bd83ab
+--- /dev/null
++++ b/python/sgl_jax/srt/configs/deepseek_v41.py
+@@ -0,0 +1,118 @@
++"""Config for DeepSeek V4.1-Flash (`model_type: deepseek_v41`).
++
++The published `config.json` nests the language model under `text_config` and ships no
++configuration module, so `transformers` can't build it. This class flattens `text_config` onto
++itself, so `get_hf_text_config` returns the config itself and every text field sits at the top.
++
++It also moves the checkpoint's `quantization_config` to `checkpoint_quantization_config`. The
++engine reads `quantization_config.quant_method: fp8` as a request to serve FP8 linears, while this
++model widens its FP8 and FP4 weights to the serving dtype in its own loader, and keeps the Engram
++tables in FP8.
++"""
++
++from __future__ import annotations
++
++from transformers import PretrainedConfig
++
++# Published name -> the name the reference runtime (`inference/model.py` `ModelArgs`) uses. The
++# model reads the reference names, so a tiny test config and the published file land on one set.
++_TEXT_ALIASES = {
++    "hidden_size": "dim",
++    "moe_intermediate_size": "moe_inter_dim",
++    "num_hidden_layers": "n_layers",
++    "num_attention_heads": "n_heads",
++    "qk_rope_head_dim": "rope_head_dim",
++    "rms_norm_eps": "norm_eps",
++    "num_experts_per_tok": "n_activated_experts",
++    "scoring_func": "score_func",
++    "routed_scaling_factor": "route_scale",
++    "sliding_window": "window_size",
++    "kv_source_layer_ids": "kv_source_layers",
++    "index_source_layer_ids": "index_source_layers",
++    "candidate_source_layer_id": "candidate_source_layer",
++    "engram_pad_token_id": "engram_pad_id",
++    "num_nextn_predict_layers": "n_mtp_layers",
++    "dspark_num_experts_per_tok": "dspark_n_activated_experts",
++}
++
++# The reference defaults for fields a config may leave out.
++_DEFAULTS = {
++    "n_shared_experts": 1,
++    "gate_temp": 1.0,
++    "norm_topk_prob": True,
++    "swiglu_limit": 0.0,
++    "o_groups": 8,
++    "compress_rope_theta": 40000.0,
++    "rope_factor": 40.0,
++    "beta_fast": 32,
++    "beta_slow": 1,
++    "original_seq_len": 0,
++    "candidate_source_layer": -1,
++    "candidate_topk_blocks": 0,
++    "candidate_block_size": 0,
++    "hc_mult": 4,
++    "hc_sinkhorn_iters": 20,
++    "hc_eps": 1e-6,
++    "engram_layer_ids": [],
++    "engram_num_embeddings": [],
++    "engram_max_ngram_size": 1,
++    "engram_vocab_size": 0,
++    "engram_n_heads": 0,
++    "engram_head_dim": 0,
++    "engram_pad_id": 2,
++    "engram_compressed_vocab_size": 0,
++    "n_mtp_layers": 0,
++}
++
++
++class DeepseekV41Config(PretrainedConfig):
++    model_type = "deepseek_v41"
++
++    def __init__(self, text_config=None, vision_config=None, **kwargs):
++        quant = kwargs.pop("quantization_config", None)
++        if quant is not None:
++            kwargs.setdefault("checkpoint_quantization_config", quant)
++        text = dict(text_config or {})
++        text.pop("model_type", None)
++        text.update({k: v for k, v in kwargs.items() if k not in ("architectures",)})
++        # transformers 5 standardizes `rope_scaling` into `rope_parameters` inside
++        # PretrainedConfig.__init__. The model reads the four YaRN fields below instead, so the
++        # published dict stays aside under another name.
++        rope = text.pop("rope_scaling", None) or {}
++        text["yarn_rope_scaling"] = rope
++        if rope:
++            text.setdefault("rope_factor", rope.get("factor", 40.0))
++            text.setdefault("beta_fast", rope.get("beta_fast", 32))
++            text.setdefault("beta_slow", rope.get("beta_slow", 1))
++            text.setdefault("original_seq_len", rope.get("original_max_position_embeddings", 0))
++        for published, reference in _TEXT_ALIASES.items():
++            if published in text and reference not in text:
++                text[reference] = text[published]
++            if reference in text and published not in text:
++                text[published] = text[reference]
++        for key, value in _DEFAULTS.items():
++            text.setdefault(key, value)
++        # ModelConfig reads `sliding_window` and then splits the paged KV pool into full and SWA
++        # layers. This model keeps its window ring in its own state pool, so the published name
++        # stays out and the reference name `window_size` carries it.
++        text.pop("sliding_window", None)
++        text.setdefault("num_key_value_heads", 1)
++        text.setdefault("tie_word_embeddings", False)
++        self.vision_config = vision_config
++        for key in ("architectures",):
++            if key in kwargs:
++                text[key] = kwargs[key]
++        super().__init__(**text)
++        # PretrainedConfig drops unknown keys it can't set only on error; set them all again so
++        # every reference name is an attribute.
++        for key, value in text.items():
++            if not hasattr(self, key):
++                setattr(self, key, value)
++        for key in ("compress_ratios", "kv_source_layers", "index_source_layers",
++                    "engram_layer_ids", "engram_num_embeddings", "dspark_target_layer_ids"):
++            if getattr(self, key, None) is not None:
++                setattr(self, key, [int(v) for v in getattr(self, key)])
++        self.head_dim = int(text.get("head_dim", 512))
++        # The engine sizes nothing from these for this model, but ModelConfig reads them.
++        self.v_head_dim = self.head_dim
++        self.max_position_embeddings = int(text.get("max_position_embeddings", 1048576))
+diff --git a/python/sgl_jax/srt/hf_transformers_utils.py b/python/sgl_jax/srt/hf_transformers_utils.py
+index 51805fa2..e034c93a 100644
+--- a/python/sgl_jax/srt/hf_transformers_utils.py
++++ b/python/sgl_jax/srt/hf_transformers_utils.py
+@@ -21,6 +21,7 @@ from transformers import (
+ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+ 
+ from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
++from sgl_jax.srt.configs.deepseek_v41 import DeepseekV41Config
+ from sgl_jax.srt.configs.gemma4 import Gemma4Config
+ from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
+ from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
+@@ -35,6 +36,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+     cls.model_type: cls
+     for cls in [
+         BailingHybridConfig,
++        DeepseekV41Config,
+         KimiLinearConfig,
+         Qwen3_5HybridConfig,
+         Qwen3_5DenseConfig,
+diff --git a/python/sgl_jax/srt/mem_cache/deepseek_v41_state_pool.py b/python/sgl_jax/srt/mem_cache/deepseek_v41_state_pool.py
+new file mode 100644
+index 00000000..443e1363
+--- /dev/null
++++ b/python/sgl_jax/srt/mem_cache/deepseek_v41_state_pool.py
+@@ -0,0 +1,76 @@
++"""Per-request state of DeepSeek V4.1-Flash.
++
++One row per request slot, plus the dummy slot 0 that padding tokens write to. Row `i + 1`
++belongs to the request at `req_pool_indices == i`. What a row holds, per
++`models/deepseek_v41.state_shapes`:
++
++- `window[l]`: the last `window_size` raw latents of layer `l`, as a ring.
++- `ckv[o]`, `ik[o]`: the compressed latents and index keys of KV owner `o`, one row per closed
++  group, `context_len // ratio` rows.
++- `tail_kv[o]`, `tail_score[o]`: the members of a ratio-2 owner's group that hasn't closed.
++- `engram_hist[0]`: the last `engram_max_ngram_size - 1` compressed token ids.
++
++A request reads only rows it wrote itself: the model masks every read by the request's own
++prefix length, so a slot needs no reset between requests. Nothing here is paged and nothing is
++shared between requests, so the model runs with the radix cache off.
++"""
++
++from __future__ import annotations
++
++import jax
++import jax.numpy as jnp
++from jax.sharding import NamedSharding
++from jax.sharding import PartitionSpec as P
++from jax.tree_util import register_pytree_node_class
++
++
++@register_pytree_node_class
++class DeepseekV41StatePool:
++    def __init__(self, state: dict, num_slots: int, mesh=None):
++        self.state = state
++        self.num_slots = num_slots
++        self.mesh = mesh
++
++    @classmethod
++    def create(cls, cfg, max_num_reqs: int, context_len: int, dtype, mesh):
++        from sgl_jax.srt.models.deepseek_v41 import state_shapes
++
++        num_slots = max_num_reqs + 1
++        sharding = NamedSharding(mesh, P()) if mesh is not None else None
++        shapes = state_shapes(cfg, num_slots, context_len, dtype)
++        state = {}
++        with jax.set_mesh(mesh) if mesh is not None else _null():
++            for key, entries in shapes.items():
++                state[key] = [jnp.zeros(shape, dt, device=sharding) for shape, dt in entries]
++        return cls(state, num_slots, mesh)
++
++    def size_bytes(self) -> int:
++        return sum(a.size * a.dtype.itemsize for v in self.state.values() for a in v)
++
++    def replace_buffer(self, new_state) -> None:
++        if set(new_state) != set(self.state):
++            raise ValueError(f"state keys {sorted(new_state)} != {sorted(self.state)}")
++        self.state = {k: list(v) for k, v in new_state.items()}
++
++    def tree_flatten(self):
++        keys = sorted(self.state)
++        lens = tuple(len(self.state[k]) for k in keys)
++        leaves = [a for k in keys for a in self.state[k]]
++        return leaves, (tuple(keys), lens, self.num_slots, self.mesh)
++
++    @classmethod
++    def tree_unflatten(cls, aux, leaves):
++        keys, lens, num_slots, mesh = aux
++        state, i = {}, 0
++        for k, n in zip(keys, lens):
++            state[k] = list(leaves[i : i + n])
++            i += n
++        return cls(state, num_slots, mesh)
++
++
++class _null:
++    def __enter__(self):
++        return None
++
++    def __exit__(self, *exc):
++        return False
+diff --git a/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py
+index f44322a8..65cc118b 100644
+--- a/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -781,6 +781,16 @@ class ModelRunnerKVCacheMixin:
+         else:
+             self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)
+ 
++        # A model that keeps state outside the paged KV pool builds its own pools here, and its
++        # forward returns their new buffers under the same names. DeepSeek V4.1 keeps its window
++        # rings, compressed caches and Engram history per request.
++        build_extra = getattr(type(getattr(self, "model", None)), "build_extra_memory_pools", None)
++        if build_extra is not None:
++            extra = build_extra(
++                self.model_config, self.server_args, max_num_reqs, self.mesh, self.dtype
++            )
++            self.memory_pools = MemoryPools(**self.memory_pools._pools, **extra)
++
+         # --- Allocator ---
+         if self.token_to_kv_pool_allocator is None:
+             if self.is_hybrid:
+@@ -852,6 +862,13 @@ class ModelRunnerKVCacheMixin:
+                 self.server_args.max_num_reqs = max_num_reqs
+                 self.server_args.draft_runner_cache_size = self.max_total_num_tokens
+ 
++        # A model that keeps its caches in its own pools caps the paged pool: the scheduler still
++        # hands each token a slot there, and nothing reads it.
++        cap_fn = getattr(type(getattr(self, "model", None)), "paged_kv_token_cap", None)
++        if cap_fn is not None:
++            cap = int(cap_fn(self.server_args, self.model_config, max_num_reqs))
++            max_total_tokens = cap if max_total_tokens is None else min(max_total_tokens, cap)
++
+         # 6. Apply constraints (CI, user cap, page align, dp).
+         self.max_total_num_tokens = self._apply_token_constraints(
+             self.max_total_num_tokens,
+@@ -925,4 +942,7 @@ class ModelRunnerKVCacheMixin:
+         cfg = self.linear_recurrent_config
+         if cfg is not None:
+             return len(cfg.full_attention_layer_ids)
++        layers = getattr(type(getattr(self, "model", None)), "paged_kv_layers", None)
++        if layers is not None:
++            return int(layers)
+         return self.adjust_layer_num()
+diff --git a/python/sgl_jax/srt/models/deepseek_v41.py b/python/sgl_jax/srt/models/deepseek_v41.py
+new file mode 100644
+index 00000000..1e0f8db9
+--- /dev/null
++++ b/python/sgl_jax/srt/models/deepseek_v41.py
+@@ -0,0 +1,1489 @@
++"""DeepSeek V4.1-Flash text backbone (`DeepseekV41ForCausalLM`).
++
++Ported from the reference runtime the checkpoint repo ships, `inference/model.py` and
++`inference/engram.py` at revision dba1be0a40aa45a94ad051997016db3960a90277. Names follow it:
++`Attention`, `Compressor`, `Indexer`, `Engram`, `Gate`, `Block`, `hc_pre`, `hc_post`.
++
++What the model is, in the terms this file uses:
++
++- The residual stream is `hc_mult` (4) parallel copies. Each block collapses them into the
++  attention input with the `pre` mix the previous sublayer made, and into the feed-forward input
++  with the one its own attention made. `hc_post` expands each sublayer's output back to four
++  copies and mixes the residual in through a Sinkhorn-normalized matrix.
++- Every layer attends over a sliding window of 128 raw latents. Layers with a compression ratio
++  `r > 0` also attend over `index_topk` compressed latents. A KV owner (`kv_source_layers`) pools
++  `r` tokens into one latent and writes it, and the index keys, to a cache the layers after it
++  read. An index source (`index_source_layers`) scores the compressed positions and publishes its
++  top-k, which the layers after it reuse. The candidate source keeps the best blocks of
++  compressed positions, and the index sources after it score only inside them.
++- One 512-wide latent serves as key and value for all query heads. Rotation turns the last 64
++  channels and the attention output is rotated back before the output projection.
++- Two layers add an Engram lookup to the stream before the block: n-gram hashes of the token ids
++  pick rows from an FP8 table, and a per-copy gate decides how much of each row goes in.
++
++The reference rounds cached values to FP8 and FP4 and stores them back in the compute dtype. This
++file does the same round trips, so its activations match the reference's.
++
++State. Every cache the model reads lives in `DeepseekV41StatePool`, one row per request slot:
++the window ring of each layer, the compressed latents and index keys of each KV owner, the tail of
++each ratio-2 compressor's open group, and the last `engram_max_ngram_size - 1` compressed token ids
++for the Engram hash. Slot 0 is a dummy that padding tokens write to. The pool isn't paged and holds
++no prefix, so this model runs without prefix caching.
++
++Capture. Slot `k` of `layers_to_capture` holds the collapsed attention input of layer `k`: the
++four copies after any Engram lookup, collapsed with the incoming `pre` mix, before `attn_norm`.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import glob
++import json
++import logging
++import math
++import os
++import struct
++from functools import partial
++
++import jax
++import jax.numpy as jnp
++import numpy as np
++from flax import nnx
++from jax.sharding import NamedSharding
++from jax.sharding import PartitionSpec as P
++
++from sgl_jax.srt.layers import moe as _moe
++from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
++from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
++from sgl_jax.srt.layers.moe import EPMoE
++
++logger = logging.getLogger(__name__)
++
++FP8_MAX = 448.0
++FP4_MAX = 6.0
++E2M1_VALUES = np.array(
++    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
++    dtype=np.float32,
++)
++
++
++# --------------------------------------------------------------------------------------------
++# Layer plan
++# --------------------------------------------------------------------------------------------
++
++
++@dataclasses.dataclass(frozen=True)
++class LayerRole:
++    """What one backbone layer reads and writes. All fields are static."""
++
++    layer_id: int
++    ratio: int  # 0: window only; r: compressed r-to-1
++    kv_owner: int  # index into kv_source_layers of the cache this layer reads, -1 if none
++    owns_kv: bool  # this layer runs the compressor and writes the cache
++    index_source: int  # layer id whose top-k this layer uses, -1 if none
++    owns_index: bool  # this layer runs its own indexer
++    is_candidate_source: bool
++    uses_candidates: bool
++    engram_slot: int  # index into engram_layer_ids, -1 if none
++
++
++def layer_roles(cfg) -> list[LayerRole]:
++    """Bind each backbone layer to its KV owner and its index source.
++
++    A consumer binds to the nearest source at or before it, because the reference runtime hands
++    shared state down the stack in layer order. Raises when a consumer and its source differ in
++    ratio, or when an index source has no KV owner to read keys from.
++    """
++    n_layers = int(cfg.n_layers)
++    ratios = [int(r) for r in cfg.compress_ratios[:n_layers]]
++    kv_sources = [int(i) for i in cfg.kv_source_layers]
++    index_sources = [int(i) for i in cfg.index_source_layers]
++    cand = int(getattr(cfg, "candidate_source_layer", -1))
++    engram_ids = [int(i) for i in getattr(cfg, "engram_layer_ids", [])]
++    if len(cfg.compress_ratios) < n_layers:
++        raise ValueError(f"compress_ratios holds {len(cfg.compress_ratios)} entries for {n_layers} layers")
++    for s in kv_sources:
++        if s not in index_sources:
++            raise ValueError(f"kv source {s} isn't an index source")
++    roles = []
++    for layer_id, ratio in enumerate(ratios):
++        owner, isrc = -1, -1
++        if ratio:
++            before = [s for s in kv_sources if s <= layer_id]
++            if not before:
++                raise ValueError(f"layer {layer_id} compresses at ratio {ratio} but no kv source precedes it")
++            owner_layer = before[-1]
++            if ratios[owner_layer] != ratio:
++                raise ValueError(
++                    f"layer {layer_id} at ratio {ratio} binds to kv source {owner_layer} at "
++                    f"ratio {ratios[owner_layer]}"
++                )
++            owner = kv_sources.index(owner_layer)
++            ibefore = [s for s in index_sources if s <= layer_id]
++            isrc = ibefore[-1]
++            if ratios[isrc] != ratio:
++                raise ValueError(f"layer {layer_id} binds to index source {isrc} at another ratio")
++        roles.append(
++            LayerRole(
++                layer_id=layer_id,
++                ratio=ratio,
++                kv_owner=owner,
++                owns_kv=layer_id in kv_sources,
++                index_source=isrc,
++                owns_index=layer_id in index_sources,
++                is_candidate_source=layer_id == cand,
++                uses_candidates=0 <= cand < layer_id and ratio > 0,
++                engram_slot=engram_ids.index(layer_id) if layer_id in engram_ids else -1,
++            )
++        )
++    return roles
++
++
++def owner_ratios(cfg) -> list[int]:
++    return [int(cfg.compress_ratios[s]) for s in cfg.kv_source_layers]
++
++
++# --------------------------------------------------------------------------------------------
++# Numerics shared by every layer
++# --------------------------------------------------------------------------------------------
++
++
++def rms_norm(x, weight, eps):
++    """FP32 statistics, weight applied in FP32, cast back. `RMSNorm.forward` in the reference."""
++    xf = x.astype(jnp.float32)
++    xf = xf * jax.lax.rsqrt(jnp.mean(xf * xf, axis=-1, keepdims=True) + eps)
++    return (weight.astype(jnp.float32) * xf).astype(x.dtype)
++
++
++def _pow2_ceil(v):
++    """2 ** ceil(log2(v)) for positive normal float32 `v`, exactly, the way `fast_round_scale`
++    reads the exponent bits."""
++    mant, exp = jnp.frexp(v)  # v = mant * 2**exp, mant in [0.5, 1)
++    k = jnp.where(mant == 0.5, exp - 1, exp)
++    return jnp.ldexp(jnp.ones_like(v), k)
++
++
++def fp8_roundtrip(x, block=32):
++    """`act_quant(x, block, "ue8m0", e8m0, inplace=True)`: E4M3 with a power-of-2 scale per block."""
++    shape = x.shape
++    xb = x.astype(jnp.float32).reshape(*shape[:-1], shape[-1] // block, block)
++    amax = jnp.maximum(jnp.max(jnp.abs(xb), axis=-1, keepdims=True), 1e-4)
++    s = _pow2_ceil(amax * np.float32(1.0 / FP8_MAX))
++    y = jnp.clip(xb / s, -FP8_MAX, FP8_MAX).astype(jnp.float8_e4m3fn).astype(jnp.float32) * s
++    return y.reshape(shape).astype(x.dtype)
++
++
++def fp4_roundtrip(x, block, e4m3_scale=False):
++    """`fp4_act_quant(x, block, inplace=True)`: E2M1 values with an E8M0 scale per block, or an
++    E4M3 scale when `e4m3_scale`, as the compressed KV uses."""
++    shape = x.shape
++    xb = x.astype(jnp.float32).reshape(*shape[:-1], shape[-1] // block, block)
++    amax = jnp.max(jnp.abs(xb), axis=-1, keepdims=True)
++    if e4m3_scale:
++        amax = jnp.maximum(amax, FP4_MAX * 2.0**-9)
++        s = (amax / FP4_MAX).astype(jnp.float8_e4m3fn).astype(jnp.float32)
++    else:
++        amax = jnp.maximum(amax, FP4_MAX * 2.0**-126)
++        s = _pow2_ceil(amax * np.float32(1.0 / FP4_MAX))
++    y = jnp.clip(xb / s, -FP4_MAX, FP4_MAX).astype(jnp.float4_e2m1fn).astype(jnp.float32) * s
++    return y.reshape(shape).astype(x.dtype)
++
++
++def rope_freqs(dim, original_seq_len, base, factor, beta_fast, beta_slow) -> np.ndarray:
++    """Per-pair angular frequencies, `precompute_freqs_cis` before the outer product. YaRN
++    applies when `original_seq_len > 0`."""
++    freqs = 1.0 / (np.float32(base) ** (np.arange(0, dim, 2, dtype=np.float32) / np.float32(dim)))
++    freqs = freqs.astype(np.float32)
++    if original_seq_len > 0:
++
++        def corrected_dim(rotations):
++            return dim * math.log(original_seq_len / (rotations * 2 * math.pi)) / (2 * math.log(base))
++
++        low = max(math.floor(corrected_dim(beta_fast)), 0)
++        high = min(math.ceil(corrected_dim(beta_slow)), dim - 1)
++        ramp = np.clip((np.arange(dim // 2, dtype=np.float32) - low) / max(high - low, 1e-3), 0, 1)
++        smooth = (1 - ramp).astype(np.float32)
++        freqs = (freqs / np.float32(factor) * (1 - smooth) + freqs * smooth).astype(np.float32)
++    return freqs
++
++
++def rope_cos_sin(positions, freqs):
++    angle = positions.astype(jnp.float32)[..., None] * jnp.asarray(np.array(freqs, np.float32))[None, :]
++    return jnp.cos(angle), jnp.sin(angle)
++
++
++def apply_rope(x, cos, sin, rd, inverse=False):
++    """Rotate the last `rd` channels as adjacent pairs, `apply_rotary_emb`. `cos`/`sin` are
++    `[T, rd/2]` and broadcast over any axes between the token axis and the channel axis."""
++    head, tail = x[..., :-rd], x[..., -rd:]
++    t = tail.astype(jnp.float32).reshape(*tail.shape[:-1], rd // 2, 2)
++    a, b = t[..., 0], t[..., 1]
++    extra = x.ndim - 2
++    c = cos.reshape(cos.shape[0], *([1] * extra), cos.shape[-1])
++    s = sin.reshape(sin.shape[0], *([1] * extra), sin.shape[-1])
++    if inverse:
++        s = -s
++    out = jnp.stack([a * c - b * s, a * s + b * c], axis=-1).reshape(tail.shape)
++    return jnp.concatenate([head, out.astype(x.dtype)], axis=-1)
++
++
++def sinkhorn_split(mixes, hc_scale, hc_base, hc, iters, eps):
++    """`hc_split_sinkhorn`: pre, post and the doubly stochastic comb from one projection."""
++    m = mixes.astype(jnp.float32)
++    scale = hc_scale.astype(jnp.float32)
++    base = hc_base.astype(jnp.float32)
++    pre = jax.nn.sigmoid(m[..., :hc] * scale[0] + base[:hc]) + eps
++    post = 2.0 * jax.nn.sigmoid(m[..., hc : 2 * hc] * scale[1] + base[hc : 2 * hc])
++    c = m[..., 2 * hc :] * scale[2] + base[2 * hc :]
++    c = c.reshape(*c.shape[:-1], hc, hc)
++    c = jax.nn.softmax(c, axis=-1) + eps
++    c = c / (jnp.sum(c, axis=-2, keepdims=True) + eps)
++    for _ in range(iters - 1):
++        c = c / (jnp.sum(c, axis=-1, keepdims=True) + eps)
++        c = c / (jnp.sum(c, axis=-2, keepdims=True) + eps)
++    return pre, post, c
++
++
++def hc_pre(x, pre_mix):
++    """Collapse `[T, hc, D]` to `[T, D]` with weights `[T, hc]`."""
++    return jnp.sum(pre_mix[..., None] * x.astype(jnp.float32), axis=-2).astype(x.dtype)
++
++
++def hc_post(y, residual, post, comb):
++    """`post[j] * y + sum_i comb[i, j] * residual[i]`, `[T, hc, D]`."""
++    mixed = jnp.einsum("tij,tid->tjd", comb, residual.astype(jnp.float32))
++    return (post[..., None] * y.astype(jnp.float32)[:, None, :] + mixed).astype(y.dtype)
++
++
++# --------------------------------------------------------------------------------------------
++# Token metadata
++# --------------------------------------------------------------------------------------------
++
++
++@jax.tree_util.register_pytree_node_class
++@dataclasses.dataclass
++class TokenMeta:
++    """Per-token and per-request views of one forward batch, all on device.
++
++    `slot` is the state-pool row a token reads and writes: `req_pool_index + 1`, or 0 for a padding
++    token. `prefix` is how many tokens of the request the pool already holds, `end` how many it
++    holds after this pass, `idx` the token's place inside its request's chunk.
++    """
++
++    valid: jax.Array  # [T] bool
++    pos: jax.Array  # [T] int32
++    slot: jax.Array  # [T] int32
++    prefix: jax.Array  # [T] int32
++    end: jax.Array  # [T] int32
++    idx: jax.Array  # [T] int32
++    req_slot: jax.Array  # [B] int32
++    req_prefix: jax.Array  # [B] int32
++    req_lens: jax.Array  # [B] int32
++    req_start: jax.Array  # [B] int32
++
++    def tree_flatten(self):
++        return tuple(getattr(self, f.name) for f in dataclasses.fields(self)), None
++
++    @classmethod
++    def tree_unflatten(cls, aux, children):
++        return cls(*children)
++
++
++def token_meta(num_tokens, req_pool_indices, prefix_lens, extend_lens) -> TokenMeta:
++    """Tokens sit request after request, each request's in position order, the layout
++    `ForwardBatch` uses for extend and decode alike. `extend_lens[b] == 0` marks a padding
++    request."""
++    req_pool_indices = jnp.asarray(req_pool_indices, jnp.int32)
++    prefix_lens = jnp.asarray(prefix_lens, jnp.int32)
++    extend_lens = jnp.asarray(extend_lens, jnp.int32)
++    cum = jnp.cumsum(extend_lens)
++    start = cum - extend_lens
++    t = jnp.arange(num_tokens, dtype=jnp.int32)
++    b = jnp.clip(jnp.searchsorted(cum, t, side="right"), 0, extend_lens.shape[0] - 1)
++    valid = t < cum[-1]
++    idx = t - start[b]
++    prefix = prefix_lens[b]
++    req_slot = jnp.where(extend_lens > 0, req_pool_indices + 1, 0)
++    return TokenMeta(
++        valid=valid,
++        pos=jnp.where(valid, prefix + idx, 0),
++        slot=jnp.where(valid, req_slot[b], 0),
++        prefix=jnp.where(valid, prefix, 0),
++        end=jnp.where(valid, prefix + extend_lens[b], 0),
++        idx=jnp.where(valid, idx, 0),
++        req_slot=req_slot,
++        req_prefix=prefix_lens,
++        req_lens=extend_lens,
++        req_start=start,
++    )
++
++
++def _replicated(x):
++    """The engine shards batch arrays over `data`. Metadata here is small and every token reads
++    all of it, so it runs replicated."""
++    return jax.sharding.reshard(jnp.asarray(x, jnp.int32), P())
++
++
++def meta_from_forward_batch(forward_batch) -> TokenMeta:
++    num_tokens = forward_batch.input_ids.shape[0]
++    req = _replicated(forward_batch.req_pool_indices)
++    if forward_batch.forward_mode.is_decode():
++        seq_lens = _replicated(forward_batch.seq_lens)
++        lens = (seq_lens > 0).astype(jnp.int32)
++        return token_meta(num_tokens, req, jnp.maximum(seq_lens - 1, 0), lens)
++    return token_meta(
++        num_tokens,
++        req,
++        _replicated(forward_batch.extend_prefix_lens),
++        _replicated(forward_batch.extend_seq_lens),
++    )
++
++
++# --------------------------------------------------------------------------------------------
++# State
++# --------------------------------------------------------------------------------------------
++
++
++def state_shapes(cfg, num_slots, max_context, dtype):
++    """Shapes and dtypes of every state array, keyed the way the model reads them. `num_slots`
++    counts the dummy slot 0."""
++    hd, win, ihd = int(cfg.head_dim), int(cfg.window_size), int(cfg.index_head_dim)
++    n_layers = int(cfg.n_layers)
++    out = {"window": [((num_slots, win, hd), dtype) for _ in range(n_layers)]}
++    out["ckv"], out["ik"], out["tail_kv"], out["tail_score"] = [], [], [], []
++    for r in owner_ratios(cfg):
++        cap = max_context // r
++        out["ckv"].append(((num_slots, cap, hd), dtype))
++        out["ik"].append(((num_slots, cap, ihd), dtype))
++        out["tail_kv"].append(((num_slots, max(r, 1), hd), jnp.float32))
++        out["tail_score"].append(((num_slots, max(r, 1), hd), jnp.float32))
++    hist = max(int(getattr(cfg, "engram_max_ngram_size", 1)) - 1, 1)
++    out["engram_hist"] = [((num_slots, hist), jnp.int32)]
++    return out
++
++
++def init_state(cfg, num_slots, max_context, dtype, sharding=None):
++    shapes = state_shapes(cfg, num_slots, max_context, dtype)
++    return {
++        key: [jnp.zeros(shape, dt, device=sharding) for shape, dt in entries]
++        for key, entries in shapes.items()
++    }
++
++
++def _scatter_rows(buf, slot, row, values, write):
++    """buf[slot, row] = values where `write`, else into the dummy slot 0 at row 0."""
++    slot = jnp.where(write, slot, 0)
++    row = jnp.where(write, row, 0)
++    return buf.at[slot, row].set(values.astype(buf.dtype))
++
++
++# --------------------------------------------------------------------------------------------
++# Parameters
++# --------------------------------------------------------------------------------------------
++
++
++def _param(shape, dtype, spec=None):
++    spec = spec or (None,) * len(shape)
++    return nnx.Param(jnp.zeros(shape, dtype=dtype, out_sharding=P(*spec)))
++
++
++class Buffer(nnx.Variable):
++    """A loaded array that isn't trained and isn't a weight: the Engram token map."""
++
++
++class DeepseekV41Compressor(nnx.Module):
++    def __init__(self, cfg, ratio, dtype):
++        dim, hd = int(cfg.dim), int(cfg.head_dim)
++        self.ratio = ratio
++        # ratio 1 is a plain projection; the softmax pooling above ratio 1 runs in FP32
++        wdtype = jnp.float32 if ratio > 1 else dtype
++        self.wkv = _param((dim, hd), wdtype)
++        if ratio > 1:
++            self.wgate = _param((dim, hd), jnp.float32)
++        self.norm = _param((hd,), jnp.float32)
++
++
++class DeepseekV41Indexer(nnx.Module):
++    def __init__(self, cfg, owns_k, dtype):
++        dim, qr = int(cfg.dim), int(cfg.q_lora_rank)
++        ih, ihd, hd = int(cfg.index_n_heads), int(cfg.index_head_dim), int(cfg.head_dim)
++        self.wq_b = _param((qr, ih * ihd), dtype)
++        self.weights_proj = _param((dim, ih), dtype)
++        self.owns_k = owns_k
++        if owns_k:
++            self.wk = _param((hd, ihd), dtype)
++            self.k_norm = _param((ihd,), jnp.float32)
++
++
++class DeepseekV41Attention(nnx.Module):
++    """`Attention` in the reference: a window of raw latents plus, at ratio > 0, the top-k
++    compressed latents, in one softmax with a per-head sink."""
++
++    def __init__(self, cfg, role: LayerRole, dtype):
++        self.role = role
++        self.dim = int(cfg.dim)
++        self.n_heads = int(cfg.n_heads)
++        self.head_dim = int(cfg.head_dim)
++        self.rd = int(cfg.rope_head_dim)
++        self.q_lora_rank = int(cfg.q_lora_rank)
++        self.o_groups = int(cfg.o_groups)
++        self.o_lora_rank = int(cfg.o_lora_rank)
++        self.window = int(cfg.window_size)
++        self.eps = float(cfg.norm_eps)
++        self.index_n_heads = int(cfg.index_n_heads)
++        self.index_head_dim = int(cfg.index_head_dim)
++        self.index_topk = int(cfg.index_topk)
++        self.cand_blocks = int(getattr(cfg, "candidate_topk_blocks", 0))
++        self.cand_block_size = int(getattr(cfg, "candidate_block_size", 0))
++        self.dtype = dtype
++        h, hd = self.n_heads, self.head_dim
++        self.attn_sink = _param((h,), jnp.float32)
++        self.wq_a = _param((self.dim, self.q_lora_rank), dtype)
++        self.q_norm = _param((self.q_lora_rank,), jnp.float32)
++        self.wq_b = _param((self.q_lora_rank, h * hd), dtype)
++        self.wkv = _param((self.dim, hd), dtype)
++        self.kv_norm = _param((hd,), jnp.float32)
++        self.wo_a = _param((self.o_groups, self.o_lora_rank, h * hd // self.o_groups), dtype)
++        self.wo_b = _param((self.o_groups * self.o_lora_rank, self.dim), dtype)
++        self.compressor = DeepseekV41Compressor(cfg, role.ratio, dtype) if role.owns_kv else None
++        self.indexer = (
++            DeepseekV41Indexer(cfg, role.owns_kv, dtype) if role.ratio and role.owns_index else None
++        )
++        if role.ratio:
++            freqs = rope_freqs(
++                self.rd,
++                int(cfg.original_seq_len),
++                float(cfg.compress_rope_theta),
++                float(cfg.rope_factor),
++                int(cfg.beta_fast),
++                int(cfg.beta_slow),
++            )
++        else:
++            # pure sliding-window layers turn YaRN off and use the base theta
++            freqs = rope_freqs(self.rd, 0, float(cfg.rope_theta), float(cfg.rope_factor),
++                               int(cfg.beta_fast), int(cfg.beta_slow))
++        self.freqs = tuple(float(f) for f in freqs)
++
++    # --- window -------------------------------------------------------------------------
++
++    def _window(self, kv, meta, state):
++        """Keys and mask for the window: the ring as it stood before this pass, then the band of
++        this request's chunk ending at the query. Writes the chunk's newest tokens to the ring."""
++        win, layer = self.window, self.role.layer_id
++        ring_buf = state["window"][layer]
++        ring = ring_buf[meta.slot]  # [T, win, hd]
++        j = jnp.arange(win, dtype=jnp.int32)[None, :]
++        last = meta.prefix[:, None] - 1
++        ring_pos = last - jnp.mod(last - j, win)  # newest position < prefix in ring slot j
++        lo = meta.pos[:, None] - win + 1
++        ring_ok = (ring_pos >= 0) & (ring_pos >= lo) & meta.valid[:, None]
++        o = jnp.arange(win, dtype=jnp.int32)[None, :]
++        t = jnp.arange(kv.shape[0], dtype=jnp.int32)[:, None]
++        band = kv[jnp.clip(t - o, 0, kv.shape[0] - 1)]  # [T, win, hd]
++        band_ok = (o <= meta.idx[:, None]) & meta.valid[:, None]
++        write = meta.valid & (meta.pos >= meta.end - win)
++        state["window"][layer] = _scatter_rows(ring_buf, meta.slot, jnp.mod(meta.pos, win), kv, write)
++        return jnp.concatenate([ring, band], axis=1), jnp.concatenate([ring_ok, band_ok], axis=1)
++
++    # --- compressor ---------------------------------------------------------------------
++
++    def _compress(self, x, meta, state):
++        """`Compressor.forward`: the pre-RoPE latent of each group this pass closes, and which
++        tokens close one. Updates the tail of the open group."""
++        c, r, owner = self.compressor, self.role.ratio, self.role.kv_owner
++        if r == 1:
++            latent = rms_norm(x @ c.wkv.value, c.norm.value, self.eps)
++            return latent, meta.valid
++        xf = x.astype(jnp.float32)
++        kvc = xf @ c.wkv.value.astype(jnp.float32)
++        sc = xf @ c.wgate.value.astype(jnp.float32)
++        closes = meta.valid & (jnp.mod(meta.pos + 1, r) == 0)
++        tail_kv = state["tail_kv"][owner][meta.slot]  # [T, r, hd]
++        tail_sc = state["tail_score"][owner][meta.slot]
++        k = jnp.arange(r, dtype=jnp.int32)[None, :]
++        q = meta.pos[:, None] - (r - 1) + k  # member positions
++        in_chunk = q >= meta.prefix[:, None]
++        t = jnp.arange(x.shape[0], dtype=jnp.int32)[:, None]
++        src = jnp.clip(t - (meta.pos[:, None] - q), 0, x.shape[0] - 1)
++        slot_idx = jnp.mod(q, r)
++        mem_kv = jnp.where(in_chunk[..., None], kvc[src], jnp.take_along_axis(tail_kv, slot_idx[..., None], 1))
++        mem_sc = jnp.where(in_chunk[..., None], sc[src], jnp.take_along_axis(tail_sc, slot_idx[..., None], 1))
++        pooled = jnp.sum(mem_kv * jax.nn.softmax(mem_sc, axis=1), axis=1)
++        latent = rms_norm(pooled.astype(x.dtype), c.norm.value, self.eps)
++        write = meta.valid & (meta.pos >= meta.end - r)
++        state["tail_kv"][owner] = _scatter_rows(state["tail_kv"][owner], meta.slot, jnp.mod(meta.pos, r), kvc, write)
++        state["tail_score"][owner] = _scatter_rows(
++            state["tail_score"][owner], meta.slot, jnp.mod(meta.pos, r), sc, write
++        )
++        return latent, closes
++
++    # --- indexer ------------------------------------------------------------------------
++
++    def _index(self, x, qr, meta, state, shared, latent, closes, cos_c, sin_c):
++        """`Indexer.forward`: publish index keys when this layer owns the cache, then score every
++        compressed position of the request and keep the top-k."""
++        ix, r, owner, rd = self.indexer, self.role.ratio, self.role.kv_owner, self.rd
++        if ix.owns_k:
++            k = rms_norm(latent @ ix.wk.value, ix.k_norm.value, self.eps)
++            k = apply_rope(k, cos_c, sin_c, rd)
++            k = fp4_roundtrip(k, 32)
++            state["ik"][owner] = _scatter_rows(state["ik"][owner], meta.slot, meta.pos // r, k, closes)
++        cos, sin = rope_cos_sin(meta.pos, self.freqs)
++        q = (qr @ ix.wq_b.value).reshape(-1, self.index_n_heads, self.index_head_dim)
++        q = apply_rope(q, cos, sin, rd)
++        q = fp4_roundtrip(q, 32)
++        keys = state["ik"][owner][meta.slot]  # [T, cap, ihd]
++        w = (x @ ix.weights_proj.value).astype(jnp.float32) * (
++            self.index_head_dim**-0.5 * self.index_n_heads**-0.5
++        )
++        score = jnp.einsum("thd,tnd->thn", q.astype(jnp.float32), keys.astype(jnp.float32))
++        score = jnp.sum(jax.nn.relu(score) * w[..., None], axis=1)  # [T, cap]
++        cap = score.shape[-1]
++        clen = (meta.pos + 1) // r
++        n = jnp.arange(cap, dtype=jnp.int32)[None, :]
++        score = jnp.where((n < clen[:, None]) & meta.valid[:, None], score, -jnp.inf)
++        if self.role.is_candidate_source:
++            shared["candidates"] = self._candidates(score, clen, shared.get("margins"))
++        elif self.role.uses_candidates:
++            score = jnp.where(shared["candidates"], score, -jnp.inf)
++        topk = min(self.index_topk, cap)
++        vals, idxs = jax.lax.top_k(score, topk)
++        if "margins" in shared and topk < cap:
++            # the relative gap between the last kept and the first dropped score; a gap near
++            # float32 resolution means another library may keep the other one
++            v2, _ = jax.lax.top_k(score, topk + 1)
++            a, b = v2[:, topk - 1], v2[:, topk]
++            gap = jnp.where(jnp.isfinite(b), (a - b) / (jnp.abs(a) + 1e-30), jnp.inf)
++            shared["margins"].append((f"topk{self.role.layer_id}", gap))
++        ok = (vals > -jnp.inf) & (idxs < clen[:, None])
++        shared["topk"][self.role.layer_id] = (idxs, ok)
++        return idxs, ok
++
++    def _candidates(self, score, clen, margins=None):
++        """`select_candidate_blocks`: the `candidate_topk_blocks` best blocks per query, the block
++        holding the newest position pinned in."""
++        bs = self.cand_block_size
++        width = score.shape[-1]
++        pad = -width % bs
++        s = jnp.pad(score, ((0, 0), (0, pad)), constant_values=-jnp.inf)
++        s = s.reshape(s.shape[0], -1, bs).max(axis=-1)
++        nb = s.shape[-1]
++        last = jnp.floor_divide(clen - 1, bs)
++        s = jnp.where(jnp.arange(nb)[None, :] == last[:, None], jnp.inf, s)
++        vals, idxs = jax.lax.top_k(s, min(self.cand_blocks, nb))
++        if margins is not None and self.cand_blocks < nb:
++            v2, _ = jax.lax.top_k(s, self.cand_blocks + 1)
++            a, b = v2[:, self.cand_blocks - 1], v2[:, self.cand_blocks]
++            ok = jnp.isfinite(a) & jnp.isfinite(b)
++            margins.append(("cand", jnp.where(ok, (a - b) / (jnp.abs(a) + 1e-30), jnp.inf)))
++        keep = jnp.zeros_like(s, dtype=bool)
++        keep = keep.at[jnp.arange(s.shape[0])[:, None], idxs].set(vals > -jnp.inf)
++        return jnp.repeat(keep, bs, axis=-1)[:, :width]
++
++    # --- forward ------------------------------------------------------------------------
++
++    def __call__(self, x, meta, state, shared):
++        rd, h, hd = self.rd, self.n_heads, self.head_dim
++        cos, sin = rope_cos_sin(meta.pos, self.freqs)
++        qr = rms_norm(x @ self.wq_a.value, self.q_norm.value, self.eps)
++        q = (qr @ self.wq_b.value).reshape(-1, h, hd)
++        q = apply_rope(q, cos, sin, rd)
++
++        kv = rms_norm(x @ self.wkv.value, self.kv_norm.value, self.eps)
++        kv = apply_rope(kv, cos, sin, rd)
++        kv = fp8_roundtrip(kv, 32)
++        keys, mask = self._window(kv, meta, state)
++
++        if self.role.ratio:
++            r, owner = self.role.ratio, self.role.kv_owner
++            latent = closes = cos_c = sin_c = None
++            if self.role.owns_kv:
++                latent, closes = self._compress(x, meta, state)
++                # a latent stands for the first token of its group
++                gpos = (meta.pos // r) * r
++                cos_c, sin_c = rope_cos_sin(gpos, self.freqs)
++            if self.role.owns_index:
++                idxs, ok = self._index(x, qr, meta, state, shared, latent, closes, cos_c, sin_c)
++            else:
++                idxs, ok = shared["topk"][self.role.index_source]
++            if self.role.owns_kv:
++                lat = apply_rope(latent, cos_c, sin_c, rd)
++                lat = fp4_roundtrip(lat, 16, e4m3_scale=True)
++                state["ckv"][owner] = _scatter_rows(state["ckv"][owner], meta.slot, meta.pos // r, lat, closes)
++            ckv = state["ckv"][owner][meta.slot[:, None], idxs]  # [T, K, hd]
++            keys = jnp.concatenate([keys, ckv], axis=1)
++            mask = jnp.concatenate([mask, ok & meta.valid[:, None]], axis=1)
++
++        o = self._attend(q, keys, mask)
++        o = apply_rope(o, cos, sin, rd, inverse=True)
++        o = o.reshape(o.shape[0], self.o_groups, -1)
++        o = jnp.einsum("tgd,grd->tgr", o, self.wo_a.value)
++        return o.reshape(o.shape[0], -1) @ self.wo_b.value
++
++    def _attend(self, q, keys, mask):
++        """`sparse_attn`: one softmax over the selected latents and the per-head sink. The latent
++        is key and value at once."""
++        scale = self.head_dim**-0.5
++        logits = jnp.einsum("thd,tkd->thk", q.astype(jnp.float32), keys.astype(jnp.float32)) * scale
++        logits = jnp.where(mask[:, None, :], logits, -jnp.inf)
++        sink = self.attn_sink.value.astype(jnp.float32)[None, :]
++        m = jnp.maximum(jnp.max(logits, axis=-1), sink)
++        p = jnp.exp(logits - m[..., None])
++        denom = jnp.sum(p, axis=-1) + jnp.exp(sink - m)
++        o = jnp.einsum("thk,tkd->thd", p, keys.astype(jnp.float32)) / denom[..., None]
++        return o.astype(q.dtype)
++
++
++class DeepseekV41EPMoE(EPMoE):
++    """`EPMoE` with the SwiGLU clamp the checkpoint trained with: the up branch clamped on both
++    sides, the gate branch from above (`Expert.forward`)."""
++
++    swiglu_limit: float = 0.0
++
++    def _gmm_compute(
++        self,
++        inputs_2d,
++        token_indices,
++        group_sizes,
++        w0_kernel,
++        w1_kernel,
++        wo_kernel,
++        group_offset,
++        w0_kernel_scale=None,
++        w1_kernel_scale=None,
++        wo_kernel_scale=None,
++        w0_kernel_bias=None,
++        w1_kernel_bias=None,
++        wo_kernel_bias=None,
++        local_range=None,
++    ):
++        if token_indices.shape[0] == 0:
++            return jnp.zeros((0, wo_kernel.shape[-1]), dtype=inputs_2d.dtype)
++        if local_range is not None:
++            x = _moe.sc_dispatch_gather(inputs_2d, token_indices, *local_range).astype(self.dtype)
++        else:
++            x = inputs_2d[token_indices].astype(self.dtype)
++        group_sizes = group_sizes.astype(jnp.int32)
++        kwargs = dict(
++            group_sizes=group_sizes,
++            preferred_element_type=self.dtype,
++            group_offset=group_offset,
++            maybe_quantize_lhs=False,
++            acc_dtype=jnp.float32,
++        )
++        gate = _moe.gmm(lhs=x, rhs=w0_kernel, rhs_scale=w0_kernel_scale, rhs_bias=w0_kernel_bias,
++                        zero_initialize=False, **kwargs)
++        up = _moe.gmm(lhs=x, rhs=w1_kernel, rhs_scale=w1_kernel_scale, rhs_bias=w1_kernel_bias,
++                      zero_initialize=False, **kwargs)
++        gate = gate.astype(jnp.float32)
++        up = up.astype(jnp.float32)
++        if self.swiglu_limit > 0:
++            up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
++            gate = jnp.minimum(gate, self.swiglu_limit)
++        act = (jax.nn.silu(gate) * up).astype(self.dtype)
++        return _moe.gmm(lhs=act, rhs=wo_kernel, rhs_scale=wo_kernel_scale, rhs_bias=wo_kernel_bias,
++                        zero_initialize=True, **kwargs)
++
++
++class DeepseekV41MoE(nnx.Module):
++    """`MoE`: `sqrtsoftplus` routing with a selection-only bias, `route_scale`, one shared
++    expert."""
++
++    def __init__(self, cfg, mesh, layer_id, dtype, ep_size):
++        dim, inter = int(cfg.dim), int(cfg.moe_inter_dim)
++        self.n_experts = int(cfg.n_routed_experts)
++        self.topk = int(cfg.n_activated_experts)
++        self.score_func = str(cfg.score_func)
++        self.gate_temp = float(getattr(cfg, "gate_temp", 1.0))
++        self.norm_topk_prob = bool(cfg.norm_topk_prob)
++        self.route_scale = float(cfg.route_scale)
++        self.swiglu_limit = float(cfg.swiglu_limit)
++        self.gate_weight = _param((self.n_experts, dim), jnp.float32)
++        self.gate_bias = _param((self.n_experts,), jnp.float32)
++        self.experts = DeepseekV41EPMoE(
++            hidden_size=dim,
++            num_experts=self.n_experts,
++            num_experts_per_tok=self.topk,
++            ep_size=ep_size,
++            mesh=mesh,
++            intermediate_dim=inter,
++            weight_dtype=dtype,
++            dtype=dtype,
++            layer_id=layer_id,
++        )
++        self.experts.swiglu_limit = self.swiglu_limit
++        self.shared_w1 = _param((dim, inter), dtype)
++        self.shared_w3 = _param((dim, inter), dtype)
++        self.shared_w2 = _param((inter, dim), dtype)
++
++    def route(self, x):
++        scores = (x.astype(jnp.float32) @ self.gate_weight.value.astype(jnp.float32).T) / self.gate_temp
++        if self.score_func == "softmax":
++            scores = jax.nn.softmax(scores, axis=-1)
++        elif self.score_func == "sigmoid":
++            scores = jax.nn.sigmoid(scores)
++        else:
++            scores = jnp.sqrt(jax.nn.softplus(scores))
++        _, idx = jax.lax.top_k(scores + self.gate_bias.value[None, :], self.topk)
++        weights = jnp.take_along_axis(scores, idx, axis=-1)
++        if self.norm_topk_prob and self.topk > 1:
++            weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + 1e-20)
++        return weights * self.route_scale, idx
++
++    def shared(self, x):
++        gate = (x @ self.shared_w1.value).astype(jnp.float32)
++        up = (x @ self.shared_w3.value).astype(jnp.float32)
++        if self.swiglu_limit > 0:
++            up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
++            gate = jnp.minimum(gate, self.swiglu_limit)
++        return (jax.nn.silu(gate) * up).astype(x.dtype) @ self.shared_w2.value
++
++    def __call__(self, x):
++        weights, idx = self.route(x)
++        routed = self.experts(x, weights.astype(x.dtype), idx.astype(jnp.int32))
++        return (routed.astype(jnp.float32) + self.shared(x).astype(jnp.float32)).astype(x.dtype)
++
++
++# --------------------------------------------------------------------------------------------
++# Engram
++# --------------------------------------------------------------------------------------------
++
++
++def _isprime(n: int) -> bool:
++    from sympy import isprime
++
++    return bool(isprime(n))
++
++
++@dataclasses.dataclass(frozen=True)
++class EngramLayout:
++    """`engram.EngramLayout`: per layer, per n-gram size, per head, a prime-sized bucket range,
++    primes drawn in order and never reused."""
++
++    max_ngram_size: int
++    layer_ids: tuple
++    num_embeddings: tuple
++    primes: tuple  # [layer][ngram][head]
++    n_heads: int
++    head_dim: int
++
++    @classmethod
++    def from_config(cls, cfg):
++        layer_ids = tuple(int(i) for i in getattr(cfg, "engram_layer_ids", []))
++        if not layer_ids:
++            return None
++        max_n, heads = int(cfg.engram_max_ngram_size), int(cfg.engram_n_heads)
++        primes, seen = [], set()
++        for _ in layer_ids:
++            per_ngram = []
++            for _ in range(max_n - 1):
++                sizes, current = [], int(cfg.engram_vocab_size) - 1
++                for _ in range(heads):
++                    candidate = current + 1
++                    while not _isprime(candidate) or candidate in seen:
++                        candidate += 1
++                    current = candidate
++                    seen.add(current)
++                    sizes.append(current)
++                per_ngram.append(tuple(sizes))
++            primes.append(tuple(per_ngram))
++        return cls(max_n, layer_ids, tuple(int(n) for n in cfg.engram_num_embeddings),
++                   tuple(primes), heads, int(cfg.engram_head_dim))
++
++    @property
++    def n_hash_cols(self):
++        return (self.max_ngram_size - 1) * self.n_heads
++
++
++def engram_multipliers(layer_ids, max_ngram_size, compressed_vocab_size) -> np.ndarray:
++    """`engram.compute_hash_multipliers`: odd, from a per-layer RNG, bounded so the products fit
++    in int64. `[layers, max_ngram_size]` int64."""
++    max_long = np.iinfo(np.int64).max
++    bound = max(1, (max_long // compressed_vocab_size) // 2)
++    rows = []
++    for layer_id in layer_ids:
++        gen = np.random.default_rng(10007 * layer_id)
++        values = gen.integers(low=0, high=bound, size=(max_ngram_size,), dtype=np.int64)
++        rows.append(values * 2 + 1)
++    return np.stack(rows)
++
++
++def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
++    """`engram.build_compressed_token_map`: tokens that normalize alike share one id."""
++    from tokenizers import Regex, normalizers
++
++    sentinel = "\ue000"
++    normalizer = normalizers.Sequence(
++        [
++            normalizers.NFKC(),
++            normalizers.NFD(),
++            normalizers.StripAccents(),
++            normalizers.Lowercase(),
++            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
++            normalizers.Replace(Regex(r"^ $"), sentinel),
++            normalizers.Strip(),
++            normalizers.Replace(sentinel, " "),
++        ]
++    )
++    backend = tokenizer.backend_tokenizer
++    key_to_new: dict[str, int] = {}
++    lookup = [0] * len(tokenizer)
++    for token_id in range(len(tokenizer)):
++        text = backend.decode([token_id], skip_special_tokens=False)
++        if "\ufffd" in text:
++            key = backend.id_to_token(token_id)
++        else:
++            normalized = normalizer.normalize_str(text)
++            key = normalized if normalized else text
++        new_id = key_to_new.get(key)
++        if new_id is None:
++            new_id = len(key_to_new)
++            key_to_new[key] = new_id
++        lookup[token_id] = new_id
++    return lookup, len(key_to_new)
++
++
++def _as_tuple(a: np.ndarray):
++    return tuple(_as_tuple(x) for x in a) if a.ndim > 1 else tuple(int(v) for v in a)
++
++
++def _u64_limbs(values: np.ndarray) -> np.ndarray:
++    """int64 -> four 16-bit limbs, least significant first, as uint32."""
++    v = values.astype(np.uint64)
++    return np.stack([((v >> np.uint64(16 * i)) & np.uint64(0xFFFF)).astype(np.uint32) for i in range(4)], -1)
++
++
++def _mul_u17_u64(t, m_limbs):
++    """t (< 2**32, as uint32) times a 64-bit constant in 16-bit limbs, mod 2**64, in limbs.
++    Every partial product of two 16-bit limbs fits in uint32, and the halves accumulate apart."""
++    t_limbs = [t & 0xFFFF, t >> 16]
++    acc = [jnp.zeros_like(t) for _ in range(6)]
++    for i, ti in enumerate(t_limbs):
++        for j in range(4):
++            if i + j >= 4:
++                continue
++            pp = ti * m_limbs[..., j]
++            acc[i + j] = acc[i + j] + (pp & 0xFFFF)
++            acc[i + j + 1] = acc[i + j + 1] + (pp >> 16)
++    out, carry = [], jnp.zeros_like(t)
++    for k in range(4):
++        v = acc[k] + carry
++        out.append(v & 0xFFFF)
++        carry = v >> 16
++    return jnp.stack(out, -1)
++
++
++def _mod_limbs(limbs, p):
++    """A 64-bit value in 16-bit limbs modulo p < 2**27, four bits at a time in uint32."""
++    r = jnp.zeros(limbs.shape[:-1], jnp.uint32)
++    for k in range(3, -1, -1):
++        limb = limbs[..., k]
++        for shift in (12, 8, 4, 0):
++            r = (r * 16 + ((limb >> shift) & 0xF)) % p
++    return r
++
++
++def _mesh_axes(mesh):
++    """Every axis of the mesh, in order: the Engram tables split their rows over all of them."""
++    return tuple(mesh.axis_names) if mesh is not None else ()
++
++
++def _mesh_size(mesh):
++    return int(np.prod([mesh.shape[a] for a in _mesh_axes(mesh)])) if mesh is not None else 1
++
++
++class DeepseekV41Engram(nnx.Module):
++    """`Engram` with its `ParallelEngramEmbedding`: the table stays E4M3 with one E8M0 exponent
++    per 32 channels, and a row widens on lookup.
++
++    The rows split evenly over every device of the mesh, padded up to a multiple of the device
++    count the way `convert.py` pads its shards. A lookup runs inside `shard_map`: each device
++    gathers against its own slice, zeroes the rows it doesn't hold, and one `psum` over the mesh
++    sums the widened rows, as `ParallelEngramEmbedding.forward` does across ranks."""
++
++    def __init__(self, cfg, layout: EngramLayout, slot: int, dtype, mesh=None):
++        self.slot = slot
++        self.dim = int(cfg.dim)
++        self.hc = int(cfg.hc_mult)
++        self.eps = float(cfg.norm_eps)
++        self.head_dim = layout.head_dim
++        self.block = 32
++        self.mesh = mesh
++        self.axes = _mesh_axes(mesh)
++        ways = _mesh_size(mesh)
++        self.rows = layout.num_embeddings[slot]
++        self.padded_rows = -(-self.rows // ways) * ways
++        spec = (self.axes if self.axes else None, None)
++        self.table = _param((self.padded_rows, layout.head_dim), jnp.float8_e4m3fn, spec)
++        self.table_scale = _param((self.padded_rows, layout.head_dim // self.block), jnp.uint8, spec)
++        self.wkv = _param((layout.n_hash_cols * layout.head_dim, self.dim * (self.hc + 1)), dtype)
++        self.q_weight = _param((self.hc, self.dim), jnp.float32)
++        self.k_weight = _param((self.hc, self.dim), jnp.float32)
++
++    def _widen(self, table, scale, ids):
++        rows = table[ids].astype(jnp.float32)  # [T, cols, hd]
++        codes = scale[ids].astype(jnp.int32) - 127
++        factor = jnp.ldexp(jnp.ones(codes.shape, jnp.float32), codes)
++        rows = rows.reshape(*rows.shape[:-1], -1, self.block) * factor[..., None]
++        return rows.reshape(*ids.shape, self.head_dim)
++
++    def lookup(self, hash_ids, dtype):
++        if not self.axes:
++            return self._widen(self.table.value, self.table_scale.value, hash_ids).astype(dtype)
++        axes = self.axes
++
++        def local(table, scale, ids):
++            part = table.shape[0]
++            start = jax.lax.axis_index(axes) * part
++            here = ids - start
++            mask = (here >= 0) & (here < part)
++            rows = self._widen(table, scale, jnp.where(mask, here, 0))
++            rows = jnp.where(mask[..., None], rows, 0.0)
++            return jax.lax.psum(rows, axes)
++
++        out = jax.shard_map(
++            local,
++            mesh=self.mesh,
++            in_specs=(P(axes, None), P(axes, None), P()),
++            out_specs=P(),
++            check_vma=False,
++        )(self.table.value, self.table_scale.value, jax.sharding.reshard(hash_ids, P()))
++        return out.astype(dtype)
++
++    def __call__(self, x, hash_ids):
++        values = self.lookup(hash_ids, x.dtype)
++        kv = values.reshape(values.shape[0], -1) @ self.wkv.value
++        key = kv[:, : self.hc * self.dim].astype(jnp.float32).reshape(-1, self.hc, self.dim)
++        value = kv[:, self.hc * self.dim :].astype(jnp.float32)
++        weight = self.q_weight.value.astype(jnp.float32) * self.k_weight.value.astype(jnp.float32)
++        h = x.astype(jnp.float32)
++        rstd = jax.lax.rsqrt(jnp.mean(h * h, -1) + self.eps) * jax.lax.rsqrt(jnp.mean(key * key, -1) + self.eps)
++        dot = jnp.sum(h * weight * key, -1) * rstd * self.dim**-0.5
++        gate = jax.nn.sigmoid(jnp.copysign(jnp.sqrt(jnp.maximum(jnp.abs(dot), 1e-6)), dot))
++        return (h + gate[..., None] * value[:, None, :]).astype(x.dtype)
++
++
++class DeepseekV41EngramHash(nnx.Module):
++    """`NgramHashState` on device. The hash of a position XORs `token * multiplier` over the
++    n-gram ending there, then reduces modulo each head's prime. Products run in 16-bit limbs,
++    because the engine runs JAX without 64-bit integers."""
++
++    def __init__(self, cfg, layout: EngramLayout, vocab_size: int):
++        self.layout = layout
++        self.max_n = layout.max_ngram_size
++        self.pad_token = int(getattr(cfg, "engram_pad_id", 2))
++        self.compressed_vocab = int(cfg.engram_compressed_vocab_size)
++        self.token_map = Buffer(jnp.zeros((vocab_size,), jnp.int32))
++        self.pad_id = Buffer(jnp.zeros((), jnp.int32))
++        mult = engram_multipliers(layout.layer_ids, self.max_n, self.compressed_vocab)
++        # Constants stay Python tuples. nnx treats an ndarray attribute as graph data, and the
++        # engine's split/merge of the model state then hands back something else.
++        self.mult_limbs = _as_tuple(_u64_limbs(mult))  # [layers, max_n, 4]
++        flat = [[p for per in layer for p in per] for layer in layout.primes]
++        primes = np.array(flat, dtype=np.uint32)  # [layers, cols]
++        offsets = np.array([np.cumsum([0, *sizes[:-1]]) for sizes in flat], dtype=np.int64)
++        self.primes, self.offsets = _as_tuple(primes), _as_tuple(offsets)
++        if offsets.max(initial=0) + primes.max(initial=0) >= 2**31:
++            raise ValueError("Engram row ids need int32")
++
++    def __call__(self, input_ids, meta, state):
++        """Hash ids `[T, layers, cols]` and the new last-token history."""
++        n_hist = self.max_n - 1
++        comp = self.token_map.value[input_ids]
++        hist = state["engram_hist"][0][meta.slot]  # [T, n_hist]; entry k-1 holds position prefix-k
++        t = jnp.arange(input_ids.shape[0], dtype=jnp.int32)
++        pad = self.pad_id.value
++        tokens = [comp]
++        for shift in range(1, self.max_n):
++            from_chunk = comp[jnp.clip(t - shift, 0, input_ids.shape[0] - 1)]
++            back = jnp.clip(shift - meta.idx - 1, 0, n_hist - 1)
++            from_hist = jnp.take_along_axis(hist, back[:, None], 1)[:, 0]
++            tok = jnp.where(shift <= meta.idx, from_chunk, from_hist)
++            tokens.append(jnp.where(meta.pos - shift < 0, pad, tok))
++        tokens = jnp.stack(tokens, -1).astype(jnp.uint32)  # [T, max_n]
++        mult = jnp.asarray(np.array(self.mult_limbs, np.uint32))
++        primes = jnp.asarray(np.array(self.primes, np.uint32))
++        heads = self.layout.n_heads
++        out = []
++        for li in range(len(self.layout.layer_ids)):
++            rolling = _mul_u17_u64(tokens[:, 0], mult[li, 0])
++            cols = []
++            for i in range(1, self.max_n):
++                rolling = rolling ^ _mul_u17_u64(tokens[:, i], mult[li, i])
++                p = primes[li, (i - 1) * heads : i * heads]
++                cols.append(_mod_limbs(rolling[:, None, :], p[None, :]))
++            out.append(jnp.concatenate(cols, -1).astype(jnp.int32) + jnp.asarray(np.array(self.offsets[li]), jnp.int32))
++        new_hist = self._history(comp, meta, state, pad)
++        return jnp.stack(out, 1), new_hist
++
++    def _history(self, comp, meta, state, pad):
++        n_hist = self.max_n - 1
++        buf = state["engram_hist"][0]
++        old = buf[meta.req_slot]  # [B, n_hist]
++        end = meta.req_prefix + meta.req_lens
++        k = jnp.arange(1, n_hist + 1, dtype=jnp.int32)[None, :]
++        q = end[:, None] - k
++        in_chunk = q >= meta.req_prefix[:, None]
++        src = jnp.clip(meta.req_start[:, None] + q - meta.req_prefix[:, None], 0, comp.shape[0] - 1)
++        back = jnp.clip(meta.req_prefix[:, None] - q - 1, 0, n_hist - 1)
++        val = jnp.where(in_chunk, comp[src], jnp.take_along_axis(old, back, 1))
++        val = jnp.where(q < 0, pad, val)
++        slot = jnp.where(meta.req_lens > 0, meta.req_slot, 0)
++        return buf.at[slot].set(val.astype(buf.dtype))
++
++
++# --------------------------------------------------------------------------------------------
++# Blocks and model
++# --------------------------------------------------------------------------------------------
++
++
++class DeepseekV41DecoderLayer(nnx.Module):
++    """`Block`: attention and feed-forward between `hc_pre` and `hc_post`. Returns the `pre` mix
++    the next layer's attention collapses with."""
++
++    def __init__(self, cfg, mesh, role, dtype, ep_size, layout):
++        dim, hc = int(cfg.dim), int(cfg.hc_mult)
++        self.role = role
++        self.hc = hc
++        self.eps = float(cfg.norm_eps)
++        self.hc_iters = int(cfg.hc_sinkhorn_iters)
++        self.hc_eps = float(cfg.hc_eps)
++        mix = (2 + hc) * hc
++        self.attn = DeepseekV41Attention(cfg, role, dtype)
++        self.ffn = DeepseekV41MoE(cfg, mesh, role.layer_id, dtype, ep_size)
++        self.attn_norm = _param((dim,), jnp.float32)
++        self.ffn_norm = _param((dim,), jnp.float32)
++        self.hc_attn_fn = _param((mix, hc * dim), jnp.float32)
++        self.hc_ffn_fn = _param((mix, hc * dim), jnp.float32)
++        self.hc_attn_base = _param((mix,), jnp.float32)
++        self.hc_ffn_base = _param((mix,), jnp.float32)
++        self.hc_attn_scale = _param((3,), jnp.float32)
++        self.hc_ffn_scale = _param((3,), jnp.float32)
++        self.engram = (
++            DeepseekV41Engram(cfg, layout, role.engram_slot, dtype, mesh)
++            if role.engram_slot >= 0 else None
++        )
++
++    def hc_mixes(self, x, fn, scale, base):
++        xf = x.reshape(x.shape[0], -1).astype(jnp.float32)
++        rs = jax.lax.rsqrt(jnp.mean(xf * xf, -1, keepdims=True) + self.eps)
++        mixes = (xf @ fn.value.T) * rs
++        return sinkhorn_split(mixes, scale.value, base.value, self.hc, self.hc_iters, self.hc_eps)
++
++    def __call__(self, x, pre_mix, meta, state, shared):
++        residual = x
++        a_pre, a_post, a_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
++        collapsed = hc_pre(x, pre_mix)
++        h = rms_norm(collapsed, self.attn_norm.value, self.eps)
++        h = self.attn(h, meta, state, shared)
++        x = hc_post(h, residual, a_post, a_comb)
++
++        residual = x
++        f_pre, f_post, f_comb = self.hc_mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
++        h = hc_pre(x, a_pre)
++        h = rms_norm(h, self.ffn_norm.value, self.eps)
++        h = self.ffn(h)
++        x = hc_post(h, residual, f_post, f_comb)
++        return x, f_pre, collapsed
++
++
++class DeepseekV41Model(nnx.Module):
++    def __init__(self, cfg, mesh, dtype, ep_size=1):
++        self.cfg = cfg
++        self.dtype = dtype
++        self.hc = int(cfg.hc_mult)
++        self.eps = float(cfg.norm_eps)
++        self.roles = layer_roles(cfg)
++        self.layout = EngramLayout.from_config(cfg)
++        self.embed = Embed(int(cfg.vocab_size), int(cfg.dim), dtype=dtype, param_dtype=dtype,
++                           kernel_axes=(None, None), mesh=mesh)
++        self.layers = nnx.List(
++            [DeepseekV41DecoderLayer(cfg, mesh, role, dtype, ep_size, self.layout) for role in self.roles]
++        )
++        self.norm = _param((int(cfg.dim),), jnp.float32)
++        self.engram_hash = (
++            DeepseekV41EngramHash(cfg, self.layout, int(cfg.vocab_size)) if self.layout else None
++        )
++        self.layers_to_capture = []
++        self.return_streams = False
++
++    def __call__(self, input_ids, meta: TokenMeta, state):
++        """Returns the final collapsed, normed hidden state `[T, D]`, the captured slots, the new
++        state and, when `return_streams`, every layer's four copies after it."""
++        state = {k: list(v) for k, v in state.items()}
++        shared = {"topk": {}}
++        if self.return_streams:
++            shared["margins"] = []
++        hash_ids = None
++        if self.engram_hash is not None:
++            hash_ids, state["engram_hist"][0] = self.engram_hash(input_ids, meta, state)
++        h = self.embed(input_ids).astype(self.dtype)
++        # The window band, the compressor's group members and the Engram history all gather
++        # across the token axis, so the stream stays replicated. Attention weights are
++        # replicated too; only the routed experts shard, inside EPMoE.
++        h = jax.sharding.reshard(h, P(None, None))
++        x = jnp.repeat(h[:, None, :], self.hc, axis=1)
++        pre_mix = jnp.zeros((x.shape[0], self.hc), jnp.float32).at[:, 0].set(1.0)
++        aux, streams = [], []
++        for layer_id, layer in enumerate(self.layers):
++            if layer.engram is not None:
++                x = layer.engram(x, hash_ids[:, layer.engram.slot])
++                if self.return_streams:
++                    streams.append(("engram", layer_id, x))
++            x, pre_mix, collapsed = layer(x, pre_mix, meta, state, shared)
++            if layer_id in self.layers_to_capture:
++                aux.append(collapsed)
++            if self.return_streams:
++                streams.append(("block", layer_id, x))
++                streams.append(("collapsed", layer_id, collapsed))
++        for name, gap in shared.get("margins", []):
++            streams.append((f"margin:{name}", -1, gap))
++        h = hc_pre(x, pre_mix)
++        h = rms_norm(h, self.norm.value, self.eps)
++        return h, aux, state, streams
++
++
++class DeepseekV41ForCausalLM(nnx.Module):
++    """Text backbone of `deepseek-ai/DeepSeek-V4.1-Flash`. DSpark draft blocks (`mtp.*`) and the
++    vision tower (`vision.*`, `aligner.*`, `image_*`) load nothing yet."""
++
++    STATE_POOL = "dsv41_state_pool"
++    # The runner still builds the paged KV pool and the scheduler still hands each token a slot in
++    # it, but nothing reads it. One layer keeps a slot at 2 KiB instead of 80 KiB, and the token
++    # cap keeps the pool from taking the HBM the state pool needs.
++    paged_kv_layers = 1
++    PAGED_KV_TOKEN_CEILING = 1 << 20
++
++    @classmethod
++    def paged_kv_token_cap(cls, server_args, model_config, max_num_reqs):
++        return min(int(max_num_reqs) * int(model_config.context_len), cls.PAGED_KV_TOKEN_CEILING)
++
++    def __init__(self, config, mesh, dtype=jnp.bfloat16):
++        self.config = config
++        self.mesh = mesh
++        self.dtype = dtype
++        ep_size = int(getattr(config, "ep_size", 1) or 1)
++        self.model = DeepseekV41Model(config, mesh, dtype, ep_size=ep_size)
++        self.lm_head = ParallelLMHead(int(config.vocab_size), int(config.dim), dtype=jnp.float32,
++                                      param_dtype=jnp.float32, mesh=mesh)
++        self.logits_processor = LogitsProcessor(int(config.vocab_size), mesh=mesh)
++        self.capture_aux_hidden_states = False
++
++    def set_layers_to_capture(self, layers):
++        self.model.layers_to_capture = list(layers)
++
++    def forward_hidden(self, forward_batch, state):
++        meta = meta_from_forward_batch(forward_batch)
++        return self.model(_replicated(forward_batch.input_ids), meta, state)
++
++    @classmethod
++    def build_extra_memory_pools(cls, model_config, server_args, max_num_reqs, mesh, dtype):
++        """Pools the runner adds beside `token_to_kv_pool`: the per-request state. The model
++        reads none of the engine's paged KV pool."""
++        from sgl_jax.srt.mem_cache.deepseek_v41_state_pool import DeepseekV41StatePool
++
++        if not getattr(server_args, "disable_radix_cache", False):
++            raise ValueError(
++                "DeepseekV41ForCausalLM keeps its caches per request, not per token, so no radix "
++                "prefix can be shared; start the server with --disable-radix-cache"
++            )
++        pool = DeepseekV41StatePool.create(
++            model_config.hf_config, max_num_reqs, model_config.context_len, dtype, mesh
++        )
++        logger.info("DeepSeek V4.1 state pool: %d slots, %.2f GiB", pool.num_slots,
++                    pool.size_bytes() / 2**30)
++        return {cls.STATE_POOL: pool}
++
++    def __call__(self, forward_batch, memory_pools, logits_metadata: LogitsMetadata):
++        pool = getattr(memory_pools, self.STATE_POOL)
++        hidden, aux, new_state, _ = self.forward_hidden(forward_batch, pool.state)
++        if not self.capture_aux_hidden_states:
++            aux = None
++        output = self.logits_processor(hidden.astype(jnp.float32), self.lm_head, logits_metadata,
++                                       aux_hidden_states=aux)
++        updates = {self.STATE_POOL: new_state}
++        for name, other in memory_pools._pools.items():
++            if name != self.STATE_POOL:
++                # this model writes no paged KV; hand the buffers back as they came
++                updates[name] = other.kv_buffer
++        return output, updates, True, None
++
++    # ----------------------------------------------------------------------------------------
++    # Weights
++    # ----------------------------------------------------------------------------------------
++
++    def load_weights(self, model_config):
++        path = model_config.model_path
++        load_checkpoint(self, path)
++        if self.model.engram_hash is not None:
++            from transformers import AutoTokenizer
++
++            tok = AutoTokenizer.from_pretrained(path)
++            self.set_token_map(tok)
++
++    def set_token_map(self, tokenizer):
++        hashing = self.model.engram_hash
++        lookup, size = build_compressed_token_map(tokenizer)
++        if size != hashing.compressed_vocab:
++            raise ValueError(
++                f"the tokenizer compresses to {size} ids, the config says "
++                f"engram_compressed_vocab_size={hashing.compressed_vocab}"
++            )
++        table = np.zeros(hashing.token_map.value.shape, np.int32)
++        table[: len(lookup)] = np.asarray(lookup, np.int32)
++        hashing.token_map.value = jnp.asarray(table)
++        hashing.pad_id.value = jnp.asarray(lookup[hashing.pad_token], jnp.int32)
++
++
++# --------------------------------------------------------------------------------------------
++# Checkpoint reading
++# --------------------------------------------------------------------------------------------
++
++_ST_DTYPES = {
++    "F32": np.float32,
++    "F16": np.float16,
++    "BF16": np.uint16,
++    "F8_E4M3": np.uint8,
++    "F8_E8M0": np.uint8,
++    "I8": np.int8,
++    "U8": np.uint8,
++    "I32": np.int32,
++    "I64": np.int64,
++}
++
++
++def scan_safetensors(path) -> dict:
++    """Every tensor in `path/*.safetensors`: file, dtype tag, shape, byte range."""
++    index = {}
++    for file in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
++        with open(file, "rb") as fp:
++            n = struct.unpack("<Q", fp.read(8))[0]
++            header = json.loads(fp.read(n))
++        base = 8 + n
++        for name, info in header.items():
++            if name == "__metadata__":
++                continue
++            start, stop = info["data_offsets"]
++            index[name] = (file, info["dtype"], tuple(info["shape"]), base + start, base + stop)
++    return index
++
++
++def read_tensor(entry) -> np.ndarray:
++    """Raw read. BF16 comes back as float32, F8_E4M3 as `ml_dtypes.float8_e4m3fn`, F8_E8M0 as
++    its uint8 exponent code, I8 as int8."""
++    import ml_dtypes
++
++    file, tag, shape, start, stop = entry
++    dt = _ST_DTYPES[tag]
++    # A memory map: slicing it reads only the rows asked for, which is how a host reads its own
++    # shard of a 98 GB Engram table.
++    arr = np.memmap(file, dtype=dt, mode="r", offset=start, shape=tuple(shape))
++    if tag == "BF16":
++        return (arr.astype(np.uint32) << 16).view(np.float32)
++    if tag == "F8_E4M3":
++        return arr.view(ml_dtypes.float8_e4m3fn)
++    return arr
++
++
++def e8m0_to_float(codes: np.ndarray) -> np.ndarray:
++    return np.ldexp(np.float32(1.0), codes.astype(np.int32) - 127).astype(np.float32)
++
++
++def dequant_fp8_block(weight: np.ndarray, scale_codes: np.ndarray, block=32) -> np.ndarray:
++    """E4M3 `[out, in]` with one E8M0 scale per `block x block` tile. The last tile in either
++    axis may be partial."""
++    out, inn = weight.shape
++    s = e8m0_to_float(scale_codes)
++    if s.shape != (-(-out // block), -(-inn // block)):
++        raise ValueError(f"scale {s.shape} doesn't tile weight {weight.shape} at {block}")
++    s = np.repeat(np.repeat(s, block, 0), block, 1)[:out, :inn]
++    return weight.astype(np.float32) * s
++
++
++def dequant_fp4(packed: np.ndarray, scale_codes: np.ndarray, block=32) -> np.ndarray:
++    """Packed E2M1 `[out, in/2]`, even element in the low nibble, one E8M0 scale per `block`
++    inputs."""
++    p = packed.view(np.uint8)
++    codes = np.stack([p & 0x0F, p >> 4], -1).reshape(p.shape[0], -1)
++    vals = E2M1_VALUES[codes]
++    s = e8m0_to_float(scale_codes)
++    if s.shape != (codes.shape[0], codes.shape[1] // block):
++        raise ValueError(f"scale {s.shape} doesn't cover {codes.shape} at {block}")
++    return (vals.reshape(codes.shape[0], -1, block) * s[..., None]).reshape(codes.shape)
++
++
++# Checkpoint key families this text-only model reads nothing from.
++SKIPPED_PREFIXES = ("mtp.", "vision.", "aligner.", "image_start", "image_end", "image_newline")
++SKIPPED_SUFFIXES = (".ffn.gate.bias_vl",)
++
++
++def _is_skipped(name):
++    return name.startswith(SKIPPED_PREFIXES) or name.endswith(SKIPPED_SUFFIXES)
++
++
++def load_checkpoint(model: DeepseekV41ForCausalLM, path: str) -> dict:
++    """Read every backbone tensor, widen FP8 and FP4 to the parameter dtype, keep the Engram
++    table in FP8, and place each on its parameter's sharding. Returns the key -> parameter map
++    it used. Raises on a checkpoint key it neither reads nor skips, and on a parameter nothing
++    wrote."""
++    index = scan_safetensors(path)
++    index_st = index
++    used, written = {}, set()
++
++    def get(name):
++        if name not in index:
++            raise KeyError(f"checkpoint has no {name}")
++        used[name] = True
++        return read_tensor(index[name])
++
++    def dense(name):
++        """[out, in] float32 of a linear, dequantized when it ships FP8."""
++        w = get(name + ".weight")
++        if index[name + ".weight"][1] == "F8_E4M3":
++            return dequant_fp8_block(w, get(name + ".scale"))
++        return w.astype(np.float32)
++
++    def put(param, value, label, mesh=None, shape=None):
++        """Place a value on the parameter's partition spec over a concrete mesh. The engine's
++        loader builds the model under `nnx.eval_shape`, where a parameter's sharding names an
++        abstract mesh that can't place anything.
++
++        `value` is an array, or a function of one device's index (a tuple of slices) that returns
++        that device's block. The function form lets each host build only the blocks its own
++        devices hold: its experts, its rows of an Engram table."""
++        v = param.value
++        want = tuple(v.shape)
++        spec = getattr(getattr(v, "sharding", None), "spec", None) or P()
++        sharding = NamedSharding(mesh if mesh is not None else model.mesh, spec)
++        if callable(value):
++            if tuple(shape) != want:
++                raise ValueError(f"{label}: checkpoint gives {tuple(shape)}, parameter is {want}")
++
++            def block(index):
++                out = np.asarray(value(index))
++                return out.astype(v.dtype) if out.dtype != v.dtype else out
++
++            param.value = jax.make_array_from_callback(want, sharding, block)
++        else:
++            arr = np.asarray(value)
++            if tuple(arr.shape) != want:
++                raise ValueError(f"{label}: checkpoint gives {arr.shape}, parameter is {want}")
++            param.value = jax.device_put(arr.astype(v.dtype) if arr.dtype != v.dtype else arr, sharding)
++        written.add(id(param))
++
++    def rows_block(name, rows, padded, fill):
++        """A padded row-sharded table read one device's rows at a time from the memory map."""
++        arr = get(name)
++
++        def block(index):
++            r = index[0]
++            lo, hi = r.start or 0, padded if r.stop is None else r.stop
++            out = np.full((hi - lo, *arr.shape[1:]), fill, dtype=arr.dtype)
++            take = max(0, min(hi, rows) - lo)
++            if take:
++                out[:take] = arr[lo : lo + take]
++            return out[(slice(None), *index[1:])]
++
++        return block, (padded, *arr.shape[1:])
++
++    def expert_block(fp, w, n_exp, transpose_shape):
++        """One device's slice of an `[experts, in, out]` stack, dequantizing only its experts."""
++
++        def block(index):
++            e = index[0]
++            lo, hi = e.start or 0, n_exp if e.stop is None else e.stop
++            mats = []
++            for i in range(lo, hi):
++                key = f"{fp}experts.{i}.{w}"
++                if index_st[key + ".weight"][1] == "I8":
++                    mats.append(dequant_fp4(get(key + ".weight"), get(key + ".scale")).T)
++                else:
++                    mats.append(dense(key).T)
++            return np.stack(mats)[(slice(None), *index[1:])]
++
++        return block, (n_exp, *transpose_shape)
++
++    m = model.model
++    put(m.embed.embedding, get("embed.weight"), "embed")
++    put(model.lm_head.embedding, get("head.weight"), "head")
++    put(m.norm, get("norm.weight"), "norm")
++    cfg = model.config
++    for i, layer in enumerate(m.layers):
++        pre = f"layers.{i}."
++        put(layer.attn_norm, get(pre + "attn_norm.weight"), pre + "attn_norm")
++        put(layer.ffn_norm, get(pre + "ffn_norm.weight"), pre + "ffn_norm")
++        for part in ("attn", "ffn"):
++            for kind in ("fn", "base", "scale"):
++                put(getattr(layer, f"hc_{part}_{kind}"), get(f"{pre}hc_{part}_{kind}"), pre + f"hc_{part}_{kind}")
++        a = layer.attn
++        ap = pre + "attn."
++        put(a.attn_sink, get(ap + "attn_sink"), ap + "attn_sink")
++        put(a.wq_a, dense(ap + "wq_a").T, ap + "wq_a")
++        put(a.q_norm, get(ap + "q_norm.weight"), ap + "q_norm")
++        put(a.wq_b, dense(ap + "wq_b").T, ap + "wq_b")
++        put(a.wkv, dense(ap + "wkv").T, ap + "wkv")
++        put(a.kv_norm, get(ap + "kv_norm.weight"), ap + "kv_norm")
++        put(a.wo_a, dense(ap + "wo_a").reshape(a.wo_a.value.shape), ap + "wo_a")
++        put(a.wo_b, dense(ap + "wo_b").T, ap + "wo_b")
++        if a.compressor is not None:
++            cp = ap + "compressor."
++            put(a.compressor.wkv, dense(cp + "wkv").T, cp + "wkv")
++            if a.role.ratio > 1:
++                put(a.compressor.wgate, dense(cp + "wgate").T, cp + "wgate")
++            put(a.compressor.norm, get(cp + "norm.weight"), cp + "norm")
++        if a.indexer is not None:
++            ip = ap + "indexer."
++            put(a.indexer.wq_b, dense(ip + "wq_b").T, ip + "wq_b")
++            put(a.indexer.weights_proj, dense(ip + "weights_proj").T, ip + "weights_proj")
++            if a.indexer.owns_k:
++                put(a.indexer.wk, dense(ip + "wk").T, ip + "wk")
++                put(a.indexer.k_norm, get(ip + "k_norm.weight"), ip + "k_norm")
++        f = layer.ffn
++        fp = pre + "ffn."
++        put(f.gate_weight, get(fp + "gate.weight"), fp + "gate.weight")
++        put(f.gate_bias, get(fp + "gate.bias"), fp + "gate.bias")
++        put(f.shared_w1, dense(fp + "shared_experts.w1").T, fp + "shared_experts.w1")
++        put(f.shared_w3, dense(fp + "shared_experts.w3").T, fp + "shared_experts.w3")
++        put(f.shared_w2, dense(fp + "shared_experts.w2").T, fp + "shared_experts.w2")
++        n_exp = int(cfg.n_routed_experts)
++        emesh = f.experts.moe_mesh
++        dim, inter = int(cfg.dim), int(cfg.moe_inter_dim)
++        for w, target, tshape in (("w1", f.experts.wi_0, (dim, inter)), ("w3", f.experts.wi_1, (dim, inter)),
++                                  ("w2", f.experts.wo, (inter, dim))):
++            for e in range(n_exp):  # every expert's tensors count as read, whichever host reads them
++                used[f"{fp}experts.{e}.{w}.weight"] = True
++                if f"{fp}experts.{e}.{w}.scale" in index:
++                    used[f"{fp}experts.{e}.{w}.scale"] = True
++            block, shape = expert_block(fp, w, n_exp, tshape)
++            put(target, block, fp + f"experts.{w}", emesh, shape=shape)
++        if layer.engram is not None:
++            ep = pre + "engram."
++            g = layer.engram
++            if index[ep + "embed.weight"][1] != "F8_E4M3":
++                raise ValueError(f"{ep}embed.weight ships {index[ep + 'embed.weight'][1]}, not F8_E4M3")
++            if index[ep + "embed.weight"][2][0] != g.rows:
++                raise ValueError(f"{ep}embed.weight holds {index[ep + 'embed.weight'][2][0]} rows, "
++                                 f"the config {g.rows}")
++            # padding rows: zero values, and scale code 127 (a factor of 1), as convert.py pads
++            block, shape = rows_block(ep + "embed.weight", g.rows, g.padded_rows, 0)
++            put(g.table, block, ep + "embed.weight", shape=shape)
++            block, shape = rows_block(ep + "embed.scale", g.rows, g.padded_rows, 127)
++            put(g.table_scale, block, ep + "embed.scale", shape=shape)
++            put(g.wkv, dense(ep + "wkv").T, ep + "wkv")
++            put(g.q_weight, get(ep + "q_weight"), ep + "q_weight")
++            put(g.k_weight, get(ep + "k_weight"), ep + "k_weight")
++
++    unread = sorted(k for k in index if k not in used and not _is_skipped(k))
++    if unread:
++        raise ValueError(f"{len(unread)} checkpoint tensors have no parameter, first: {unread[:5]}")
++    missing = [
++        path for path, var in nnx.iter_graph(model)
++        if isinstance(var, nnx.Param) and id(var) not in written
++    ]
++    if missing:
++        raise ValueError(f"{len(missing)} parameters got no checkpoint tensor, first: {missing[:5]}")
++    logger.info("DeepSeek V4.1 loaded %d tensors from %s", len(used), path)
++    return used
++
++
++EntryClass = [DeepseekV41ForCausalLM]

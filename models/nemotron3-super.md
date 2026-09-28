@@ -2,8 +2,9 @@
 
 `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16`
 
-**Status: measured on TPU**, `v5p-8`, 2026-09-25, with the layer filter. [Measured](#measured)
-has two runs of this page's [Reproduce](#reproduce) block, on one Spot slice in europe-west4-b.
+**Status: measured on TPU**, `v5p-8`, 2026-09-28, with the layer filter. [Measured](#measured)
+has two runs of this page's [Reproduce](#reproduce) block, on one Spot slice in europe-west4-b,
+and the 2026-09-25 runs from before the patch's float32 shard sums.
 
 | | |
 |---|---|
@@ -169,10 +170,12 @@ A full-context sequence costs 1.0 GiB of KV on every chip. The recurrent state s
 Mamba-2 heads: 160 MiB of SSM state plus 4.69 MiB of conv state over 32 chips is 5.15 MiB per chip
 per sequence, and 10.3 MiB over 16. Capture buffers come out of the same free space.
 
-A `v5p-64` is 32 chips on 8 hosts, and nothing here has run across hosts. There the launch line
-takes `--tp-size 32`.
+A `v5p-64` is 32 chips on 8 hosts. Super hasn't run there. Ultra has, through the same model file
+([nemotron3-ultra.md](nemotron3-ultra.md#capture-check-on-a-v5p-64)), and
+[Across hosts](../README.md#across-hosts) gives the recipe. There the launch line takes
+`--tp-size 32`.
 
-Three counts don't divide over 32 chips. Each chip stores one of the 2 KV heads. The 8 Mamba-2
+Two counts don't divide over 32 chips. Each chip stores one of the 2 KV heads. The 8 Mamba-2
 groups shard 8 ways and replicate four times, so `B` and `C` ride into the state path replicated
 and each device slices the groups its heads read. The gated norm runs those same 8 groups, and its
 RMS reduction covers a whole 1,024 channel group, so a 32-way tensor axis splits one group over
@@ -248,19 +251,21 @@ the logits match to 1.2e-07 on a single request, on two packed requests and thro
 and a four-way tensor axis matches a one-way one to 6.0e-08. It also loads a checkpoint written
 under the published key names, resolves both published `config.json` files through `AutoConfig`,
 and runs the engine's own pools and jit through a prefix hit on the extra buffer's track slot, a
-poisoned request packed among clean ones, and `int8.yaml`. Twenty-three mutants each have to fail
+poisoned request packed among clean ones, and `int8.yaml`. Twenty-seven mutants each have to fail
 the check they name, and a NaN fails every check it reaches.
 
-The served model clamps `dt` to `(0, inf)`, as Megatron-LM, vLLM and NVIDIA's CUDA kernels do.
-`transformers` floors prefill `dt` at 0.001 instead. The test's random weights keep `dt` above 0.5,
-so the comparison never reaches that floor. On the published weights, 212 of Super's 5,120 Mamba-2
-heads have `softplus(dt_bias)` below it.
+The served model floors `dt` at `time_step_min`, 0.001, as `transformers` does in prefill.
+Megatron-LM, vLLM and NVIDIA's CUDA kernels clamp it to `(0, inf)` instead. On the published
+weights, 212 of Super's 5,120 Mamba-2 heads have `softplus(dt_bias)` below the floor, and check 16
+of the test puts one RMS group of heads under it.
 
 ## Measured
 
-The Reproduce block below ran twice on 2026-09-25, back to back on one `v5p-8` Spot slice in
-europe-west4-b, with the layer filter. 4 chips, one host, `tp_size=4`, BF16 engine,
-`mem_fraction_static=0.8`. 400 wikitext passages cut at 440 tokens, sent 8 to a call. The engine
+A clean-context replay ran the Reproduce block below twice on 2026-09-28, back to back on one
+`v5p-8` Spot slice in europe-west4-b, with the layer filter. 4 chips, one host, `tp_size=4`, BF16
+engine, `mem_fraction_static=0.8`. Checkpoint revision `2dc98e2afe4face0e4ce40972a915c45368bd34a`,
+unchanged since 2026-08-25. 400 wikitext passages cut at 440 tokens, sent 8 to a call; the prompt
+list's SHA-256 is `e0833f77481e27bece521db883e02132cde702b67fa8664ad61477ac5212fdc2`. The engine
 runs at most 6 at a time: it takes the smallest of the 8 asked for, its request pool size, and a
 limit it computes from the 262,144 context and a page size of 64 (`tp_worker.py`). Capture keeps
 slot 44 of 88 and writes it to `/dev/shm` as float32. Run 1 filled the compile cache, and run 2
@@ -268,22 +273,29 @@ read from it.
 
 | | Run 1 | Run 2 |
 |---|---|---|
-| Capture off, tokens/s | 4,360.2 | 4,360.3 |
-| Capture off, window | batches 3 to 32, first two discarded, 105,600 tokens in 24.22 s | the same batches, 105,600 tokens in 24.22 s |
-| Capture on, tokens/s | 3,299.4 | 3,321.7 |
-| Capture on, window | 106.58 s to 143.92 s, 123,200 tokens | 23.33 s to 60.42 s, 123,200 tokens |
-| Peak HBM per chip, capture off | 78.75 of 95.73 GiB, 188 samples over 403.4 s | 78.75 of 95.73 GiB, 137 samples over 300.7 s |
-| Peak HBM per chip, capture on | 78.89 of 95.73 GiB, 199 samples over 428.4 s | 78.89 of 95.73 GiB, 157 samples over 346.1 s |
-| Capture cost | 1.32x the throughput, 0.14 GiB of HBM per chip | 1.31x, 0.14 GiB |
-| Wire in the window | 27.0 MB/s | 27.2 MB/s |
-| End to end, capture on | 1,186.9 tokens/s over 148.29 s | 2,718.8 tokens/s over 64.73 s |
-| Peak duty cycle, capture off / on | 100.0% / 94.3% | 100.0% / 94.2% |
+| Capture off, tokens/s | 3,916.3 | 3,917.1 |
+| Capture off, window | batches 3 to 32, first two discarded, 105,600 tokens in 26.96 s | the same batches, 105,600 tokens in 26.96 s |
+| Capture on, tokens/s | 2,979.4 | 2,999.0 |
+| Capture on, window | 113.38 s to 154.73 s, 123,200 tokens | 24.66 s to 65.74 s, 123,200 tokens |
+| Peak HBM per chip, capture off | 78.78 of 95.73 GiB, 190 samples over 408.2 s | 78.78 of 95.73 GiB, 139 samples over 303.9 s |
+| Peak HBM per chip, capture on | 78.93 of 95.73 GiB, 205 samples over 440.8 s | 78.93 of 95.73 GiB, 160 samples over 349.9 s |
+| Capture cost | 1.31x the throughput, 0.15 GiB of HBM per chip | 1.31x, 0.15 GiB |
+| Wire in the window | 24.4 MB/s | 24.6 MB/s |
+| End to end, capture on | 1,103.0 tokens/s over 159.56 s | 2,495.9 tokens/s over 70.51 s |
+| Peak duty cycle, capture off / on | 100.0% / 96.2% | 100.0% / 95.3% |
 
 The wire carries 8,192 bytes per token, the one kept slot at BF16, and disk takes 16,384, the same
 slot at float32. Each run wrote 176,000 tokens into one 2.686 GiB shard, and both shards carry the
-same SHA-256, `027b52a6...`. Two runs before the filter, earlier on 2026-09-25, wrote different
-SHA-256s from the same prompts, `c7aeda79...` and `dfe04ee2...`. The second of those deleted the
-first one's shard, so nothing says why. `measure_model.sh` now keeps the last run's shard.
+same SHA-256, `f922609c...`.
+
+The same block ran twice on 2026-09-25, on the same checkpoint and prompts, before the model patch
+began flooring `dt` at `time_step_min` and summing tensor shards in float32 (2026-09-27). Those runs
+read 4,360.2 and 4,360.3 tokens/s with capture off and 3,299.4 and 3,321.7 with it on, 1.32x and
+1.31x, at 78.75 and 78.89 GiB, and both shards carried `027b52a6...`. The current patch reads 10%
+lower; the runs don't separate its two changes. Two runs before the filter, earlier on 2026-09-25,
+wrote different SHA-256s from the same prompts, `c7aeda79...` and `dfe04ee2...`. The second of
+those deleted the first one's shard, so nothing says why. `measure_model.sh` now keeps the last
+run's shard.
 
 Before the layer filter, on 2026-09-24, the engine copied all 88 slots, 720,896 bytes per token,
 and the same command read 514.0 and 503.8 tokens/s with capture on, 8.47x and 8.64x, at 80.28 GiB
@@ -291,17 +303,17 @@ of peak HBM.
 
 HBM is the peak of what [`scripts/peak_hbm.py`](../scripts/peak_hbm.py) sampled every 2 s, and all
 4 chips read the same. Duty cycle is the busiest chip's peak, and the other 3 sit within 0.1 points
-of it. A warm cache moves the windows. Run 2's first capture line comes at 12.71 s against run 1's
-95.92 s, and its capture-off sampler covers 300.7 s against 403.4 s.
+of it. A warm cache moves the windows. Run 2's first capture line comes at 12.92 s against run 1's
+101.55 s, and its capture-off sampler covers 303.9 s against 408.2 s.
 
 No `RESULT` line carries the duty cycle, the end-to-end rate or the first capture line. The duty
 cycle is each chip's `duty_pct` in `hbm_off.json` and `hbm_on.json`. The end-to-end rate and the
 first capture line come from the last and first progress lines in `capture_on.out`.
 
-The 50 safetensors, 247,227,650,480 bytes, came down in 668.3 s at 370.0 MB/s before run 1, with
-the mount at `mpol=interleave`, and run 2 found them cached. On 2026-09-24 the same fetch read
-363.3 MB/s, and `huggingface_hub` resumed two shards whose connections dropped inside that one
-process. A fetch you kill leaves partial files that a new process fetches again from zero, and
+The 50 safetensors, 247,227,650,480 bytes, came down in 679.2 s at 364.0 MB/s before run 1, with
+the mount at `mpol=interleave`, and run 2 found them cached. The same fetch read 370.0 MB/s on
+2026-09-25 and 363.3 MB/s on 2026-09-24, when `huggingface_hub` resumed two shards whose
+connections dropped inside that one process. A fetch you kill leaves partial files that a new process fetches again from zero, and
 `fetch_weights.py` deletes them before it starts. The checkpoint is more than the boot disk holds
 and more than the default 221 GiB `/dev/shm` on a v5p host, so the Reproduce block grows the
 mount to 340G first. The host has 440 GB of RAM.
@@ -320,8 +332,16 @@ stall. The TPU image has no `numastat`, so read `grep Shmem /sys/devices/system/
 ### Reproduce
 
 On a `v5p-8`, from the repo root. `bootstrap_tpu_vm.sh --model nemotron3` builds `sglang-jax` in
-`~/w` with the capture and steering patches, then the model and its hook. Run it again and it
-keeps that tree, so the whole block runs twice on one VM.
+`~/w` with the capture and steering patches, then the model and its hook. One pass gives one column
+of the table above. Run the block again and bootstrap keeps that tree, which is how the second
+column ran.
+
+On a VM that served another model, bootstrap moves the old tree aside, builds this one and lists
+the old model's weights. The fetch runs inside `measure_model.sh`, the block's last line, so delete
+those weights right after bootstrap, for example
+`rm -rf /dev/shm/hf/hub/models--openai--gpt-oss-120b`. The old model's capture shards stay in
+`/dev/shm/caps-*` too. Each run's manifest, SHA-256s included, already sits in that run's results
+folder, so delete the shards once you've kept the activations you need.
 
 ```bash
 bash scripts/bootstrap_tpu_vm.sh --model nemotron3
@@ -337,11 +357,6 @@ lands in `~/results/nemotron3-super/results.txt`. A rerun moves the last run's f
 `run-<time>/` in the same directory and its shard to `/dev/shm/caps-nemotron3-super-<time>`.
 The THP, unauthenticated-request and `libtpu metrics unavailable` messages are expected, and
 [the capture guide](../docs/activation-capture.md#setting-up-a-tpu-vm) says why.
-
-On a VM that served another model, bootstrap moves the old tree aside, builds this one and lists
-the old model's weights. Delete them before this block's fetch, for example
-`rm -rf /dev/shm/hf/hub/models--openai--gpt-oss-120b`. The old model's capture shards stay in
-`/dev/shm/caps-*` as well; delete them once you've kept what you need.
 
 To move the VM to another model afterwards, run bootstrap with that model's `--model`, or with
 none for Gemma 4. It moves this tree aside and builds the other one. These weights still fill

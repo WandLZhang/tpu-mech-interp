@@ -23,9 +23,9 @@
 # applies to. The gates that start the real engine on CPU share that tree, and the upstream suites
 # apply the patches to the clone themselves. SGL_COMMIT (default eb061d8) resolves to one full
 # commit id in the clone, and every gate that clones or builds gets that id, so SGL_COMMIT=main
-# tests one commit throughout. Budget about 70 minutes on 8 cores. The four model tests build
-# each model on CPU and compare it with a reference, and the gpt-oss and Nemotron 3 ones take
-# about 14 and 16 minutes.
+# tests one commit throughout. On a 90-vCPU c3d-highcpu-90 on 2026-09-28 all 46 gates took 2 hours
+# 3 minutes. The model tests under upstream/models/ build each model on CPU and compare it with a
+# reference; the DeepSeek V4.1 one took 27 minutes of that and the GLM-5.3-Flash one 21.
 #
 # Every gate writes its output to its own log. A gate that fails prints its whole log, and the
 # logs stay on disk, at the path the last line names, when anything failed. When the clone or the
@@ -62,8 +62,11 @@ TREE_GATES=(
 # Gates that need the clone and build their own trees from it.
 CLONE_GATES=(
   scripts/test_bootstrap_tree.py
+  scripts/test_multihost_exec.py
   upstream/capture-hooks/test_capture_hooks.py
   upstream/test_steering_hook.py
+  upstream/test_glm5_tp_sharding.py
+  upstream/test_glm5_fp8_accumulate.py
   upstream/models/test_*.py
 )
 

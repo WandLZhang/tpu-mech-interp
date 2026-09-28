@@ -22,6 +22,11 @@ Builds the engine with the same settings `capture_activations.py` uses, minus th
 the two rates compare. Runs two batches and discards them, because first-step timers read 7x to
 11x high, then times 30. Prints one `RESULT` line of JSON with the window it read.
 
+`--profile-dir DIR` traces one more batch, between the warmup and the timed window, with the JAX
+profiler in the engine's scheduler process, which holds the chips. The trace lands under DIR as
+`plugins/profile/<run>/<host>.xplane.pb`, which xprof and TensorBoard read. On a multi-host slice
+it covers host 0's chips. The timed window leaves the traced batch out.
+
 `--log-payloads`, or `LOG_PAYLOADS=1`, logs every request the engine gets, prompts and all, and a
 summary of each reply: its token counts and the shape and dtype of any array in it.
 
@@ -71,6 +76,11 @@ def main(argv=None) -> int:
         action="store_true",
         help="log each engine request and a summary of each reply to stderr; LOG_PAYLOADS=1 too",
     )
+    ap.add_argument(
+        "--profile-dir",
+        help="trace one more batch after the warmup into this folder with the JAX profiler; the "
+        "timed window leaves it out",
+    )
     args = ap.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
@@ -92,10 +102,16 @@ def main(argv=None) -> int:
     if payload_log_requested(args.log_payloads):
         enable_payload_log()
 
-    with open(args.prompts, encoding="utf-8") as fh:
-        prompts = [json.loads(line)["text"] for line in fh if line.strip()]
-    need = (args.warmup_batches + args.batches) * args.batch_size
-    if len(prompts) < need:
+    # A non-zero rank of a multi-host slice starts its engine and blocks in the scheduler; only rank
+    # 0 sends prompts, so only rank 0 reads them (the file lives on host 0 alone).
+    peer = int(os.environ.get("SGL_NODE_RANK", "0") or 0) > 0
+    prompts = []
+    if not peer:
+        with open(args.prompts, encoding="utf-8") as fh:
+            prompts = [json.loads(line)["text"] for line in fh if line.strip()]
+    profiled = 1 if args.profile_dir else 0
+    need = (args.warmup_batches + profiled + args.batches) * args.batch_size
+    if not peer and len(prompts) < need:
         print(f"need {need} prompts, got {len(prompts)}", file=sys.stderr)
         return 1
 
@@ -120,14 +136,32 @@ def main(argv=None) -> int:
     for i in range(args.warmup_batches):
         generate(i)
 
+    if args.profile_dir:
+        # The scheduler process holds the chips, so the trace starts there. The tokenizer manager's
+        # start_profile takes the output folder, which Engine.start_profile() doesn't pass, and
+        # python_tracer_level=0 keeps Python events out of the trace. Both calls raise
+        # RuntimeError when the scheduler refuses.
+        profile_dir = os.path.abspath(args.profile_dir)
+        os.makedirs(profile_dir, exist_ok=True)
+        log_request(call="start_profile", output_dir=profile_dir, python_tracer_level=0)
+        engine.loop.run_until_complete(
+            engine.tokenizer_manager.start_profile(output_dir=profile_dir, python_tracer_level=0)
+        )
+        generate(args.warmup_batches)
+        log_request(call="stop_profile")
+        engine.loop.run_until_complete(engine.tokenizer_manager.stop_profile())
+        print(f"PROFILE batch {args.warmup_batches + 1} traced into {profile_dir}", flush=True)
+
+    first_timed = args.warmup_batches + profiled
     started, tokens, done = time.time(), 0, 0
-    for i in range(args.warmup_batches, args.warmup_batches + args.batches):
+    for i in range(first_timed, first_timed + args.batches):
         out = generate(i)
         tokens += sum(o["meta_info"]["prompt_tokens"] for o in out)
         done += 1
     secs = time.time() - started
 
-    first = args.warmup_batches + 1
+    first = first_timed + 1
+    traced = f", batch {args.warmup_batches + 1} traced" if profiled else ""
     print(
         "RESULT "
         + json.dumps(
@@ -140,7 +174,7 @@ def main(argv=None) -> int:
                 "secs": round(secs, 2),
                 "tokens_per_s": round(tokens / secs, 1),
                 "window": f"batches {first} to {first + done - 1}, "
-                f"first {args.warmup_batches} discarded",
+                f"first {args.warmup_batches} discarded{traced}",
             }
         ),
         flush=True,

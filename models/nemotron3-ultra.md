@@ -2,7 +2,9 @@
 
 `nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16`
 
-**Status: CPU only.** It needs a `v5p-64` across 8 hosts, and nothing here has run across hosts.
+**Status: measured on TPU**, `v5p-64`, 2026-09-28, with the layer filter.
+[Capture check on a `v5p-64`](#capture-check-on-a-v5p-64) has one capture check, which passes on
+all 108 layers, and one measure run, on a Spot slice in us-east5-a across 8 hosts.
 [Super](nemotron3-super.md) serves on a chip through the same model file, and
 `upstream/models/test_nemotron_h_model.py` checks that file on CPU.
 
@@ -83,9 +85,9 @@ Engine: `sglang-jax` with
 `python/sgl_jax/srt/models/nemotron_h.py`, the config that resolves the layer stack, and the
 Mamba-2 backend that owns the recurrent state. Slice: `v5p-64`, 32 chips.
 
-Ultra hasn't run on a chip yet. Nothing in this model needs v6e. The Mamba-2 mixer is plain XLA,
-built from `cumsum`, `einsum`, `exp` and a `lax.scan`, with no Pallas kernel and no generation
-check.
+Ultra serves on a `v5p-64` ([below](#capture-check-on-a-v5p-64)), and nothing in this model needs
+v6e. The Mamba-2 mixer is plain XLA, built from `cumsum`, `einsum`, `exp` and a `lax.scan`, with
+no Pallas kernel and no generation check.
 
 Budget the slice per chip, not in aggregate. At `--tp-size 32` each chip stores one of the 2 KV
 heads, the same as [Super](nemotron3-super.md), so a sequence pays half its KV on every chip:
@@ -102,10 +104,12 @@ heads, the same as [Super](nemotron3-super.md), so a sequence pays half its KV o
 The recurrent state shards with the Mamba-2 heads, so it adds 12.3 MiB per chip per sequence
 against the 1.5 GiB of KV. Capture buffers come out of the same free space.
 
+Notes: the table is computed from the weights and the KV and state sizes.
+
 The [measured `v5p-8` runs](nemotron3-super.md#measured) keep weights in `/dev/shm`, which
 defaults to half the host's RAM. That host has 440 GB of RAM, less than this 1,044.1 GiB
-checkpoint, so the weights can't live there. Each of the 8 hosts in a `v5p-64` reads from the
-checkpoint. No run here has loaded a checkpoint this size.
+checkpoint, so the weights can't live there. Each of the 8 hosts in a `v5p-64` reads it from a
+GCS bucket through gcsfuse, as [Across hosts](../README.md#across-hosts) sets up.
 
 ```bash
 python3 -m sgl_jax.launch_server \
@@ -116,14 +120,17 @@ python3 -m sgl_jax.launch_server \
   --enable-return-hidden-states
 ```
 
-Untested: no run here has started this line, used a `v5p-64` or loaded this checkpoint.
+Untested as written. Across 8 hosts every host runs the engine with `--nnodes 8`, its own
+`--node-rank` and host 0's `--dist-init-addr`. For this repo's scripts,
+`scripts/multihost_exec.sh` sets the same three settings on every host, and the runs
+[below](#capture-check-on-a-v5p-64) started the engine that way through `scripts/multihost_run.sh`.
 
 A hybrid recurrent model needs `--disable-radix-cache` or `--enable-unified-radix-tree` to start.
 [Super](nemotron3-super.md#serve) covers the prefix-caching flags.
 
 Confirm the chip count first, on all 8 hosts at once, as
-[gpt-oss-120b](gpt-oss-120b.md#scaling-out-to-v5p-64) describes. Untested: no run here has used a
-`v5p-64`. It reports 32.
+[gpt-oss-120b](gpt-oss-120b.md#scaling-out-to-v5p-64) describes. It reported 32 on every host on
+2026-09-27; `scripts/multihost_setup.sh` runs this check.
 
 ```bash
 python3 -c "import jax; jax.distributed.initialize(); print(jax.device_count())"
@@ -188,6 +195,75 @@ if layer_id in self.layers_to_capture:
 108 layers at 8,192 dim is 1,728 KiB per token of host traffic. At 1,000 tokens/s that's 1.77 GB/s
 against the host NIC. That's every slot. `capture_activations.py` hands `--layers` to the engine as
 `--return-hidden-states-layers`, and one kept slot moves 16 KiB per token.
+
+The first capture check on the `v5p-64` read 0.93, 1.29, 1.27, 2.77, 2.62, 12.08 and 10.51 times
+the BF16 floor at slots 1 to 7. The fault sat in the reference. `check_capture.py --offload-folder`
+loaded the checkpoint at BF16 and upcast afterwards, and accelerate's offload index cast each
+tensor to BF16 on read. Ultra's router correction bias is float32 at 56.975 to 56.981, and BF16's
+step there is 0.25, so the reference routed as if every expert carried a bias of 57.0. The float32
+pass and the BF16 floor both lost it; transformers keeps that bias float32 at BF16. The streamed
+path now reads float32 checkpoint tensors at float32. On CPU, the same engine on the first 8
+layers of the published checkpoint, with `ep_size` equal to `tp_size` and `SGL_PROBE_MOE=dense`,
+gives these ratios for prompt 0 on 2026-09-28. `ref8` is `transformers` 5.17 without streaming,
+built with `--reference-only --reference-layers 8`.
+
+| Reference | tp | Slots 1 to 7 |
+| --- | --- | --- |
+| published `ref-nemotron3-ultra.npz` | 1 | 0.81 1.25 1.23 2.76 2.62 12.10 10.54 |
+| published `ref-nemotron3-ultra.npz` | 8 | 0.93 1.31 1.27 2.77 2.62 12.05 10.55 |
+| published `ref-nemotron3-ultra.npz` | 32 | 0.93 1.31 1.28 2.77 2.62 12.03 10.54 |
+| `ref8` | 1 | 0.81 0.88 0.85 0.88 0.86 0.89 0.80 |
+| `ref8` | 8 | 0.93 0.95 0.92 0.93 0.92 0.92 0.87 |
+| `ref8` | 32 | 0.93 0.95 0.92 0.93 0.92 0.92 0.87 |
+
+The streamed path then got the same test on the same 8 layers. The tp 32 capture above, saved as
+`cap-tp32-dense.npz`, was gated against two streamed 8-layer references built on 2026-09-28, one
+before the fix and one after:
+
+| Streamed reference | Worst ratio, prompt 0 / 1 | Control | Result |
+| --- | --- | --- | --- |
+| before the fix | 12.19 / 12.02 | 8.6x / 8.8x | FAILED at slots 4 to 7 |
+| after the fix | 0.95 / 0.95 | 55.6x / 51.5x | PASS |
+
+The published reference was rebuilt with the fix on a `c4-highcpu-96` in `us-east5-a`, on
+2026-09-28 in 2 hours 20 minutes at a peak RSS of 147 GiB. The new npz replaced
+`refs/ref-nemotron3-ultra.npz` in the bucket; the old one is
+`refs/ref-nemotron3-ultra.pre-f32fix.npz`.
+
+### Capture check on a `v5p-64`
+
+`scripts/multihost_run.sh NODE us-east5-a nemotron3-ultra setup check` on a `v5p-64` Spot slice
+(32 chips, 8 hosts) in us-east5-a, tp 32, ep 32, all 108 layers, 2026-09-28 06:34 to 06:55Z,
+against the rebuilt reference, BF16 floor gate:
+
+| Prompt | Layers | Result | Worst ratio to the floor | Worst Pearson | Control |
+|---|---|---|---|---|---|
+| 441 tokens | 108 | all pass | 1.04 (layer 72) | 0.9988 (layer 104) | 3.58x, detected |
+| 1,322 tokens, split across prefill passes | 108 | all pass | 1.00 (layer 72) | 0.9990 (layer 59) | 4.47x, detected |
+
+The extend graph precompiled in 2.4 minutes and the decode graph in 1.4.
+
+**Throughput and HBM**, `scripts/multihost_run.sh NODE us-east5-a nemotron3-ultra measure`
+(`scripts/measure_model.sh` with `PROMPTS=1000`, 440-token prompts), capture slot 54, tp 32, ep 32,
+2026-09-28 06:57 to 07:25Z:
+
+| | Tokens/s | Window | Peak HBM per chip (host 0's 4 chips) |
+|---|---|---|---|
+| Capture off | 3,095.3 | 30 batches, first 2 discarded, 105,600 tokens in 34.12 s | 78.01 of 95.73 GiB (448 samples) |
+| Capture on, slot 54 | 2,218.2 | steady window 258.69 to 441.18 s, 404,800 tokens | 78.39 of 95.73 GiB (369 samples) |
+
+Capture costs 1.40x (3,095.3 over 2,218.2), and the wire carries 16,384 bytes a token (one
+8,192-wide BF16 slot) at 36.3 MB/s.
+
+To reproduce, stage the checkpoint and its reference as [Across hosts](../README.md#across-hosts)
+describes, then run from the repo root:
+
+```bash
+BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE nemotron3-ultra setup check measure
+```
+
+Notes: nobody has replayed that block as written from a clean start. The runs above came from the
+same script and row.
 
 ## Notes
 

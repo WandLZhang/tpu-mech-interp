@@ -16,6 +16,9 @@ git -c user.name=you -c user.email=you@example.com am < "$REPO/upstream/sglang-j
 git apply "$REPO/upstream/models/inkling-model.patch"
 ```
 
+No recorded run typed this block. The recorded runs built their trees through
+`scripts/bootstrap_tpu_vm.sh`, which also applies both steering patches.
+
 | Patch | Adds | Serves | Test |
 |---|---|---|---|
 | [`inkling-model.patch`](inkling-model.patch) | `models/inkling.py`, `configs/inkling.py`, `mem_cache/short_conv_state_pool.py`, position bias and sliding-window slot mapping in the native backend, KV-head padding that reads the target path, a worker hook that refuses flags before the load | `thinkingmachines/Inkling`, `thinkingmachines/Inkling-Small` | [`test_inkling.py`](test_inkling.py) |
@@ -23,19 +26,29 @@ git apply "$REPO/upstream/models/inkling-model.patch"
 | [`kimi-k3-capture-hook.patch`](kimi-k3-capture-hook.patch) | the hook on `models/kimi_k3.py` | `moonshotai/Kimi-K3` | [`test_kimi_k3_model.py`](test_kimi_k3_model.py) |
 | [`nemotron3-model.patch`](nemotron3-model.patch) | `models/nemotron_h.py`, `configs/nemotron_h.py`, `layers/attention/mamba/`, a build-time refusal of the expert-placement flags | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16`, `nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16` | [`test_nemotron_h_model.py`](test_nemotron_h_model.py) |
 | [`nemotron3-capture-hook.patch`](nemotron3-capture-hook.patch) | the hook on `models/nemotron_h.py` | the same | [`test_nemotron_h_model.py`](test_nemotron_h_model.py) |
+| [`nemotron3-probe.patch`](nemotron3-probe.patch) | `layers/moe_probe.py`: `SGL_PROBE_*` switches, off by default, that swap the top-k kernel, the grouped matmul, the router dot, the latent projections, EPMoE's dispatch or the shared expert for a plain JAX version, keep the MoE output float32, or raise the block's open dot precision | the same, for diagnosis | [`test_nemotron3_probe.py`](test_nemotron3_probe.py) |
+| [`deepseek-v41-model.patch`](deepseek-v41-model.patch) | `models/deepseek_v41.py` with the capture hook, `configs/deepseek_v41.py`, `mem_cache/deepseek_v41_state_pool.py`, and a runner hook for a model's own pools | `deepseek-ai/DeepSeek-V4.1-Flash`, text only | [`test_deepseek_v41_model.py`](test_deepseek_v41_model.py) |
+| [`glm5-next-model.patch`](glm5-next-model.patch) | `models/glm5_next.py` with the capture hook, `configs/glm5_next.py`, `mem_cache/glm5_next_state_pool.py`, and the runner hooks for a model's own pools | `zai-org/GLM-5.3-Flash`, text only | [`test_glm5_next_model.py`](test_glm5_next_model.py) |
+| [`glm5-next-probe.patch`](glm5-next-probe.patch) | `layers/moe_probe.py` and `SGL_PROBE_MOE=dense` in `models/glm5_next.py`, off by default | the same, for diagnosis | [`test_glm5_next_probe.py`](test_glm5_next_probe.py) |
 | [`gpt-oss-model.patch`](gpt-oss-model.patch) | `models/gpt_oss.py`, per-expert bias and the gpt-oss gate in `EPMoE`, YaRN `truncate`, the `gmm` v1 bias after the activation rescale, and the output sharding of the EPLB dispatch gathers | `openai/gpt-oss-120b`, `openai/gpt-oss-20b` | [`test_gpt_oss_model.py`](test_gpt_oss_model.py) |
 
 One clone takes one model patch. `gpt-oss-model.patch`, `kimi-k3-model.patch` and
 `nemotron3-model.patch` all edit `python/sgl_jax/srt/layers/moe.py`, and any two of them collide
-there. The gpt-oss and Kimi K3 patches also carry the same `eplb/expert_location.py` hunk.
+there. `deepseek-v41-model.patch` collides with the Kimi K3 and Nemotron 3 patches in either
+order, and applies with gpt-oss or Inkling in either order. The gpt-oss and Kimi K3 patches also
+carry the same `eplb/expert_location.py` hunk.
+`glm5-next-model.patch` carries the same runner hooks as the DeepSeek V4.1 patch, so the two
+collide, and it collides with the Inkling, Kimi K3 and Nemotron 3 patches in either order. It
+applies with gpt-oss in either order.
 `inkling-model.patch` collides with the Kimi patch in `layers/attention/native_backend.py` and
 with the Nemotron patch in `model_executor/model_runner_kv_cache_mixin.py`. With one patch
 applied, `git apply --check` refuses each of the others, except gpt-oss with inkling in either
 order. A serving instance runs one model, so clone per model. On a TPU VM,
 `bash scripts/bootstrap_tpu_vm.sh --model NAME` builds the tree with one model's patches, `NAME`
-being `gpt-oss`, `inkling`, `kimi-k3` or `nemotron3`. A rerun that asks for what the tree already
-holds keeps it: the same name, or no `--model` on a tree built without one. A run that asks for
-another model, or for none when the tree holds one, moves it aside and builds the tree it asks for.
+being `deepseek-v41`, `glm5-next`, `gpt-oss`, `inkling`, `kimi-k3` or `nemotron3`. A rerun that
+asks for what the tree already holds keeps it: the same name, or no `--model` on a tree built
+without one. A run that asks for another model, or for none when the tree holds one, moves it aside
+and builds the tree it asks for.
 
 Each test runs on CPU. Every test first builds the tree the TPU VM serves from, `eb061d8` with
 `sglang-jax-877.patch` and both steering patches, and applies its patch on top. The gpt-oss,
@@ -62,12 +75,13 @@ tests and the `scripts/` gates start.
 
 ## `inkling-model.patch`
 
-Nine files. `models/inkling.py`, `configs/inkling.py` and `mem_cache/short_conv_state_pool.py`
-are new. The other six teach the native attention backend to read a per-token position bias and
+Ten files. `models/inkling.py`, `configs/inkling.py` and `mem_cache/short_conv_state_pool.py`
+are new. The other seven teach the native attention backend to read a per-token position bias and
 to map sliding-window cache slots, register the config, let a checkpoint name its KV projections
 something other than `k_proj` and `v_proj`, have the runner build a per-request pool for the
-short-convolution windows, have precompile build the batches that address it, and have the
-worker ask the model class about the flags before it loads a weight.
+short-convolution windows, have precompile build the batches that address it, have the worker ask
+the model class about the flags before it loads a weight, and have the loader skip its gcsfuse
+warm-up read in a multi-process load.
 
 `EntryClass` registers three names. `InklingForCausalLM` is the decoder.
 `InklingForConditionalGeneration` matches the architecture the published `config.json` advertises
@@ -394,12 +408,13 @@ tokens into the request before it.
 `replay_scalar` runs that scan. `A` is a scalar times the identity, so it carries one number per
 chunk per head where a dense `[K, K]` form would carry 16,384 at `ssm_state_size=128`.
 
-`dt` is clamped to `mamba_dt_limit`, whose `(0.0, inf)` default neither published `config.json`
-overrides. Megatron-LM trains with that pair, and NVIDIA's CUDA kernels and vLLM serve with it.
-The torch paths floor `dt` at `time_step_min`, 0.001, instead: `transformers` 5.17 in prefill and
-not in decode, and NVIDIA's `torch_forward` in both. On the published weights, 212 of Super's
-5,120 Mamba-2 heads have `softplus(dt_bias)` below 0.001, so that floor binds there. The test's
-random weights keep `dt` above 0.5, so its comparison with `transformers` never reaches the floor.
+`dt` is floored at `time_step_min`, 0.001, and capped at the high end of `mamba_dt_limit`, whose
+`(0.0, inf)` default neither published `config.json` overrides. That's the clamp `transformers`
+5.17 applies in prefill, and every capture is checked against `transformers`. Megatron-LM trains
+with `(0.0, inf)`, and NVIDIA's CUDA kernels and vLLM serve with it. On the published weights the
+floor binds for 212 of Super's 5,120 Mamba-2 heads and 458 of Ultra's 12,288.
+`NemotronHConfig.scan_dt_limit` holds the clamp, and check 16 of the test puts one RMS group of
+heads under it.
 
 The conv runs through `short_convolution`, the same packed varlen conv the KDA and GDN backends
 use.
@@ -419,7 +434,7 @@ run on CPU only.
 
 | File | Change |
 |---|---|
-| `layers/moe.py` | `EPMoE(gated=False)` and a `relu2` activation, for experts with one input matrix, which quantize those two matrices under a MoE quantization config |
+| `layers/moe.py` | `EPMoE(gated=False)` and a `relu2` activation, for experts with one input matrix, which quantize those two matrices under a MoE quantization config, and a `reduce_in_float32` flag that keeps the experts' down projection, the top-k combine and the all-reduce in float32 |
 | `mem_cache/recurrent_state_pool.py` | the SSM state buffer reads `head_k_dim` for its last axis, and the sharding asserts cover the axes that shard |
 | `layers/attention/fla/group_rmsnorm.py` | a second layout for an RMS group that straddles shards |
 | `model_executor/model_runner_kv_cache_mixin.py` | the same width in the per-request byte count, and `nemotron_h` resolves to its own recurrent config |
@@ -518,14 +533,14 @@ the `[conv_dim, 1, conv_kernel]` depthwise kernel, the router and the stacked ex
 resolves both published `config.json` files through `AutoConfig`, and a config stock
 `transformers` saved under its own block names.
 
-The forwards in checks 2 to 8 and 13 put a dense attention stand-in behind `RadixAttention`. The
-engine's attention backend on CPU, `NativeAttention`, writes through `set_kv_buffer_legacy`,
-which the `HybridLinearKVPool` a hybrid recurrent model gets doesn't have. Checks 10 to 12 run a
-Mamba-2, LatentMoE, Mamba-2, MLP stack instead, which holds no attention block, through the
-engine's own classes: `RecurrentStatePool`, `HybridReqToTokenPool` with the extra buffer,
-`HybridLinearKVPool`, `MemoryPools`, the backend metadata `get_forward_metadata` builds from a
-`ModelWorkerBatch`, and `make_jitted_run_model`, the jit the runner calls, which clones a matched
-tree slot before the model reads it.
+The forwards in checks 2 to 8, 13, 16 and 17 put a dense attention stand-in behind
+`RadixAttention`. The engine's attention backend on CPU, `NativeAttention`, writes through
+`set_kv_buffer_legacy`, which the `HybridLinearKVPool` a hybrid recurrent model gets doesn't have.
+Checks 10 to 12 run a Mamba-2, LatentMoE, Mamba-2, MLP stack instead, which holds no attention
+block, through the engine's own classes: `RecurrentStatePool`, `HybridReqToTokenPool` with the
+extra buffer, `HybridLinearKVPool`, `MemoryPools`, the backend metadata `get_forward_metadata`
+builds from a `ModelWorkerBatch`, and `make_jitted_run_model`, the jit the runner calls, which
+clones a matched tree slot before the model reads it.
 
 | Check | What it pins | Max abs error |
 |---|---|---|
@@ -557,7 +572,7 @@ resolve to the model's config, `attn_backend_wrapper` has to build a `Mamba2Attn
 layer plan, and `_per_req_state_bytes_from_config` has to count what one slot of a real
 `RecurrentStatePool` holds, and 43,171,840 bytes for Super at `--tp-size 4`.
 
-Twenty-three negative controls follow. Nine perturb one weight, fourteen rewrite the patched
+Twenty-seven negative controls follow. Nine perturb one weight, eighteen rewrite the patched
 source, and each has to move the check it targets past 1e-05. A control that returns NaN counts as
 missed.
 
@@ -597,12 +612,47 @@ from the select, since on a finite carry the two give the same state; check 11 c
 returns infinity found a non-finite value where the clean run has none, or a property that didn't
 hold.
 
+Notes: the table leaves out four controls: the `dt` floor dropped, the same at BF16, row-parallel
+shards rounded to BF16, and the experts' all-reduce in BF16.
+
 ## `nemotron3-capture-hook.patch`
 
 One file. The four parts [`../capture-hooks/README.md`](../capture-hooks/README.md) describes, on
 `models/nemotron_h.py`. The stack carries `hidden_states` and `residual` as a pair and `residual`
 is None on layer 0, so the append takes the None-residual form. Depends on
 [`../sglang-jax-877.patch`](../sglang-jax-877.patch) for the flag and the output reshape.
+
+## `nemotron3-probe.patch`
+
+Five files, on top of the model patch and its hook. It was written to find which LatentMoE piece
+put Ultra's on-chip capture over the BF16 floor. The fault turned out to sit in the CPU reference
+([Nemotron 3 Ultra](../../models/nemotron3-ultra.md#capture)), and the switches stay for diagnosis.
+`layers/moe_probe.py` reads eight variables when the model traces, each off by default, and a run
+with none set traces the program the tree traced before. On a slice, set one variable per engine
+start; `scripts/multihost_exec.sh` passes every `SGL_*` variable to all hosts.
+
+| Variable | Swaps in |
+|---|---|
+| `SGL_PROBE_TOPK=jnp` | the plain JAX top-k for the Pallas top-k kernels `layers/gate.py` runs on a TPU |
+| `SGL_PROBE_GMM=xla` | one masked dense dot per local expert for each `gmm` call, float32 accumulation, `gmm`'s output dtypes |
+| `SGL_PROBE_GMM=xla32` | the same, with the up projection and the activation kept in float32 |
+| `SGL_PROBE_ROUTER=f32highest` | the router dot as an explicit float32 `dot_general` at HIGHEST, and the sigmoid written out |
+| `SGL_PROBE_LATENT=f32` | `fc1_latent_proj` and `fc2_latent_proj` in float32 at HIGHEST |
+| `SGL_PROBE_MOE=dense` | the routed experts without EPMoE's dispatch: every local expert over every token in float32 at HIGHEST, each row scaled by the token's float32 top-k weight for that expert, then EPMoE's float32 reduce over the shards. No sort, group sizes, padding, `gmm` or unpermute |
+| `SGL_PROBE_SHARED=f32` | the shared expert in float32 at HIGHEST, and a float32 add to the routed output |
+| `SGL_PROBE_MOE_OUT=f32` | the MoE block's output in float32: EPMoE's sum unrounded, `fc2_latent_proj` in float32 at HIGHEST, and the next residual add and the capture in float32. The stream rounds to BF16 inside the next block |
+| `SGL_PROBE_MATMUL=highest` | `jax.default_matmul_precision("highest")` over the MoE block, cleared around the top-k and `gmm` kernel calls, which Mosaic refuses at HIGHEST |
+
+A value outside the table raises. The model logs the switches that are on. `SGL_PROBE_MOE=dense`
+holds one `[tokens, intermediate]` and one `[tokens, latent]` float32 array per shard at a time,
+whatever top_k is, and reads each local expert's weights once.
+[`test_nemotron3_probe.py`](test_nemotron3_probe.py) checks each switch against the default path
+in float32 at tp=1, tp=4, tp=4 with `ep_size` 4 and tp=8 with `ep_size` 8, `SGL_PROBE_MOE_OUT` in
+BF16, the precision each call sees under `SGL_PROBE_MATMUL`, `dense_gmm` against `gmm`,
+`dense_experts` against a per-token gather of the top-k experts, the Pallas grouped top-k in
+interpret mode against the JAX path on Ultra's routing shape, `check_capture.py --engine-layers`
+through the real engine on a tiny checkpoint, and two requests packed to 128 tokens per mesh
+against transformers.
 
 ## `kimi-k3-model.patch`
 
@@ -739,7 +789,7 @@ that names `--attention-backend native`.
 
 ### What `test_kimi_k3_model.py` covers
 
-Eleven checks. No full HuggingFace forward runs, because `modeling_kimi_linear.py` needs Triton for
+Twelve checks. No full HuggingFace forward runs, because `modeling_kimi_linear.py` needs Triton for
 the KDA recurrence. Two pieces of that file don't: `SituAndMul` and `_apply_attn_res` compile and
 run on their own, and checks 3 and 4 use them beside a NumPy float64 reference written from the
 published equations. Check 10 runs the whole model against a float64 forward written from that
@@ -833,6 +883,10 @@ fails every gate.
     to be refused when the model builds, an online `QuantizationConfig` has to reach `EPMoE`, and
     the checkpoint's own dict mustn't. Control: the file's bias rounded through BF16 moves by
     2.4e-04.
+12. The full model at `--tp-size 32` on 32 simulated devices, in a child process: one chip's
+    weights and decoded-layer temporary from shapes, dtypes and shardings alone. Resident weights
+    have to fit the `--mem-fraction-static 0.8` reservation. Control: the decode-at-load weights
+    have to exceed the chip.
 
 Check 10 serves float32 with a float32 short-convolution state, so the engine's error is
 rounding, not BF16. The Mega KDA kernel takes BF16 only, so its prefill runs the chunked KDA
@@ -865,7 +919,7 @@ pinned SHA-256 before the test reads it. They're cached under `KIMI_K3_CACHE`, o
 `ModelRunner`, which imports `pybase64` and `llguidance`. Without them check 10 fails and the run
 ends on the `uv pip install` line. `LOG_PAYLOADS=1` prints the `ServerArgs` of every engine launch
 and every request check 10 sends. The whole run takes about 8 minutes on CPU, most of it in check
-10's seven engine launches.
+10's 19 engine launches, 12 of them in child processes.
 
 ## `kimi-k3-capture-hook.patch`
 
@@ -881,6 +935,312 @@ restarts every 12 layers.
 Check 10 of the test serves with `--enable-return-hidden-states` at `--dp-size 1` and holds every
 layer's input the engine returns, at every prompt position and decode step, to the float64
 forward.
+
+## `deepseek-v41-model.patch`
+
+Five files. `models/deepseek_v41.py`, `configs/deepseek_v41.py` and
+`mem_cache/deepseek_v41_state_pool.py` are new. `hf_transformers_utils.py` registers the config,
+and `model_runner_kv_cache_mixin.py` gains three hooks a model class can define:
+`build_extra_memory_pools` builds pools beside `token_to_kv_pool`, and the model's forward returns
+their new buffers under the same names; `paged_kv_layers` sets how many layers the paged KV pool
+holds; `paged_kv_token_cap` caps its tokens.
+
+It serves the text backbone of `deepseek-ai/DeepSeek-V4.1-Flash` at revision
+`dba1be0a40aa45a94ad051997016db3960a90277`: 40 layers, 4 residual copies, the window and
+compressed attention, the indexer and its candidate pool, 384 experts top-6 with one shared, and
+both Engram tables. The DSpark draft blocks (`mtp.*`) and the vision tower (`vision.*`,
+`aligner.*`, `image_*`, `ffn.gate.bias_vl`) load nothing. The port follows DeepSeek's own runtime,
+`inference/model.py` and `inference/engram.py` in the checkpoint repo, name for name.
+[`../../models/deepseek-v4.1-flash.md`](../../models/deepseek-v4.1-flash.md) carries the
+architecture and the slice arithmetic.
+
+Serve it with the radix cache off, which `build_extra_memory_pools` requires, and a context
+length that sizes the state pool. On one `v5p-64`:
+
+```bash
+bash scripts/bootstrap_tpu_vm.sh --model deepseek-v41
+# engine args: --tp-size 32 --ep-size 32 --disable-radix-cache --context-length 4096
+```
+
+[The model page](../../models/deepseek-v4.1-flash.md#measured-on-a-v5p-64) has the runs behind
+these settings, which took them through the `deepseek-v41` row of `scripts/multihost_run.sh`.
+
+### The config is nested
+
+The published `config.json` puts the language model under `text_config` and ships no config
+module, so `transformers` can't build `model_type: deepseek_v41`. `DeepseekV41Config` flattens
+`text_config` and keeps both the published names and the reference runtime's (`hidden_size` and
+`dim`, `kv_source_layer_ids` and `kv_source_layers`). It moves three published fields aside:
+
+- `quantization_config` goes to `checkpoint_quantization_config`. The engine reads `quant_method:
+  fp8` as a request to serve FP8 linears, and this model widens its weights itself.
+- `rope_scaling` goes to `yarn_rope_scaling`. `transformers` 5 rewrites it into
+  `rope_parameters` inside `PretrainedConfig.__init__`, and the model reads the four YaRN fields.
+- `sliding_window` goes. `ModelConfig` reads it and splits the paged KV pool into full and window
+  layers; this model keeps its window ring in its own pool, under `window_size`.
+
+### Weights
+
+`load_checkpoint` reads the safetensors headers itself. Dense linears ship E4M3 with one E8M0
+scale per 32x32 tile and widen to the serving dtype on the host. Routed experts ship as `I8`, two
+E2M1 codes a byte with the even element in the low nibble and one E8M0 scale per 32 inputs, and
+widen the same way into `EPMoE`'s `[experts, in, out]` stacks. The two Engram tables stay E4M3
+with their E8M0 exponents, and a row widens when a hash picks it. The loader raises on a
+checkpoint tensor it neither reads nor skips, and on a parameter nothing wrote.
+
+The routed experts run through `EPMoE` with its `_gmm_compute` overridden for the SwiGLU clamp
+(`swiglu_limit: 10`, both sides on the up branch, above on the gate branch), so the patch leaves
+`layers/moe.py` alone. `--ep-size 32` puts 12 whole experts on each chip.
+
+The two Engram tables split by row over every device of the mesh, padded up to a multiple of the
+device count the way `convert.py` pads its shards. A lookup runs in `shard_map`: each device
+gathers against its own rows, zeroes the ones it doesn't hold, and one `psum` over the mesh sums
+the widened rows, as `ParallelEngramEmbedding.forward` does across ranks.
+
+The loader places the experts and the Engram rows with `jax.make_array_from_callback`, so each
+host dequantizes only its own devices' experts and reads only their Engram rows, from memory-mapped
+safetensors. Attention weights, the router, the shared expert, the embedding and the FP32 head are
+replicated.
+
+On one `v5p-64` at `--tp-size 32 --dp-size 1 --ep-size 32`, from the shapes `nnx.eval_shape`
+builds: routed experts 31.64 GiB a chip, the Engram tables 5.90 GiB, everything replicated 14.48
+GiB, the vocab-sharded head 0.08 GiB, 52.09 GiB of weights. A capture serve of 8 requests at
+`--context-length 4096` adds 0.15 GiB of state and 0.06 GiB of paged KV, 52.31 GiB against the
+76.58 GiB `--mem-fraction-static 0.8` reserves. Replicating the Engram tables instead would take
+235 GiB.
+
+### The state
+
+Every cache lives in `DeepseekV41StatePool`, one row per request slot plus a dummy row that
+padding tokens write to: the 128-slot window ring of each layer, the compressed latents and
+index keys of the four KV owners, the open group of each ratio-2 compressor, and the last three
+compressed token ids for the Engram hash. Every read is masked by the request's own prefix
+length, so a slot needs no reset between requests. The pool isn't paged and holds no prefix,
+which is why the radix cache stays off. It's replicated on every chip and sized by
+`--context-length`: a slot costs 17.5 MiB at 4,096, 205 MiB at 65,536 and 3.2 GiB at 1,048,576.
+
+The engine still builds its paged KV pool and the scheduler still hands every token a slot there,
+though nothing reads it. `paged_kv_layers = 1` keeps a slot at 2 KiB instead of the 80 KiB 40 layers
+at head dim 512 would cost, and `paged_kv_token_cap` holds the pool to requests times context,
+at most 1,048,576 tokens, so it doesn't take the HBM the state pool needs.
+
+The Engram hash runs on device. It needs 64-bit products and the engine runs JAX without 64-bit
+integers, so each product runs in four 16-bit limbs and the modulo runs four bits at a time.
+
+### Capture
+
+Slot `k` holds the collapsed attention input of layer `k`: the four copies after any Engram
+lookup, collapsed with the incoming `pre` mix, before `attn_norm`. 40 slots at 5,120.
+
+### A bug in the reference runtime
+
+`Indexer.forward` in `inference/model.py` sets `shared_attn.index_k = self.k_cache` only when its
+layer closed a group this step (`if self.owns_k and latent is not None`). On a decode step that
+closes no ratio-2 group, the ratio-2 owners then score their queries against whatever cache the
+last publisher left there. In the published config that's layer 20's ratio-1 keys from the step
+before, read at layers 2, 8 and 14, by the same code path the tiny model runs. The port reads each
+owner's own keys. The test shows the reference doing it, then moves that one assignment ahead of
+the condition in the reference it compares against. A prefill closes every group it can, so the
+capture reference, which runs prefill only, reads the right keys either way.
+
+### What `test_deepseek_v41_model.py` covers
+
+Eleven checks, on CPU, against DeepSeek's runtime at the pinned revision. Each published file has to
+match its pinned SHA-256 in `deepseek-v41-published.sha256` before the test reads it. `kernel.py`
+runs on CUDA only, so the test carries CPU torch equivalents of the six kernels, written from the
+tilelang source, and checks them: the FP8 and FP4 round trips bit for bit against JAX's casts, and
+the Sinkhorn split against the engine's own `kernels/mhc.mhc_gates` in interpret mode.
+
+The tiny model keeps every mode the published one uses: window layers 0-1, ratio-2 owners 2 and 4
+with reuse layers after each, the ratio-1 owner 6 at the encoder-decoder boundary with the
+candidate pool, a reindex layer 8, and Engram on a window layer and on a ratio-2 owner, as at 1 and
+14. Its checkpoint is written in the published format, and its tensor names per layer match the
+published index's layer of the same mode.
+
+1. The patch applies to the bootstrap tree and compiles. A corrupted copy is refused.
+2. The CPU kernels, above.
+3. The checkpoint layout and the loader, a partial FP8 tile, and the nibble order.
+4. Prefill of two requests in one batch: every layer's four copies, every capture slot, the
+   logits.
+5. The same prefill split into two passes, the cut inside an open ratio-2 group.
+6. Three decode steps of both requests after the split.
+7. The Engram hash at the published sizes, primes near 16,000,000, against `NgramHashState` over
+   chunk cuts and decode steps, every id; the primes sum to the published row counts.
+8. 22 mutants of the model source and the loader. Each has to fail check 4, 5 or 6.
+9. The real `Engine` on CPU with capture on: greedy tokens and every captured row against the
+   reference, through the loader, the pool hooks, chunked prefill and the scheduler.
+10. The tiny model on 8 simulated devices at `--tp-size 4 --ep-size 4`, `8/8` and `8/2` against
+    itself on one device: the Engram rows in 4 or 8 shards, the experts over 4, 8 or 2. Two
+    controls break the sharded lookup, one keeping rows a device doesn't hold, one dropping the
+    `psum`, and each has to differ from one device at every layout.
+11. The published config under `nnx.eval_shape` on 32 simulated devices: one chip's weights by
+    group, the state pool per slot, and the capture serve against 76.58 GiB. The control
+    replicates the Engram tables, which has to overflow.
+
+Both sides round cached latents to FP8 and FP4 grids. A one-ulp float32 difference in front of a
+round can move one element a grid step, and every query that reads that latent then carries an
+error of a few 1e-3. Checks 4-6 pass when at most a quarter of the tokens exceed 1e-4 and none
+exceeds 3e-2; every mutant exceeds 0.7. In check 9 a flip can land in front of a selection: a
+query whose candidate-block margin is that thin keeps another block. So check 9 bounds the rows a
+flip touches, at most 5%, and needs the greedy tokens to match. A BF16 check compares the port in
+BF16 with the reference's own BF16 error against its float32 run.
+
+`DSV41_SKIP_MUTANTS=1`, `DSV41_SKIP_ENGINE=1` and `DSV41_SKIP_SHARDING=1` skip checks 8, 9, and
+10-11. `DSV41_MUTANT_WORKERS` sets how many mutants run at once, 8 by default.
+
+### The capture reference
+
+`check_capture.py --deepseek-inference` builds the float32 reference and its BF16 floor from the
+checkpoint's own `inference/model.py`, through `scripts/deepseek_reference.py`, on the CPU stand-ins
+in `scripts/deepseek_cpu_kernels.py`. The four Python files it imports have to match their pins.
+Weights load from the safetensors by name: FP8 dense and FP4 experts to BF16, then float32 for the
+reference pass; the BF16 pass keeps the tensors the runtime declares float32. The Engram tables
+read their rows from the memory map. Each entry is a layer's collapsed attention input, the slot
+the engine captures, and the final norm's output last. `--offload-folder` streams one block at a
+time. `scripts/test_deepseek_reference.py` gates it on the tiny checkpoint: the reference path
+equals this test's torch reference, and the memory-mapped and streamed paths equal the resident
+one, each bit for bit.
+
+A dry run of the first 3 layers on the real checkpoint, on a `c4-highcpu-96` in `us-east5-b` with
+the shards on a 1 TB Hyperdisk, took 1 minute 34 seconds for a 426-token and a 1,306-token prompt
+in float32 and in BF16, at a peak RSS of 114.9 GB. Slot 0 equals the embedding rows. A cold read
+and FP4 dequant of one layer's experts took 10.7 seconds, and the disk read at 486 MB/s.
+
+## `glm5-next-model.patch`
+
+Five files. `models/glm5_next.py`, `configs/glm5_next.py` and `mem_cache/glm5_next_state_pool.py`
+are new. `hf_transformers_utils.py` registers the config, and `model_runner_kv_cache_mixin.py`
+gains the three hooks the DeepSeek V4.1 patch adds, in the same words: `build_extra_memory_pools`,
+`paged_kv_layers` and `paged_kv_token_cap`.
+
+It serves the text backbone of `zai-org/GLM-5.3-Flash` at revision
+`eb9eb208eb0d988989d07a6a12d0fdeb5f52574a`: 45 layers, 34 Kimi Delta Attention and 11 sparse MLA
+with no position encoding, 4 mHC streams, 288 routed experts top-8 with one shared. The vision
+tower (`model.visual.*`) and the MTP layer (`model.language_model.layers.45.*`) load nothing. The
+port follows `transformers` 5.17 `models/glm5_next/modeling_glm5_next.py`.
+[`../../models/glm5.3-flash.md`](../../models/glm5.3-flash.md) carries the slice arithmetic.
+
+Serve it with the radix cache off and a context length that sizes the state pool. On one
+`v5p-64`:
+
+```bash
+bash scripts/bootstrap_tpu_vm.sh --model glm5-next
+# engine args: --tp-size 32 --ep-size 32 --disable-radix-cache --context-length 4096
+```
+
+[The model page](../../models/glm5.3-flash.md#capture-check-on-a-v5p-64) has the runs behind these
+settings, which took them through the `glm5.3-flash` row of `scripts/multihost_run.sh`.
+
+### The config
+
+`transformers` ships `Glm5NextConfig` from 5.16 and `sglang-jax` pins 5.12, so the patch
+registers `Glm5NextServingConfig` for `model_type: glm5_next`. It flattens `text_config`, fills
+the defaults `Glm5NextTextConfig.__post_init__` fills, and reads `linear_attn_config` the way
+that class does. It moves four fields so the engine sizes nothing from them:
+`quantization_config` goes to `checkpoint_quantization_config`, since the engine reads
+`quant_method: fp8` as a request to serve FP8 linears; `layer_types` goes to `attn_layer_types`,
+since `ModelConfig` counts sliding-window layers from it; `num_key_value_heads` reads 1 and
+`head_dim` 256, which keeps the paged KV pool nothing reads at 1 KiB a token. A write to
+`num_hidden_layers` cuts the per-layer lists with it.
+
+### The model
+
+- mHC runs in plain XLA. `kernels/mhc/tune.py` schedules v6e alone and raises on v5p. Each
+  sublayer collapses the four copies with its own `pre` mix, and `post` and a Sinkhorn-normalized
+  `comb` expand its output and mix the residual in. The final hidden state is the mean of the
+  copies, then the norm.
+- KDA keeps one log decay per channel, `lower_bound * sigmoid(exp(A_log) * (f + dt_bias))`, with
+  `A_log` per head and `dt_bias` per channel. q, k and v each run a width-4 causal convolution with
+  SiLU, and the output a sigmoid-gated RMS norm. The recurrence runs as the chunked form in plain
+  XLA, 64 tokens a chunk: `chunk_grid` cuts every request into its own chunks, and one `lax.scan`
+  carries the state across them, restarting from a request's cached state at its first chunk.
+  Padding slots read k = v = beta = 0 and a zero log decay, so they neither write the state nor
+  decay it.
+- MLA runs absorbed: q against the cached 512-wide latent through `kv_b_proj`'s key rows, the
+  output back through its value rows. The heads split over the `tensor` axis inside `shard_map`.
+  The indexer pools each run of `index_kpool` (4) keys with a per-channel softmax over the member
+  gate scores plus a learned position term, scores the pools with ReLU dot products weighted per
+  head, keeps the best `index_topk // index_kpool` (512) whose last token the query sees, and adds
+  the open tail pool. Its per-head scores sum across the shards in one `psum`.
+- The routed experts run through `EPMoE` with `_gmm_compute` overridden for the SwiGLU clamp
+  (gate from above, up both sides, at `swiglu_limit` 10), so `layers/moe.py` stays untouched.
+  `--ep-size 32` puts 9 whole experts on each chip. Routing is sigmoid with a selection-only bias,
+  weights normalized and times 2.5.
+
+The stream, the attention and KDA weights, the router and the shared expert stay replicated. Only
+the routed experts and the vocab-sharded head split.
+
+### Weights
+
+`load_checkpoint` reads the safetensors headers itself. The MLA projections, the dense MLPs, the
+shared expert and every routed expert ship E4M3 with one FP32 `weight_scale_inv` per 128 x 128
+tile, and widen on the host. The expert stacks go through `jax.make_array_from_callback`, so a
+host dequantizes only its own devices' experts. KDA, the indexer, `kv_b_proj`, the router and the
+mHC parameters ship BF16 or FP32 and load as they are. The loader raises on a checkpoint tensor
+it neither reads nor skips, and on a parameter nothing wrote.
+
+On one `v5p-64` at `--tp-size 32 --dp-size 1 --ep-size 32`, from the shapes `nnx.eval_shape`
+builds: routed experts 17.72 GiB a chip, everything replicated 15.60 GiB, the vocab-sharded head
+0.04 GiB, 33.36 GiB of weights. A capture serve of 8 requests at `--context-length 4096` adds
+1.82 GiB of state and 0.03 GiB of paged KV, 35.20 GiB against the 76.58 GiB
+`--mem-fraction-static 0.8` reserves. Replicating the routed experts instead would take 584 GiB.
+
+### The state
+
+`Glm5NextStatePool` holds one row per request slot plus a dummy row that padding tokens write to:
+per KDA layer the FP32 recurrent state `[64, 128, 128]` and the last 3 convolution inputs, and per
+MLA layer each token's latent and the indexer's key and gate score. Every read is masked by the
+request's prefix length, so a slot needs no reset between requests. The pool isn't paged and
+holds no prefix, which is why the radix cache stays off. It's replicated on every chip and sized
+by `--context-length`: a slot costs 206.8 MiB at 4,096 and 1,196.8 MiB at 65,536, 136 MiB of it
+the KDA state whatever the context.
+
+### Capture
+
+Slot `k` holds the four streams entering layer `k`, flattened to 16,384 values a token. That's
+`transformers`' `hidden_states[k]`, `[seq, 4, 4096]`, reshaped the same way
+`check_capture.py` reshapes its reference entries. 45 slots.
+
+### What `test_glm5_next_model.py` covers
+
+Twelve checks on CPU. `transformers` owns the reference and writes the tiny checkpoint: a random
+`Glm5NextForConditionalGeneration` saved with `save_pretrained`. The test rewrites the families
+the published index scales (`weight_scale_inv`) as E4M3 with power-of-two scales, keeps the
+vision tower, and adds an MTP layer, so the tiny tensor names per layer kind equal the published
+index's. The float copy the reference loads holds the E4M3 values, so both sides read the same
+weights. `config.json` and the index are pinned by SHA-256.
+
+1. The patch applies to the bootstrap tree and compiles. A corrupted copy is refused.
+2. The layout and the loader, as above, and `transformers` reading the FP8 copy to the float
+   copy's logits, the path `check_capture.py`'s reference takes.
+3. Prefill of a 90-token and a 45-token request in one batch: the four streams entering every
+   layer, every capture slot, the final norm and the logits.
+4. The same prefill split at 70, past the first KDA chunk, and at 21, inside a k-pool.
+5. Three decode steps of both requests after the split.
+6. The chunked scan against a float64 token recurrence on 70, 5 and 130 packed tokens with
+   carried states, and the pool's KDA state and convolution windows after the split against
+   `transformers`' cache after the whole prompt.
+7. The capture hook with slots `[1, 3, 6]`, and the engine's `LogitsProcessor`.
+8. BF16 against `transformers`' own BF16 error.
+9. The real `Engine` on CPU with capture on: greedy ids and every captured row.
+10. The tiny model on 8 simulated devices at `--tp-size 2/4/8 --ep-size 2/4/8/2` against one
+    device, and a control that drops the indexer's cross-shard `psum`.
+11. The published config under `nnx.eval_shape` on 32 simulated devices, above. The control
+    replicates the routed experts, which has to overflow.
+12. 22 mutants of the model and loader. Each has to fail check 3, 4 or 5.
+
+Checks 3-5 pass when at most 5% of the tokens sit above 1e-4 of the reference tensor's RMS.
+`transformers`' own float32 forward sits up to 2.9e-05 from its float64 forward on the tiny model,
+and check 3 holds the port to twice that against float64.
+
+## `glm5-next-probe.patch`
+
+Two files, on top of the model patch. `layers/moe_probe.py` is the file `nemotron3-probe.patch`
+adds. `models/glm5_next.py` reads `SGL_PROBE_MOE` when the model traces, off by default:
+`SGL_PROBE_MOE=dense` runs `Glm5NextEPMoE`'s routed experts through `dense_experts` with the
+clamped SwiGLU in float32, and hands them float32 top-k weights where the default path casts them
+to BF16. [`test_glm5_next_probe.py`](test_glm5_next_probe.py) runs it at tp 1, 4 and 8 with
+`ep_size` equal to tp against the default path at tp 1 and against transformers.
 
 ## `gpt-oss-model.patch`
 

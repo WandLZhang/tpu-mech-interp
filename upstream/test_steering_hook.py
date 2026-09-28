@@ -48,7 +48,7 @@ Fourteen checks. Every check runs the patched source, not a retyped copy of it.
    through, which is a raise on the thread that serves every request, an `inf`, or an answer
    the request didn't ask for. Each control has to show its failure.
 9. `apply_steering` traces under an explicit-sharding mesh, which is what the engine runs, not
-   the auto mesh checks 3 to 7 use. Control: the same gather without `out_sharding` raises
+   the auto mesh checks 3, 4, 7 and 14 use. Control: the same gather without `out_sharding` raises
    `ShardingTypeError` there.
 10. The cache key a steered request gets names every field that decides what the hook does.
 11. The real Engine, on CPU, with a tiny random Qwen3 and the radix cache on: a steered request
@@ -1980,7 +1980,7 @@ def _drop_out_sharding(fn):
     """Gather the bank rows without naming the output sharding.
 
     This is how the hook was first written. It resolves fine under auto sharding, which is what
-    every other check in this file runs, and raises under explicit sharding, which is what the
+    checks 3, 4, 7 and 14 run, and raises under explicit sharding, which is what the
     engine runs. That gap shipped a server that loaded and then died on the first steered
     request, so this mutation is the control for check 9.
     """
@@ -2003,7 +2003,7 @@ def _drop_out_sharding(fn):
 
 
 def check_explicit_sharding():
-    """The engine traces under explicit sharding. Every other check here uses auto.
+    """The engine traces under explicit sharding. Checks 3, 4, 7 and 14 use auto.
 
     `sgl_jax` runs its forward under a mesh whose axes are Explicit, where a gather with a
     replicated operand and token-sharded indices has no inferable output sharding. Run

@@ -30,7 +30,8 @@ git apply "$REPO/upstream/capture-hooks/kimi-linear-capture-hook.patch"
 ```
 
 The flag itself comes from [`../sglang-jax-877.patch`](../sglang-jax-877.patch). Apply that too,
-or the hook sits idle with an empty `layers_to_capture`.
+or the hook sits idle with an empty `layers_to_capture`. No recorded run typed the block above.
+`scripts/verify_patches.sh` applies the same patches in its checks.
 
 ## What each patch does
 

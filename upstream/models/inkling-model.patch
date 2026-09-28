@@ -1,13 +1,14 @@
  python/sgl_jax/srt/configs/inkling.py              |   41 +
  python/sgl_jax/srt/hf_transformers_utils.py        |   11 +
  .../srt/layers/attention/base_attn_backend.py      |    6 +
- .../sgl_jax/srt/layers/attention/native_backend.py |  222 ++-
+ .../sgl_jax/srt/layers/attention/native_backend.py |  308 ++-
  python/sgl_jax/srt/managers/tp_worker.py           |   29 +-
  .../sgl_jax/srt/mem_cache/short_conv_state_pool.py |  225 +++
  .../model_executor/model_runner_kv_cache_mixin.py  |   70 +-
- python/sgl_jax/srt/models/inkling.py               | 1835 ++++++++++++++++++++
+ python/sgl_jax/srt/model_loader/loader.py          |   15 +-
+ python/sgl_jax/srt/models/inkling.py               | 1962 ++++++++++++++++++++
  python/sgl_jax/srt/utils/weight_utils.py           |   13 +-
- 9 files changed, 2428 insertions(+), 24 deletions(-)
+ 10 files changed, 2655 insertions(+), 25 deletions(-)
 
 diff --git a/python/sgl_jax/srt/configs/inkling.py b/python/sgl_jax/srt/configs/inkling.py
 new file mode 100644
@@ -103,7 +104,7 @@ index 6dacad38..087a6507 100644
      def get_forward_metadata(self, batch: ModelWorkerBatch):
          """Init the metadata for a forward pass and return it"""
 diff --git a/python/sgl_jax/srt/layers/attention/native_backend.py b/python/sgl_jax/srt/layers/attention/native_backend.py
-index d5ae17e9..b2a04db0 100644
+index d5ae17e9..7b954bce 100644
 --- a/python/sgl_jax/srt/layers/attention/native_backend.py
 +++ b/python/sgl_jax/srt/layers/attention/native_backend.py
 @@ -1,20 +1,65 @@
@@ -335,111 +336,195 @@ index d5ae17e9..b2a04db0 100644
  ):
      """
      Forward pass using native JAX implementation with block-diagonal attention.
-@@ -208,6 +314,9 @@ def forward_attention(
+@@ -208,11 +314,43 @@ def forward_attention(
          xai_temperature_len: length of the xai temperature
          attention_sink: per-head bias for phantom attention sink token
          sliding_window_size: sliding window size for attention
 +        position_bias: [num_tokens, num_heads, extent] bias-vs-backward-distance
 +            profile. Each logit picks the entry at its own query-key distance,
-+            and a distance at or past the extent picks zero.
++            and a distance at or past the extent picks zero. A call with it
++            runs `blockwise_attention`, which reads each request's own KV.
  
      Returns:
          Output tensor of shape[batch_size, hidden_size]
-@@ -264,6 +373,18 @@ def forward_attention(
-     is_valid = jax.sharding.reshard(loc, NamedSharding(mesh, P())) > 0
-     attn_logits = jnp.where(is_valid[jnp.newaxis, jnp.newaxis, :], attn_logits, neg_inf)
+     """
  
 +    if position_bias is not None:
-+        attn_logits = _apply_position_bias(
-+            attn_logits,
-+            position_bias,
++        if (xai_temperature_len is not None and xai_temperature_len > 0) or (
++            attention_sink is not None
++        ):
++            raise NotImplementedError(
++                "the position-bias path carries no xai temperature and no attention sink"
++            )
++        return blockwise_attention(
++            q,
++            k_cache,
++            v_cache,
 +            seq_lengths,
++            loc,
 +            extend_prefix_lens,
 +            extend_seq_lens,
-+            mode=mode,
-+            mesh=mesh,
++            num_heads,
++            num_kv_heads,
++            position_bias,
 +            page_size=page_size,
++            scale=scale,
++            is_causal=is_causal,
++            mode=mode,
++            kv_sharding=kv_sharding,
++            mesh=mesh,
++            sliding_window_size=sliding_window_size,
++            softmax_dtype=softmax_dtype,
 +        )
 +
-     # ** Apply XAI temperature scaling if specified **
-     if xai_temperature_len is not None and xai_temperature_len > 0:
-         query_len = q_heads.shape[0]
-@@ -334,6 +455,73 @@ def forward_attention(
+     cache_size = k_cache.shape[0]
+     safe_loc = jnp.where(loc > 0, loc, cache_size)
+     k_cache = k_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
+@@ -334,6 +472,142 @@ def forward_attention(
      return attn_output.reshape(num_tokens, num_heads * v_head_dim)
  
  
-+def _key_positions(
-+    key_len: int,
++# Cache slots `blockwise_attention` reads per step. One step holds a
++# [tokens, heads, KEY_BLOCK] tile of logits and a [tokens, KEY_BLOCK] mask.
++KEY_BLOCK = 512
++
++
++def blockwise_attention(
++    q: jax.Array,
++    k_cache: jax.Array,
++    v_cache: jax.Array,
 +    seq_lengths: jax.Array,
-+    page_size: int,
-+) -> jax.Array:
-+    """Position of every cache column inside its own request.
-+
-+    `cache_loc` blocks are page-aligned per request, so the block offsets step
-+    by the aligned lengths while each block's valid span stays at the real
-+    length.
-+    """
-+    aligned_lengths = ((seq_lengths + page_size - 1) // page_size) * page_size
-+    k_starts = jnp.cumsum(aligned_lengths, dtype=jnp.int32) - aligned_lengths
-+    k_batch_indicators = jnp.zeros(key_len, dtype=jnp.int32).at[k_starts].set(1)
-+    k_batch_ids = jnp.cumsum(k_batch_indicators, dtype=jnp.int32) - 1
-+    return jnp.arange(key_len, dtype=jnp.int32) - k_starts[k_batch_ids]
-+
-+
-+def _apply_position_bias(
-+    attn_logits: jax.Array,
-+    position_bias: jax.Array,
-+    seq_lengths: jax.Array,
++    loc: jax.Array,
 +    extend_prefix_lens: jax.Array,
 +    extend_seq_lens: jax.Array,
++    num_heads: int,
++    num_kv_heads: int,
++    position_bias: jax.Array,
 +    *,
-+    mode: ForwardMode,
-+    mesh: Mesh | None,
 +    page_size: int,
++    scale=None,
++    is_causal: bool = True,
++    mode=ForwardMode.DECODE,
++    kv_sharding=None,
++    mesh: Mesh | None = None,
++    sliding_window_size: int | None = None,
++    softmax_dtype: jnp.dtype | None = None,
++    block: int = KEY_BLOCK,
 +):
-+    """Add a learned bias that depends on the query-key distance.
++    """Attention over each request's own KV, one block of cache slots at a time.
 +
-+    `position_bias` holds one profile per token per head, indexed by backward
-+    distance. A distance outside `[0, extent)` contributes zero, so causality
-+    and padding stay with the mask.
++    `loc` is the batch's `cache_loc` bucket. It packs every request's slots at
++    page-aligned offsets from 0, and padding fills the rest out to the bucket,
++    which is `max_running_requests` times the page-aligned `max_req_len`. A pass
++    over the whole bucket builds `[tokens, heads, bucket]` logits and
++    `[tokens, bucket]` masks in every layer: Inkling's check launch on a v5p-64
++    has a 5,329,408-slot bucket and asks for 1.43 TB of temporaries per chip.
++    This loop visits only the blocks that hold the batch's slots and carries an
++    online softmax across them, so it holds one tile at a time and reads each
++    request's KV and nothing past it, the way the FA backend's pages do.
++
++    `position_bias` is `[tokens, heads, extent]`, one bias per backward
++    distance. A distance at or past the extent adds zero. The softmax runs in
++    float32. A padding row sees no key and comes out zero.
 +    """
-+    query_len, _, key_len = attn_logits.shape
-+    extent = position_bias.shape[-1]
-+
++    del softmax_dtype  # the running max, sum and output stay in float32
 +    replicated = NamedSharding(mesh, P())
-+    seq_lengths = jax.sharding.reshard(seq_lengths, replicated)
-+    k_positions = _key_positions(key_len, seq_lengths, page_size)
++    seq_lengths = jax.sharding.reshard(seq_lengths, replicated).astype(jnp.int32)
++    loc = jax.sharding.reshard(loc, replicated)
++
++    if q.ndim == 2:
++        q = q.reshape(q.shape[0], num_heads, q.shape[1] // num_heads)
++    num_tokens, _, head_dim = q.shape
++    if k_cache.shape[-1] != head_dim:
++        q = jnp.pad(q, ((0, 0), (0, 0), (0, k_cache.shape[-1] - head_dim)))
++        head_dim = k_cache.shape[-1]
++    if scale is None:
++        scale = 1.0 / jnp.sqrt(head_dim)
++    extent = position_bias.shape[-1]
++    num_seqs = seq_lengths.shape[0]
++    rows = jnp.arange(num_tokens, dtype=jnp.int32)
 +
 +    if mode == ForwardMode.EXTEND:
-+        extend_seq_lens = jax.sharding.reshard(extend_seq_lens, replicated)
-+        extend_prefix_lens = jax.sharding.reshard(extend_prefix_lens, replicated)
++        extend_seq_lens = jax.sharding.reshard(extend_seq_lens, replicated).astype(jnp.int32)
++        prefix = jax.sharding.reshard(extend_prefix_lens, replicated).astype(jnp.int32)
 +        q_starts = jnp.cumsum(extend_seq_lens, dtype=jnp.int32) - extend_seq_lens
-+        q_batch_indicators = jnp.zeros(query_len, dtype=jnp.int32).at[q_starts].set(1)
-+        q_batch_ids = jnp.cumsum(q_batch_indicators, dtype=jnp.int32) - 1
-+        q_positions = (
-+            extend_prefix_lens[q_batch_ids]
-+            + jnp.arange(query_len, dtype=jnp.int32)
-+            - q_starts[q_batch_ids]
-+        )
++        q_batch = jnp.cumsum(
++            jnp.zeros(num_tokens, dtype=jnp.int32).at[q_starts].set(1), dtype=jnp.int32
++        ) - 1
++        q_pos = prefix[q_batch] + rows - q_starts[q_batch]
++        q_valid = rows < jnp.sum(extend_seq_lens)
 +    else:
-+        # One query row per request, at the end of its sequence. Rows past the
-+        # real batch are padding; the mask drops them.
-+        last = (seq_lengths - 1).astype(jnp.int32)
-+        q_positions = jnp.zeros(query_len, dtype=jnp.int32).at[: last.shape[0]].set(last)
++        # One query row per request, at the end of its sequence.
++        q_batch = rows
++        q_pos = jnp.zeros(num_tokens, dtype=jnp.int32).at[:num_seqs].set(seq_lengths - 1)
++        q_valid = rows < num_seqs
 +
-+    distance = q_positions[:, None] - k_positions[None, :]
-+    index = jnp.clip(distance, 0, extent - 1)
-+    bias = jnp.take_along_axis(position_bias, index[:, None, :], axis=-1)
-+    in_range = ((distance >= 0) & (distance < extent))[:, None, :]
-+    bias = jnp.where(in_range, bias, jnp.zeros((), bias.dtype))
-+    return attn_logits + bias.astype(attn_logits.dtype)
++    aligned = (seq_lengths + page_size - 1) // page_size * page_size
++    k_ends = jnp.cumsum(aligned, dtype=jnp.int32)
++    k_starts = k_ends - aligned
++    padded = -loc.shape[0] % block
++    loc = jnp.pad(loc, (0, padded))
++    num_blocks = jnp.minimum((k_ends[-1] + block - 1) // block, loc.shape[0] // block)
++    cache_size = k_cache.shape[0]
++    columns = jnp.arange(block, dtype=jnp.int32)
++    neg = jnp.finfo(jnp.float32).min
++
++    def step(index, carry):
++        running_max, running_sum, acc = carry
++        start = index * block
++        slots = jax.lax.dynamic_slice(loc, (start,), (block,))
++        safe = jnp.where(slots > 0, slots, cache_size)
++        k = k_cache.at[safe].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
++        v = v_cache.at[safe].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
++        if num_kv_heads != num_heads:
++            copies = num_heads // num_kv_heads
++            k = jnp.repeat(k, copies, axis=1, out_sharding=kv_sharding)
++            v = jnp.repeat(v, copies, axis=1, out_sharding=kv_sharding)
++
++        cols = start + columns
++        k_batch = jnp.searchsorted(k_ends, cols, side="right").astype(jnp.int32)
++        owner = jnp.minimum(k_batch, num_seqs - 1)
++        k_pos = cols - k_starts[owner]
++        k_valid = (k_batch < num_seqs) & (k_pos < seq_lengths[owner]) & (slots > 0)
++        distance = q_pos[:, None] - k_pos[None, :]
++        mask = q_valid[:, None] & k_valid[None, :] & (q_batch[:, None] == k_batch[None, :])
++        if is_causal or mode != ForwardMode.EXTEND:
++            mask = mask & (distance >= 0)
++        if sliding_window_size is not None:
++            mask = mask & (distance < sliding_window_size)
++
++        logits = jnp.einsum("qhd,khd->qhk", q, k) * scale
++        index_of = jnp.clip(distance, 0, extent - 1)
++        bias = jnp.take_along_axis(position_bias, index_of[:, None, :], axis=-1)
++        in_range = ((distance >= 0) & (distance < extent))[:, None, :]
++        logits = logits + jnp.where(in_range, bias, jnp.zeros((), bias.dtype)).astype(logits.dtype)
++        logits = jnp.where(mask[:, None, :], logits.astype(jnp.float32), neg)
++
++        new_max = jnp.maximum(running_max, jnp.max(logits, axis=-1))
++        weights = jnp.where(mask[:, None, :], jnp.exp(logits - new_max[..., None]), 0.0)
++        correction = jnp.exp(running_max - new_max)
++        running_sum = running_sum * correction + jnp.sum(weights, axis=-1)
++        update = jnp.einsum("qhk,khd->qhd", weights.astype(v.dtype), v)
++        acc = acc * correction[..., None] + update.astype(jnp.float32)
++        return new_max, running_sum, acc
++
++    # Built from q so the carry keeps q's head sharding through the loop.
++    acc = jnp.zeros_like(q[..., :1], dtype=jnp.float32) + jnp.zeros(
++        v_cache.shape[-1], jnp.float32
++    )
++    running_sum = jnp.sum(acc, axis=-1)
++    running_max = running_sum + neg
++    _, running_sum, acc = jax.lax.fori_loop(0, num_blocks, step, (running_max, running_sum, acc))
++    safe_sum = jnp.where(running_sum > 0, running_sum, 1.0)
++    out = jnp.where(running_sum[..., None] > 0, acc / safe_sum[..., None], 0.0)
++    return out.astype(v_cache.dtype).reshape(num_tokens, num_heads * v_cache.shape[-1])
 +
 +
  def _apply_extend_mask(
      attn_weights: jax.Array,
      seq_lengths: jax.Array,
 diff --git a/python/sgl_jax/srt/managers/tp_worker.py b/python/sgl_jax/srt/managers/tp_worker.py
-index 3ec0c5fb..d5061c8f 100644
+index ca540943..941b1dc2 100644
 --- a/python/sgl_jax/srt/managers/tp_worker.py
 +++ b/python/sgl_jax/srt/managers/tp_worker.py
 @@ -22,7 +22,7 @@ from sgl_jax.srt.managers.schedule_batch import (
@@ -848,12 +933,39 @@ index f44322a8..e88c5411 100644
      def _kv_pool_layer_count(self: ModelRunner):
          """Layer count for KV pool sizing.
  
+diff --git a/python/sgl_jax/srt/model_loader/loader.py b/python/sgl_jax/srt/model_loader/loader.py
+index 89ee4611..f81bb5c2 100644
+--- a/python/sgl_jax/srt/model_loader/loader.py
++++ b/python/sgl_jax/srt/model_loader/loader.py
+@@ -191,8 +191,21 @@ class JAXModelLoader(DefaultModelLoader):
+ 
+     @staticmethod
+     def _warmup_safetensors_cache(model_config: ModelConfig):
+-        """Pre-read safetensors files to warm GCSFuse cache."""
++        """Pre-read safetensors files to warm GCSFuse cache.
++
++        A multi-process load skips it. Each process then reads only the slices
++        its own devices hold, and the warm-up would read the whole checkpoint on
++        every host first: 1,904 GB a host for Inkling on a v5p-64, 72 minutes
++        before the first weight, through a file cache a tenth that size.
++        """
+         model_path = model_config.model_path
++        if jax.process_count() > 1:
++            logger.info(
++                "%d processes load %s, each its own slices; skipping GCSFuse warm-up",
++                jax.process_count(),
++                model_path,
++            )
++            return
+         try:
+             with open("/proc/mounts") as fp:
+                 mounts = [line.split() for line in fp]
 diff --git a/python/sgl_jax/srt/models/inkling.py b/python/sgl_jax/srt/models/inkling.py
 new file mode 100644
-index 00000000..42f0b241
+index 00000000..95d2a509
 --- /dev/null
 +++ b/python/sgl_jax/srt/models/inkling.py
-@@ -0,0 +1,1835 @@
+@@ -0,0 +1,1962 @@
 +"""Inkling text decoder.
 +
 +`thinkingmachines/Inkling` and `thinkingmachines/Inkling-Small` run the same
@@ -2226,9 +2338,19 @@ index 00000000..42f0b241
 +            mesh=self.mesh,
 +            dtype=self.dtype,
 +        )
++        mappings = self.create_weight_mappings()
 +        if loader.dummy_mode:
 +            self.place_dummy_experts(loader)
-+        loader.load_weights_from_safetensors(self.create_weight_mappings())
++        else:
++            # The loader reads a `kv_head_padding` tensor whole on every host
++            # before it repeats the heads. `load_stacked_weights` reads k and v
++            # itself, each device only the checkpoint rows of its own head.
++            mappings = {
++                key: mapping
++                for key, mapping in mappings.items()
++                if not getattr(mapping, "kv_head_padding", False)
++            }
++        loader.load_weights_from_safetensors(mappings)
 +        if not loader.dummy_mode:
 +            self.load_stacked_weights(loader)
 +        self.widen_kv_convolutions()
@@ -2310,13 +2432,23 @@ index 00000000..42f0b241
 +        return mappings
 +
 +    def load_stacked_weights(self, loader: WeightLoader):
-+        """Read the tensors that hold more than one target.
++        """Read the tensors that hold more than one target, and k and v.
 +
 +        The dense MLP fuses gate and up into `w13_dn`. The experts stack every
 +        expert into one array, and the shared experts stack the shared pair.
++        Each device reads only its own block of each, so a host reads its share
++        of the checkpoint once.
 +        """
 +        weight_info = loader._scan_weight_info()
 +        for layer_id, layer in enumerate(self.model.layers):
++            attention = layer.self_attn
++            source = f"{self.source_root}.layers.{layer_id}.attn"
++            attention.k_proj.weight.value = self.replicated_kv_array(
++                weight_info, f"{source}.wk_dv.weight", attention.k_proj.weight.value, attention
++            )
++            attention.v_proj.weight.value = self.replicated_kv_array(
++                weight_info, f"{source}.wv_dv.weight", attention.v_proj.weight.value, attention
++            )
 +            prefix = f"{self.source_root}.layers.{layer_id}.mlp"
 +            if layer.is_moe:
 +                self.load_expert_weights(layer, prefix, weight_info)
@@ -2338,10 +2470,59 @@ index 00000000..42f0b241
 +            )
 +        return weight_info[key][0]["file"]
 +
-+    def read_tensor(self, weight_info: dict, key: str) -> np.ndarray:
++    def read_block(self, weight_info: dict, key: str, index: tuple) -> np.ndarray:
++        """One block of a checkpoint tensor, read without the rest of it."""
 +        path = self.tensor_file(weight_info, key)
 +        with safetensors.safe_open(path, framework="np", device="cpu") as handle:
-+            return handle.get_tensor(key)
++            return handle.get_slice(key)[index]
++
++    def sharded_array(self, shape: tuple, spec: P, fetch) -> jax.Array:
++        """An array each device fills from `fetch(start, stop)`, its own block only.
++
++        `start` and `stop` are the bounds of the device's block on each axis of
++        `shape`. Only the devices this process holds call `fetch`.
++        """
++        dtype = jax.dtypes.canonicalize_dtype(self.dtype)
++
++        def callback(index):
++            bounds = [part.indices(size)[:2] for part, size in zip(index, shape)]
++            start, stop = zip(*bounds) if bounds else ((), ())
++            return np.ascontiguousarray(fetch(start, stop)).astype(dtype)
++
++        return jax.make_array_from_callback(shape, NamedSharding(self.mesh, spec), callback)
++
++    def replicated_kv_array(self, weight_info: dict, key: str, param, attention) -> jax.Array:
++        """k or v, `[hidden, heads * head_dim]` at the replicated head count.
++
++        Past a layer's own KV head count each checkpoint head repeats in place,
++        the layout `kv_head_padding` builds. A device reads the checkpoint rows
++        of the heads its columns hold.
++        """
++        rows, hidden = self.tensor_shape(weight_info, key)
++        width = param.shape[1]
++        head_dim = attention.head_dim
++        if width % rows or rows % head_dim:
++            raise ValueError(
++                f"{key} holds {rows} rows and the layer builds {width} columns, which "
++                f"isn't a whole number of {head_dim}-wide heads repeated."
++            )
++        copies = width // rows
++        # Devices holding copies of one head ask for the same rows. The host
++        # reads them once and hands each device its copy.
++        blocks = {}
++
++        def fetch(start, stop):
++            columns = np.arange(start[1], stop[1])
++            source = (columns // head_dim) // copies * head_dim + columns % head_dim
++            low, high = int(source.min()), int(source.max()) + 1
++            rows_key = (low, high, start[0], stop[0])
++            if rows_key not in blocks:
++                blocks[rows_key] = self.read_block(
++                    weight_info, key, (slice(low, high), slice(start[0], stop[0]))
++                )
++            return blocks[rows_key][source - low].T
++
++        return self.sharded_array((hidden, width), P(None, "tensor"), fetch)
 +
 +    def tensor_shape(self, weight_info: dict, key: str) -> tuple[int, ...]:
 +        """The shape in the file header, without reading the tensor."""
@@ -2349,13 +2530,67 @@ index 00000000..42f0b241
 +        with safetensors.safe_open(path, framework="np", device="cpu") as handle:
 +            return tuple(handle.get_slice(key).get_shape())
 +
++    def interleaved_halves(
++        self, weight_info: dict, key: str, axis: int
++    ) -> tuple[jax.Array, jax.Array]:
++        """The gate and up halves of a fused tensor, each transposed.
++
++        `axis` is the fused axis of the checkpoint tensor, whose rows alternate
++        gate and up. Each result moves that axis last, the layout the kernels
++        take, and shards it over `tensor`. A device reads the fused rows its
++        columns cover in one contiguous slice, keeps the gate half and holds the
++        up half back for the second array, so each row comes off disk once.
++        """
++        stored = self.tensor_shape(weight_info, key)
++        shape = list(stored)
++        shape[axis] //= 2
++        order = [i for i in range(len(stored)) if i != axis] + [axis]
++        target = tuple(shape[i] for i in order)
++        spec = P(*([None] * (len(target) - 1)), "tensor")
++        held = {}
++
++        def fetch(parity, start, stop):
++            if parity == 1 and (start, stop) in held:
++                return held.pop((start, stop))
++            index = [slice(None)] * len(stored)
++            for position, source_axis in enumerate(order):
++                if source_axis == axis:
++                    index[axis] = slice(2 * start[position], 2 * stop[position])
++                else:
++                    index[source_axis] = slice(start[position], stop[position])
++            block = self.read_block(weight_info, key, tuple(index))
++            halves = [
++                np.transpose(np.take(block, np.arange(p, block.shape[axis], 2), axis=axis), order)
++                for p in (0, 1)
++            ]
++            if parity == 0:
++                held[(start, stop)] = halves[1]
++            return halves[parity]
++
++        gate = self.sharded_array(target, spec, partial(fetch, 0))
++        up = self.sharded_array(target, spec, partial(fetch, 1))
++        return gate, up
++
++    def transposed_array(self, weight_info: dict, key: str, order: tuple, spec: P) -> jax.Array:
++        """`np.transpose(tensor, order)` sharded by `spec`, each device reading its block."""
++        stored = self.tensor_shape(weight_info, key)
++        target = tuple(stored[i] for i in order)
++
++        def fetch(start, stop):
++            index = [slice(None)] * len(stored)
++            for position, source_axis in enumerate(order):
++                index[source_axis] = slice(start[position], stop[position])
++            return np.transpose(self.read_block(weight_info, key, tuple(index)), order)
++
++        return self.sharded_array(target, spec, fetch)
++
 +    def load_dense_mlp_weights(self, layer, prefix: str, weight_info: dict):
-+        fused = self.read_tensor(weight_info, f"{prefix}.w13_dn.weight")
-+        gate, up = split_gate_up(fused, axis=0)
-+        layer.mlp.gate_proj.weight.value = self.put(gate.T, P(None, "tensor"))
-+        layer.mlp.up_proj.weight.value = self.put(up.T, P(None, "tensor"))
-+        down = self.read_tensor(weight_info, f"{prefix}.w2_md.weight")
-+        layer.mlp.down_proj.weight.value = self.put(down.T, P("tensor", None))
++        gate, up = self.interleaved_halves(weight_info, f"{prefix}.w13_dn.weight", axis=0)
++        layer.mlp.gate_proj.weight.value = gate
++        layer.mlp.up_proj.weight.value = up
++        layer.mlp.down_proj.weight.value = self.transposed_array(
++            weight_info, f"{prefix}.w2_md.weight", (1, 0), P("tensor", None)
++        )
 +
 +    def stacked_expert_array(
 +        self,
@@ -2448,12 +2683,16 @@ index 00000000..42f0b241
 +        if shared is None:
 +            return
 +        shared_key = f"{prefix}.shared_experts.shared_w13_weight"
-+        gate, up = split_gate_up(self.read_tensor(weight_info, shared_key), axis=1)
-+        self.check_expert_width(gate.shape[1], shared_key)
-+        shared.gate_proj.value = self.put(np.transpose(gate, (0, 2, 1)), P(None, None, "tensor"))
-+        shared.up_proj.value = self.put(np.transpose(up, (0, 2, 1)), P(None, None, "tensor"))
-+        down = self.read_tensor(weight_info, f"{prefix}.shared_experts.shared_w2_weight")
-+        shared.down_proj.value = self.put(np.transpose(down, (0, 2, 1)), P(None, "tensor", None))
++        self.check_expert_width(self.tensor_shape(weight_info, shared_key)[1] // 2, shared_key)
++        shared.gate_proj.value, shared.up_proj.value = self.interleaved_halves(
++            weight_info, shared_key, axis=1
++        )
++        shared.down_proj.value = self.transposed_array(
++            weight_info,
++            f"{prefix}.shared_experts.shared_w2_weight",
++            (0, 2, 1),
++            P(None, "tensor", None),
++        )
 +
 +    def place_dummy_experts(self, loader: WeightLoader) -> None:
 +        """Put the routed experts on `EPMoE`'s mesh in dummy mode.

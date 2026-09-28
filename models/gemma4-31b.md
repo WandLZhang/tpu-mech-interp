@@ -73,7 +73,8 @@ python3 -m sgl_jax.launch_server \
 python3 -c "import jax; print(jax.device_count())"
 ```
 
-A `v5p-64` is 32 chips on 8 hosts, and nothing here has run across hosts.
+A `v5p-64` is 32 chips on 8 hosts. Gemma 4 31B hasn't run on one; six other models have, through
+[Across hosts](../README.md#across-hosts).
 
 ## Capture
 

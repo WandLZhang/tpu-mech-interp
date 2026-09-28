@@ -45,9 +45,10 @@ Confirm the chip count first, after `source ~/.tpu_env`: a `v5litepod-8` reports
 python3 -c "import jax; print(jax.device_count())"
 ```
 
-A `v5p-64` is 32 chips on 8 hosts. No run here has served or captured across hosts. The grouped
-matmul flattens (batch, sequence). Check that sequence sharding survives it by diffing the XLA
-buffer assignment between `ctx=1` and `ctx=2`.
+A `v5p-64` is 32 chips on 8 hosts. Gemma 4 26B-A4B hasn't run on one; six other models have,
+through [Across hosts](../README.md#across-hosts). The grouped matmul flattens (batch, sequence).
+Check that sequence sharding survives it by diffing the XLA buffer assignment between `ctx=1` and
+`ctx=2`.
 
 ## Capture
 

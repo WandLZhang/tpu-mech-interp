@@ -2,10 +2,10 @@
 
 `thinkingmachines/Inkling`, `thinkingmachines/Inkling-Small`
 
-**Status: CPU only.** Both sizes need more than one host: Inkling a `v5p-64`, 8 hosts, and
-Inkling-Small at least a `v5p-16`, 2 hosts. Nothing here has run across hosts.
-[`upstream/models/test_inkling.py`](../upstream/models/test_inkling.py) serves a four-layer
-checkpoint through the engine on CPU against `transformers`.
+**Status: captured on TPU**, `v5p-64`, 2026-09-27; every layer within the BF16 floor, one control
+under its bar; not measured. Served and captured on 32 chips, 8 hosts, in us-east5-a. Throughput
+and HBM aren't measured yet; [the roadmap](../docs/roadmap.md) has both. See
+[Measured on a v5p-64](#measured-on-a-v5p-64).
 
 | | Inkling | Inkling-Small |
 |---|---|---|
@@ -60,6 +60,28 @@ rotary table. `NativeAttention` reads it and sets
 doesn't. The native backend also maps a sliding-window layer's cache slots into
 the smaller pool `SWAKVPool` keeps for those layers, as the FA backend does.
 
+The usual native pass gathers k and v at every slot of the batch's `cache_loc` bucket and masks
+the logits. The bucket is `--max-running-requests` times the page-aligned `max_req_len`, and
+`max_req_len` follows the KV pool when `--context-length` is unset. For the capture check on a
+`v5p-64` that's 8 x 666,176 = 5,329,408 slots. Each layer then builds `[1024, 64, 5,329,408]`
+logits and `[1024, 5,329,408]` distance and mask matrices, the matrices whole on every chip. A call
+with a position bias runs `blockwise_attention` instead. It walks the bucket 512 slots at a time,
+stops after the batch's last real slot and carries an online softmax. So it reads each request's
+own KV, as the FA backend's pages do, and holds one `[tokens, heads, 512]` tile at a time.
+
+An AOT compile of the served forward shows the difference. It builds the full published config
+with the engine's dummy loader and abstract pools, sizes the pool the way `init_memory_pool` does
+for the check's flags, and compiles the extend shape (8 requests, 1,024 tokens) for a 32-chip
+`v5p:2x4x4` topology through libtpu 0.0.46.1, on a CPU VM on 2026-09-27:
+
+| | Whole-bucket pass | Blockwise pass |
+|---|---|---|
+| Temporaries per chip | 1.43 TB, over the 95.73 GiB HBM | 1.47 GiB |
+| Weights and pools per chip | 73.1 GiB | 73.1 GiB |
+
+Notes: the compile sizes the pool from 55.6 GiB of weights a chip, which gives 666,176 tokens. The
+chip's own compile reported 1.71 TB, from a pool the engine sized from the HBM it measured.
+
 Serve it with `--attention-backend native --disable-radix-cache`, at
 `--dp-size 1`. Each request keeps its convolution windows in a pool slot, and
 the radix cache can't snapshot them, so a prefix hit would open on the wrong
@@ -94,12 +116,28 @@ it's under the weights alone. Inkling-Small fits 8 chips on weight size, but
 The [measured `v5p-8` runs](nemotron3-super.md#measured) keep weights in
 `/dev/shm`, which defaults to half the host's RAM. That host has 440 GB of RAM,
 less than either checkpoint, 1,773.9 GiB or 495.4 GiB, so neither can live
-there. Each of the 8 hosts in a `v5p-64` reads from the checkpoint. No run here
-has loaded a checkpoint of either size.
+there. The 8 hosts of a `v5p-64` read the checkpoint from a gcsfuse mount of the
+bucket, which `scripts/multihost_setup.sh` makes.
+
+Each host reads only the blocks its 4 chips hold, once. `load_stacked_weights`
+reads k and v, the dense MLP, the shared experts and the routed experts that
+way, one `make_array_from_callback` per tensor, and chips holding copies of one
+KV head share one read. The mapping table's tensors go through the loader's
+sharded reads. The upstream loader also pre-reads every `.safetensors` file on
+a fuse mount to warm the gcsfuse cache, and the patch skips that in a
+multi-process load. On 2026-09-27, before these changes, that warm-up read
+1,904 GB on each host, the whole checkpoint, before the first weight.
+
+Mount the bucket with `RANGE_CACHE=false`, which the `inkling` row of `scripts/multihost_run.sh`
+sets.
+The experts shard over the tensor axis, so every host reads an eighth of every
+expert file. With the gcsfuse file cache pulling a whole file on any read past
+its first byte, each host pulls every file whole through a 120 GB cache, and
+host 0 took in 31 TB for the 2026-09-27 load.
 
 Confirm the chip count first, on all 8 hosts at once, as
-[gpt-oss-120b](gpt-oss-120b.md#scaling-out-to-v5p-64) describes. Untested: no run here has used a
-`v5p-64`. It reports 32.
+[gpt-oss-120b](gpt-oss-120b.md#scaling-out-to-v5p-64) describes. It reported 32 on every host on
+2026-09-27; `scripts/multihost_setup.sh` runs this check.
 
 ```bash
 python3 -c "import jax; jax.distributed.initialize(); print(jax.device_count())"
@@ -365,7 +403,7 @@ five decode steps, the prompt logprobs, two sequences packed into one prefill,
 and a prompt split across two prefill passes and then decoded, on window slots
 earlier requests held. Then a prefill and two decode steps at `--tp-size 8`,
 past both kinds' KV head counts, and a prefill at `--ep-size 2`. Worst max
-absolute error is 8.1e-06, correlation 1.000000000000.
+absolute error is 8.6e-06, correlation 1.000000000000.
 
 Around those it checks the parts a comparison can't reach: the conv-state spec,
 the pool the runner builds from it and the bytes it takes from the KV budget,
@@ -383,6 +421,27 @@ expert width of both sizes, and every source key against the published
 safetensors index of both checkpoints. A NaN logit has to fail the gate every
 comparison uses.
 
+Two checks cover the `v5p-64` failures. The first compiles one position-bias
+attention call at an 8,192-slot and a 65,536-slot `cache_loc` bucket and needs
+the same temporaries at both; the whole-bucket pass, its control, grows eightfold.
+The second loads a checkpoint in two processes of 4 simulated devices each, one
+8-device mesh, from a directory that reads as a gcsfuse mount. It counts every
+byte each process pulls through `safetensors` or a plain file read, and each has
+to stay within half of every sharded tensor plus each replicated tensor once.
+Its controls, the single-process warm-up and every block cut from its whole
+tensor, both have to go over.
+
+A third section runs a config with every published field, sizes shrunk, at
+`--tp-size 8`: 2 query heads a device, 4 copies of each global KV head and 2 of
+each local one, the counts Inkling runs at `--tp-size 32`. A 24-token prompt,
+past the 16-token bias extent and the 8-token window, has to match
+`InklingForCausalLM` at every layer input and the prefill logits, and match
+`scripts/check_capture.py`'s own reference, which the chip check gates on. That
+reference's control norms the embeddings twice, as `transformers` 5.17's
+multimodal class does, and has to miss layer 0. Two processes of 4 devices then
+load the same checkpoint, and every block each holds has to equal the
+one-process load. Its control repeats the KV heads in tiled order.
+
 Sixteen negative controls follow, and each has to move the logits by more than
 1e-3, about a hundred times the worst clean error.
 
@@ -391,3 +450,50 @@ source .venv/bin/activate
 uv pip install -r upstream/models/requirements.txt
 python3 upstream/models/test_inkling.py
 ```
+
+
+## Measured on a v5p-64
+
+A `v5p-64` Spot slice (32 chips, 8 hosts) in us-east5-a, 2026-09-27. sglang-jax eb061d8 with
+`sglang-jax-877.patch`, the steering patches, `multihost-hidden-states.patch` and
+`models/inkling-model.patch` (blockwise native attention over each request's own KV, per-host
+reads), transformers 5.17.0 on the hosts, built by the `inkling` row of `scripts/multihost_run.sh`:
+engine args `attention_backend=native disable_radix_cache=True`, `mem_fraction_static=0.8`,
+`--tp-size 32`. Every host read the weights from a GCS bucket in us-east5 through gcsfuse with
+range-read caching off.
+
+**Capture check**, `scripts/check_capture.py` against the float32 CPU reference
+`refs/ref-inkling.npz` rebuilt at 18:08Z with `embed_norm` run once (transformers 5.17's
+`InklingForConditionalGeneration` runs it twice; upstream fixed that in transformers 3384908511,
+not yet on PyPI), 18:35 to 20:40Z:
+
+| Prompt | Layers | Worst ratio to the BF16 floor | Worst Pearson | Control (each slot against the next layer) | Result |
+|---|---|---|---|---|---|
+| 440 tokens | 66, all within the floor | 1.07 (layer 2); most layers 0.5 to 0.8 | 0.9937 (layer 65) | 3.58x, detected | pass |
+| 1,321 tokens, split across prefill passes | 66, all within the floor | 0.99 (layer 2) | 0.9841 (layer 61) | 2.82x at layer 61, under the 3.0x bar | not detected |
+
+`check_capture.py` exits FAILED because the second prompt's control reads 2.82x: at layer 61 the
+stream entering layer 62 is almost the stream entering layer 61, so the per-token test can't tell
+them apart by 3x. Every captured layer is within the floor on both prompts. The capture is saved,
+so another control can gate it again without the engine, through `check_capture.py --capture-npz`.
+
+Two earlier launches on the same slice failed: 1.71 TB of HLO temporaries from native attention over
+the whole cache_loc bucket (fixed by the blockwise pass), then every layer off from slot 0 because
+the reference ran `embed_norm` twice. Loading takes about 2 hours per launch (about 7 minutes of
+dense weights, then the routed experts at 45 MB/s to 1.4 GB/s per host through gcsfuse).
+
+To reproduce the check, stage the checkpoint and its reference as
+[Across hosts](../README.md#across-hosts) describes, then run from the repo root:
+
+```bash
+BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE inkling setup check
+```
+
+The same command with `measure` in place of `check` takes throughput and HBM, about 4.5 hours for
+two engine loads. Nobody has run it yet.
+
+Notes: nobody has replayed the check block as written from a clean start. The run above came from
+the same script and row. `check` exits 1 on the control above, and the script stops at the first
+step that fails, so put `measure` in a run of its own. The 4.5 hours is projected from the 2-hour
+loads above.
+

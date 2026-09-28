@@ -14,8 +14,11 @@
 # limitations under the License.
 
 # Apply every patch in upstream/ to a clean sglang-jax checkout at SGL_COMMIT, in the order it's
-# meant to be used, and report what no longer applies. 14 patches, 12 checks: each model patch that
-# ships a separate hook shares its check with the hook.
+# meant to be used, and report what no longer applies. 21 patches, 17 checks: each model patch that
+# ships a separate hook shares its check with the hook, multihost-hidden-states.patch,
+# glm5-tp-sharding.patch and glm5-fp8-accumulate.patch share the GLM-5.3 row's check,
+# nemotron3-probe.patch gets the Nemotron 3 Ultra row's check, and glm5-next-probe.patch gets the
+# GLM-5.3-Flash row's check.
 #
 #   bash scripts/verify_patches.sh                   # eb061d8, the tree bootstrap_tpu_vm.sh builds
 #   SGL_COMMIT=main bash scripts/verify_patches.sh   # upstream main as it stands
@@ -142,15 +145,30 @@ for p in kimi-linear qwen3_5 deepseek-v3 glm4-moe; do
   try "$p-capture-hook.patch" "upstream/capture-hooks/$p-capture-hook.patch"
 done
 try "glm5-capture-hook.patch" "upstream/glm5-capture-hook.patch"
+# GLM-5.3's row in scripts/multihost_run.sh, in its order.
+try "glm5.3 row: multihost, glm5 hook, glm5-tp-sharding.patch, then glm5-fp8-accumulate.patch" \
+  "upstream/multihost-hidden-states.patch" "upstream/glm5-capture-hook.patch" \
+  "upstream/glm5-tp-sharding.patch" "upstream/glm5-fp8-accumulate.patch"
 
-# gpt-oss, kimi-k3 and nemotron3 all edit layers/moe.py, so one clone takes one of them.
+# gpt-oss, kimi-k3 and nemotron3 all edit layers/moe.py, deepseek-v41 collides with kimi-k3
+# and nemotron3, and glm5-next carries the same runner hooks deepseek-v41 does, so one clone
+# takes one of them.
 echo "model patches, one tree each"
+try "deepseek-v41-model.patch" "upstream/models/deepseek-v41-model.patch"
+try "glm5-next-model.patch" "upstream/models/glm5-next-model.patch"
 try "gpt-oss-model.patch" "upstream/models/gpt-oss-model.patch"
 try "inkling-model.patch" "upstream/models/inkling-model.patch"
 try "kimi-k3 model then hook" \
   "upstream/models/kimi-k3-model.patch" "upstream/models/kimi-k3-capture-hook.patch"
 try "nemotron3 model then hook" \
   "upstream/models/nemotron3-model.patch" "upstream/models/nemotron3-capture-hook.patch"
+# Nemotron 3 Ultra's row in scripts/multihost_run.sh, in bootstrap_tpu_vm.sh's order.
+try "nemotron3-ultra row: model, hook, multihost, then nemotron3-probe.patch" \
+  "upstream/models/nemotron3-model.patch" "upstream/models/nemotron3-capture-hook.patch" \
+  "upstream/multihost-hidden-states.patch" "upstream/models/nemotron3-probe.patch"
+# GLM-5.3-Flash's row in scripts/multihost_run.sh.
+try "glm5.3-flash row: glm5-next model, then glm5-next-probe.patch" \
+  "upstream/models/glm5-next-model.patch" "upstream/models/glm5-next-probe.patch"
 
 echo
 echo "$pass checks passed, $fail failed"

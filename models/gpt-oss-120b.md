@@ -22,7 +22,8 @@ it. It hasn't served on a chip yet.
 
 ## Serve
 
-Engine: `sglang-jax` with [`upstream/models/gpt-oss-model.patch`](../upstream/models/gpt-oss-model.patch).
+Engine: `sglang-jax` with
+[`upstream/models/gpt-oss-model.patch`](../upstream/models/gpt-oss-model.patch).
 Slice: `v5p-8`, 4 chips, one host.
 
 ```bash
@@ -89,19 +90,21 @@ so read `swa_layer_tokens` out of the startup log and check it against
 
 ### Scaling out to `v5p-64`
 
-`v5p-64` is 32 chips on 8 hosts. Nothing here has run on it, capture included. Run the
-`launch_server` command on all 8 hosts with `--tp-size 32`, `--dp-size 4`, `--nnodes 8`,
-`--node-rank $RANK` and `--dist-init-addr $HOST0:$PORT`. `$RANK` is the host's index, 0 to 7.
-`$HOST0:$PORT` is host 0's internal IP and a free port. The engine calls
-`jax.distributed.initialize` only when `--nnodes` is above 1. This repo has no multi-host recipe.
-Capture needs `--dp-size 1`, so a captured run there takes `--tp-size 32` alone and stores every
-KV head four times.
+`v5p-64` is 32 chips on 8 hosts. gpt-oss-120b hasn't run on one; six other models have, through
+[Across hosts](../README.md#across-hosts). Run the `launch_server` command on all 8 hosts with
+`--tp-size 32`, `--dp-size 4`, `--nnodes 8`, `--node-rank $RANK` and
+`--dist-init-addr $HOST0:$PORT`. `$RANK` is the host's index, 0 to 7. `$HOST0:$PORT` is host 0's
+internal IP and a free port. The engine calls `jax.distributed.initialize` only when `--nnodes` is
+above 1. For this repo's scripts, `scripts/multihost_exec.sh` sets the same three settings on
+every host, and `scripts/multihost_run.sh` has no gpt-oss row yet. Capture needs `--dp-size 1`,
+so a captured run there takes `--tp-size 32` alone and stores every KV head four times.
 `sglang-jax` keeps its launch templates in
 [`docs/deployment/`](https://github.com/sgl-project/sglang-jax/tree/eb061d8/docs/deployment).
 
 Run the chip check on all 8 hosts at once, with `jax.distributed.initialize()` before the count,
 as the [JAX multi-process guide](https://docs.jax.dev/en/latest/501/multiprocess.html) asks. It
-reports 32.
+reported 32 on every host of the `v5p-64` in us-east5-a on 2026-09-27;
+`scripts/multihost_setup.sh` runs this check.
 
 ```bash
 python3 -c "import jax; jax.distributed.initialize(); print(jax.device_count())"
@@ -157,6 +160,10 @@ The wire carries 5,760 bytes per token, the one kept slot at BF16, and disk take
 slot at float32. Each run wrote 176,000 tokens into one 1.888 GiB shard, and both shards carry the
 same SHA-256, `2021f3af...`.
 
+A clean-context replay ran the block twice more on 2026-09-28, on a fresh `v5p-8` Spot slice in
+europe-west4-b: 7,276.9 and 7,281.8 tokens/s with capture off, 5,866.7 and 5,870.3 with it on,
+1.24x, the same peak HBM, and both shards carried `2021f3af...` again.
+
 Before the layer filter, on 2026-09-24, the engine copied all 36 slots, 207,360 bytes per token,
 and the same command read 1,875.8 tokens/s with capture on, 3.88x, at 78.72 GiB of peak HBM.
 
@@ -181,8 +188,9 @@ before run 1, and run 2 found them cached. On 2026-09-24 the same fetch read 299
 ### Reproduce
 
 On a `v5p-8`, from the repo root. `bootstrap_tpu_vm.sh --model gpt-oss` builds `sglang-jax` in
-`~/w` with the capture and steering patches, then the model, which carries its own hook. Run it
-again and it keeps that tree, so the whole block runs twice on one VM.
+`~/w` with the capture and steering patches, then the model, which carries its own hook. One pass
+gives one column of the table above. Run the block again and bootstrap keeps that tree, which is
+how the second column ran.
 
 ```bash
 bash scripts/bootstrap_tpu_vm.sh --model gpt-oss
@@ -205,8 +213,9 @@ of their own ([Mixed-precision checkpoint](#mixed-precision-checkpoint)). Every 
 
 On a VM that served another model, bootstrap moves the old tree aside and builds this one. That
 tree can't take this patch: the Nemotron 3 and Kimi K3 patches edit the same `layers/moe.py`. The
-old model's weights still fill `/dev/shm`, and bootstrap lists them. Delete them before the
-fetch, for example `rm -rf /dev/shm/hf/hub/models--nvidia--NVIDIA-Nemotron-3-Super-120B-A12B-BF16`.
+old model's weights still fill `/dev/shm`, and bootstrap lists them. The fetch runs inside
+`measure_model.sh`, so delete them right after bootstrap, for example
+`rm -rf /dev/shm/hf/hub/models--nvidia--NVIDIA-Nemotron-3-Super-120B-A12B-BF16`.
 
 ## What the patch adds
 

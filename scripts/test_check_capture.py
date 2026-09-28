@@ -25,9 +25,13 @@ those arrays and derive each control from them. Among them: the joined prompt wi
 filed under another prompt's rows, which the median passes and the diverged count has to fail, and
 a capture that keeps only the sink row, which a Pearson over the whole block passes and the
 per-token `--no-floor` gate has to fail. The engine starts without `--return-hidden-states-layers`
-and every reply holds every slot. Four runs stop before any forward: a prompt file one prompt
-short of the joined prompt, a joined prompt that fits one prefill pass, and `chunked_prefill_size`
-or `return_hidden_states_layers` passed through `--engine-arg`.
+and every reply holds every slot. Five runs stop before any forward: a prompt file one prompt
+short of the joined prompt, a joined prompt that fits one prefill pass, and `tp_size`,
+`chunked_prefill_size` or `return_hidden_states_layers` passed through `--engine-arg`.
+
+The same run writes its capture with `--save-capture`, and `--capture-npz` gates it again against
+the saved reference with no engine, to the same RESULT lines. Its controls: the capture with prompt
+0's slots one layer off has to fail, and a capture holding other token ids is refused.
 
 Every check carries a control. A control that passes fails the run.
 """
@@ -97,7 +101,9 @@ try:
                JAX_PLATFORMS="cpu")
     env.pop("XLA_FLAGS", None)
     saved = os.path.join(root, "arrays")  # no suffix, so np.savez adds one
-    run = subprocess.run(command(model, prompts, "--save-npz", saved, "--log-payloads"),
+    capture_file = os.path.join(root, "capture.npz")
+    run = subprocess.run(command(model, prompts, "--save-npz", saved, "--log-payloads",
+                                 "--save-capture", capture_file),
                          capture_output=True, text=True, env=env, timeout=1800)
     ok = run.returncode == 0 and "All checks passed." in run.stdout
     report(ok, f"check_capture.py exits {run.returncode} and passes every layer of every prompt")
@@ -143,6 +149,44 @@ try:
         f"the engine starts without --return-hidden-states-layers, and every prefill chunk holds "
         f"{slot_counts} slots",
     )
+
+    # The saved capture gates again without the engine, against the saved reference.
+    regate = subprocess.run(command(model, prompts, "--reference-npz", saved + ".npz",
+                                    "--capture-npz", capture_file),
+                            capture_output=True, text=True, env=env, timeout=600)
+    again = [json.loads(line[len("RESULT "):]) for line in regate.stdout.splitlines()
+             if line.startswith("RESULT ")]
+    report(
+        regate.returncode == 0 and "All checks passed." in regate.stdout
+        and "engine capture:" not in regate.stdout and "capture read from" in regate.stdout
+        and again == results,
+        f"--capture-npz re-gates the saved capture with no engine: exit {regate.returncode}, "
+        f"{len(again)} RESULT lines equal to the engine run's",
+    )
+    if regate.returncode != 0:
+        print("      its stdout:\n" + regate.stdout + "\n      its stderr:\n" + regate.stderr)
+    held = dict(np.load(capture_file))
+    shifted = dict(held)
+    # Prompt 0's slots moved up one layer: each slot holds the stream one layer later.
+    shifted["capture0"] = np.concatenate([held["capture0"][:, 1:], held["capture0"][:, -1:]], axis=1)
+    shifted_file = os.path.join(root, "capture-shifted.npz")
+    np.savez(shifted_file, **shifted)
+    moved = subprocess.run(command(model, prompts, "--reference-npz", saved + ".npz",
+                                   "--capture-npz", shifted_file),
+                           capture_output=True, text=True, env=env, timeout=600)
+    control(moved.returncode == 1 and "FAILED" in moved.stdout,
+            f"a saved capture with prompt 0's slots one layer off fails the re-gate, exit "
+            f"{moved.returncode}")
+    other = dict(held)
+    other["ids0"] = held["ids0"][::-1].copy()
+    other_file = os.path.join(root, "capture-other-ids.npz")
+    np.savez(other_file, **other)
+    refused = subprocess.run(command(model, prompts, "--reference-npz", saved + ".npz",
+                                     "--capture-npz", other_file),
+                             capture_output=True, text=True, env=env, timeout=600)
+    control(refused.returncode != 0 and "other token ids" in refused.stderr,
+            f"a saved capture whose prompt 0 holds other token ids is refused, exit "
+            f"{refused.returncode}")
 
     bad = subprocess.run(command(model, prompts, "--engine-arg", "tp_size=8"),
                          capture_output=True, text=True, env=env, timeout=600)

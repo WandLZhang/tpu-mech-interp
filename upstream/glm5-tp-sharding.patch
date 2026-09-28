@@ -1,0 +1,126 @@
+Subject: [PATCH] fix(glm5): serve FP8 GLM-5.3 when TP doesn't tile its shared
+ expert
+
+QuantizedLinear.from_linear drops a row-parallel static FP8 layer to a
+replicated reduce axis when its 128-wide input blocks don't tile across
+TP. Its producer, a col-parallel gate/up projection, still leaves the
+activation sharded on "tensor", and the loader places weight_q by the
+model's weight mapping, which keeps the layer row-parallel. Under
+Explicit mesh axes shard_map refuses an input whose sharding differs
+from in_specs.
+
+GLM-5.3 hits it at --tp-size 32: the shared expert's down_proj has
+2048 / 128 = 16 input blocks, and the first extend precompile dies with
+
+  ValueError: in_specs passed to shard_map: P('data', None) does not
+  match the specs of the input: P('data', 'tensor')
+
+QuantizedLinear reshards the activation and weight_q to its specs
+before the shard_map, the way it already reshards the scale. Both are
+no-ops when the sharding matches. Glm5MLP.post_load_weights places each
+static FP8 weight_q where its kernel_axes say, once, so a fallback
+down_proj doesn't gather its weight on every forward.
+
+With the model serving at TP above 1 on one host, capture fails next:
+the hidden states span the mesh, and a host slice of them lowers to a
+gather jax refuses to place under Explicit axes. _hidden_rows copies
+them to the host once per batch there, as it already gathers them once
+per batch across hosts.
+---
+ python/sgl_jax/srt/layers/linear.py                | 12 +++++++++++-
+ .../managers/scheduler_output_processor_mixin.py   | 18 ++++++++++++++----
+ python/sgl_jax/srt/models/glm5_moe.py              | 11 +++++++++++
+ 3 files changed, 36 insertions(+), 5 deletions(-)
+
+diff --git a/python/sgl_jax/srt/layers/linear.py b/python/sgl_jax/srt/layers/linear.py
+index 52068e92..1f2c72c6 100644
+--- a/python/sgl_jax/srt/layers/linear.py
++++ b/python/sgl_jax/srt/layers/linear.py
+@@ -489,6 +489,16 @@ class QuantizedLinear(nnx.Module):
+         # as q_b_proj. Explicitly reshard the scale to its expected spec — a no-op
+         # when it is already correctly sharded.
+         scale_val = jax.sharding.reshard(scale_val, NamedSharding(self.mesh, w_scale_spec))
++        # The activation and the weight have to match in_specs too. from_linear drops a
++        # row-parallel layer to a replicated reduce axis when its in_blocks don't tile across TP
++        # (GLM-5.3's shared-expert down_proj at TP 32: 16 blocks). Its producer, a col-parallel
++        # gate/up projection, still leaves the activation sharded on "tensor", and a loader that
++        # places weight_q by the model's row-parallel mapping leaves it sharded there too.
++        # Reshard both to the layer's specs, a no-op when they already match.
++        x_2d = jax.sharding.reshard(x_2d, NamedSharding(self.mesh, P("data", input_axis)))
++        w_q = jax.sharding.reshard(
++            self.weight_q.value, NamedSharding(self.mesh, P(output_axis, input_axis))
++        )
+         in_specs = (P("data", input_axis), P(output_axis, input_axis), w_scale_spec)
+ 
+         target = out_sharding or NamedSharding(self.mesh, P("data", output_axis))
+@@ -509,7 +519,7 @@ class QuantizedLinear(nnx.Module):
+             in_specs=in_specs,
+             out_specs=target.spec,
+             check_vma=False,
+-        )(x_2d, self.weight_q.value, scale_val)
++        )(x_2d, w_q, scale_val)
+ 
+         # Reshape back to original batch dimensions.
+         if x.ndim > 2:
+diff --git a/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py b/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
+index 4048bd11..63760720 100644
+--- a/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
+@@ -23,21 +23,31 @@ from sgl_jax.srt.speculative.overlap_utils import (
+ def _hidden_rows(logits_output):
+     """`logits_output.hidden_states` in a form any rank can slice.
+ 
+-    On one host the array is fully addressable and comes back as is. Across hosts, with
++    On one device the array comes back as is, and on one host a single device_get copies it to
++    the host. Across hosts, with
+     `--nnodes` above 1, its rows can sit on devices other processes own, and indexing it raises
+     a sharding error. Every rank runs this in the same order, since each one processes the same
+     batch, so one `process_allgather` per batch puts the whole array on every host. The result is
+     cached on the output, so later requests in the batch read it without another collective.
+     """
+     hs = logits_output.hidden_states
+-    if hs is None or getattr(hs, "is_fully_addressable", True):
++    if hs is None:
+         return hs
+     cached = getattr(logits_output, "_host_hidden_states", None)
+-    if cached is None:
++    if cached is not None:
++        return cached
++    if getattr(hs, "is_fully_addressable", True):
++        # On one host at --tp-size above 1 the array spans the mesh's devices, and under
++        # Explicit mesh axes a host slice of it lowers to a gather jax refuses to place. One
++        # device_get per batch copies it to the host instead.
++        if len(getattr(getattr(hs, "sharding", None), "device_set", ())) <= 1:
++            return hs
++        cached = jax.device_get(hs)
++    else:
+         from jax.experimental import multihost_utils
+ 
+         cached = multihost_utils.process_allgather(hs, tiled=True)
+-        logits_output._host_hidden_states = cached
++    logits_output._host_hidden_states = cached
+     return cached
+ 
+ 
+diff --git a/python/sgl_jax/srt/models/glm5_moe.py b/python/sgl_jax/srt/models/glm5_moe.py
+index 21e4fba5..2d112823 100644
+--- a/python/sgl_jax/srt/models/glm5_moe.py
++++ b/python/sgl_jax/srt/models/glm5_moe.py
+@@ -654,6 +654,17 @@ class Glm5MLP(nnx.Module):
+             )
+ 
+     def post_load_weights(self):
++        # Static FP8: the loader places weight_q by the weight mapping, which keeps down_proj
++        # row-parallel. QuantizedLinear.from_linear drops a down_proj whose in_blocks don't tile
++        # across TP to a replicated reduce axis, and its forward would then gather weight_q on
++        # every call. Place each weight_q where its layer's kernel_axes say, once.
++        for proj in (self.gate_proj, self.up_proj, self.down_proj):
++            if proj is not None and hasattr(proj, "weight_q"):
++                in_axis, out_axis = proj.kernel_axes
++                proj.weight_q.value = jax.sharding.reshard(
++                    proj.weight_q.value,
++                    jax.sharding.NamedSharding(self.mesh, P(out_axis, in_axis)),
++                )
+         if not self.use_fused:
+             return
+         if not hasattr(self.gate_proj, "weight"):

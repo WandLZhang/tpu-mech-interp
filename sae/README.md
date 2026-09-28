@@ -133,8 +133,8 @@ python3 sae/train.py --manifest caps/manifest.json --layer 20 \
     --expansion-factor 16 --k 100 --steps 100000 --out sae_l20.npz
 ```
 
-This command takes its width from the manifest. On a 5,376-wide capture it's the recipe above,
-and it doesn't fit a `v5litepod-8` either.
+This command takes its width from the manifest. No run here has taken it as written. On a
+5,376-wide capture it's the recipe above, and it doesn't fit a `v5litepod-8` either.
 
 Slot 20 is the residual stream entering block 20, which is block 19's output. `save` records the
 slot in the checkpoint as `capture_layer`, and

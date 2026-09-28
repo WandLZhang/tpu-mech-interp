@@ -236,7 +236,7 @@ magnitude. Every control has to clear the same bar the implementation passes, 1e
 elsewhere.
 
 Three controls run per case, and each has to fail: the intra-chunk decay dropped, the segment sum
-off by one, and the cross-device chain broken. Six more cases follow.
+off by one, and the cross-device chain broken. Seven more cases follow.
 
 | Case | Compares against | Controls |
 |---|---|---|

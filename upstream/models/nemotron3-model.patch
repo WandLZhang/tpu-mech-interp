@@ -40,13 +40,23 @@ leaves to the request's track slot as well as its running slot. The scheduler
 ends every forward that crosses a track boundary on the boundary, and the
 radix tree adopts the track slot as the state of that prefix.
 
-dt is clamped to mamba_dt_limit, whose (0.0, inf) default neither published
-config.json overrides. Megatron-LM trains with that pair, and NVIDIA's CUDA
-kernels and vLLM serve with it. The torch paths floor dt at time_step_min,
-0.001, instead: transformers in prefill, and NVIDIA's torch_forward in prefill
-and decode. On the published weights 212 of Super's 5,120 Mamba-2 heads have
-softplus(dt_bias) below 0.001, so that floor binds. The test's random weights
-keep dt above it, so the comparison with transformers doesn't reach it.
+dt is floored at time_step_min, 0.001, and capped at the high end of
+mamba_dt_limit. That's the clamp transformers applies in its chunked scan, and
+every capture is checked against transformers. Megatron-LM trains with
+mamba_dt_limit's (0.0, inf), and NVIDIA's CUDA kernels and vLLM serve with it,
+but the floor binds on the published weights: 212 of Super's 5,120 Mamba-2
+heads and 458 of Ultra's 12,288 have softplus(dt_bias) below 0.001. Without the
+floor, Ultra's first seven layers on CPU at BF16 sit at up to 2.87 times
+transformers' own BF16 error, against 0.95 with it.
+
+Row-parallel products sum their shards in float32. LinearBase asks its dot for
+the weight dtype, so at BF16 each shard rounds its partial and the all-reduce
+over the tensor axis adds BF16 numbers: 32 roundings at --tp-size 32, where
+transformers rounds once. On Ultra's layer 0 out_proj that doubles the
+product's error, 1.7e-3 of the block's norm against 9.0e-4. row_parallel asks
+for float32 at out_proj, o_proj, both down_proj and fc2_latent_proj, and EPMoE
+grows a reduce_in_float32 flag that keeps the experts' down projection, the
+top-k combine and the all-reduce in float32. Other models leave it off.
 
 The routed experts aren't gated: one up_proj, mlp_hidden_act, one down_proj,
 and they run in a shared latent of moe_latent_size rather than at
@@ -91,27 +101,32 @@ tensor axis as well as a one-way one. Through the engine's own pools,
 metadata and jit, a prefix hit that resumes from a track slot matches a fresh
 prefill, and a poisoned request's inf and NaN stay out of the three requests
 packed around it. A stack cut to three blocks through ModelConfig matches the
-full stack at that depth, and each expert-placement flag stops the build.
- python/sgl_jax/srt/configs/nemotron_h.py           | 436 ++++++++++
+full stack at that depth, and each expert-placement flag stops the build. With
+one RMS group of Mamba-2 heads under the dt floor, float32 still matches to
+1.2e-07. At BF16 on a four-way tensor axis, with every float32 dot left at the
+default precision rounded to BF16 as a TPU rounds it, each layer's median
+per-token error stays under twice transformers' own BF16 error, and the traced
+program shows every row-parallel dot and the experts' all-reduce in float32.
+ python/sgl_jax/srt/configs/nemotron_h.py           | 453 ++++++++++
  python/sgl_jax/srt/hf_transformers_utils.py        |   7 +
  .../srt/layers/attention/fla/group_rmsnorm.py      |  64 +-
  .../layers/attention/hybrid_linear_attn_backend.py |   8 +
  .../sgl_jax/srt/layers/attention/mamba/__init__.py |  21 +
  .../sgl_jax/srt/layers/attention/mamba/mamba2.py   | 305 +++++++
  .../srt/layers/attention/mamba/mamba2_backend.py   | 583 +++++++++++++
- python/sgl_jax/srt/layers/moe.py                   | 128 ++-
+ python/sgl_jax/srt/layers/moe.py                   | 141 ++-
  .../sgl_jax/srt/mem_cache/recurrent_state_pool.py  |  21 +-
  .../model_executor/model_runner_kv_cache_mixin.py  |   4 +-
- python/sgl_jax/srt/models/nemotron_h.py            | 931 +++++++++++++++++++++
+ python/sgl_jax/srt/models/nemotron_h.py            | 958 +++++++++++++++++++++
  python/sgl_jax/test/layers/test_group_rmsnorm.py   |  85 +-
- 12 files changed, 2521 insertions(+), 72 deletions(-)
+ 12 files changed, 2577 insertions(+), 73 deletions(-)
 
 diff --git a/python/sgl_jax/srt/configs/nemotron_h.py b/python/sgl_jax/srt/configs/nemotron_h.py
 new file mode 100644
-index 00000000..55409d48
+index 00000000..a5976095
 --- /dev/null
 +++ b/python/sgl_jax/srt/configs/nemotron_h.py
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,453 @@
 +"""Config and layer plan for the Nemotron 3 hybrid stack.
 +
 +Nemotron 3 doesn't repeat one layer shape, so the engine can't wrap the whole
@@ -401,12 +416,17 @@ index 00000000..55409d48
 +        self.mamba_hidden_act = mamba_hidden_act
 +        self.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
 +        # `time_step_min` and `time_step_max` bound the range the `dt_bias`
-+        # initializer draws over. The runtime clamp is `mamba_dt_limit`, which
-+        # the config class exposes as `time_step_limit`, and neither published
-+        # `config.json` overrides its (0.0, inf) default. Megatron-LM trains
-+        # with that pair, and NVIDIA's CUDA kernels and vLLM serve with it.
-+        # The torch paths floor `dt` at `time_step_min` instead: transformers
-+        # 5.17 in prefill, and NVIDIA's `torch_forward` in prefill and decode.
++        # initializer draws over. `mamba_dt_limit`, which the config class
++        # exposes as `time_step_limit`, is (0.0, inf) in both published
++        # `config.json` files. Megatron-LM trains with that pair, and NVIDIA's
++        # CUDA kernels and vLLM serve with it. The torch paths floor `dt` at
++        # `time_step_min` instead: transformers 5.17 in prefill, and NVIDIA's
++        # `torch_forward` in prefill and decode. The scan follows the torch
++        # paths, because transformers is the reference every capture is
++        # checked against: `scan_dt_limit` raises the low end to
++        # `time_step_min`. Ultra holds 458 of its 12,288 Mamba-2 heads with
++        # softplus(dt_bias) below 0.001, 29 of them in layer 0, so the floor
++        # binds on the published weights.
 +        self.time_step_min = time_step_min
 +        self.time_step_max = time_step_max
 +        # A config this class wrote back out carries the resolved spelling.
@@ -535,6 +555,18 @@ index 00000000..55409d48
 +            head_k_dim=self.ssm_state_size,
 +        )
 +
++    @property
++    def scan_dt_limit(self) -> tuple[float, float]:
++        """The `(low, high)` clamp the scan applies to `dt` after the softplus.
++
++        transformers 5.17 floors `dt` at `time_step_min` in its chunked scan
++        and ignores `mamba_dt_limit`. The low end here is the larger of the
++        two, so a config that sets a higher floor keeps it. The high end is
++        `mamba_dt_limit`'s.
++        """
++        low, high = self.time_step_limit
++        return (max(float(low), float(self.time_step_min)), float(high))
++
 +    def mamba_config(self):
 +        """The `Mamba2Config` the chunked scan reads."""
 +        from sgl_jax.srt.layers.attention.mamba.mamba2 import Mamba2Config
@@ -546,7 +578,7 @@ index 00000000..55409d48
 +            n_groups=self.n_groups,
 +            conv_kernel=self.conv_kernel,
 +            chunk_size=self.chunk_size,
-+            time_step_limit=tuple(self.time_step_limit),
++            time_step_limit=self.scan_dt_limit,
 +        )
 diff --git a/python/sgl_jax/srt/hf_transformers_utils.py b/python/sgl_jax/srt/hf_transformers_utils.py
 index 51805fa2..798c8db1 100644
@@ -721,7 +753,7 @@ index 00000000..c421b608
 +]
 diff --git a/python/sgl_jax/srt/layers/attention/mamba/mamba2.py b/python/sgl_jax/srt/layers/attention/mamba/mamba2.py
 new file mode 100644
-index 00000000..b4f4462b
+index 00000000..0788a5f4
 --- /dev/null
 +++ b/python/sgl_jax/srt/layers/attention/mamba/mamba2.py
 @@ -0,0 +1,305 @@
@@ -802,9 +834,9 @@ index 00000000..b4f4462b
 +    """The fields of a Mamba-2 layer config that the chunked scan reads.
 +
 +    `time_step_limit` is the `(low, high)` clamp applied to `dt` after the
-+    softplus. `config.json` calls the field `mamba_dt_limit`, and both
-+    published Nemotron 3 checkpoints leave it at the `(0.0, inf)` default, the
-+    pair Megatron-LM trains with.
++    softplus. `NemotronHConfig.scan_dt_limit` fills it: `time_step_min` at the
++    low end, the floor transformers applies in its chunked scan, and the high
++    end of `mamba_dt_limit`. The default here is Megatron-LM's `(0.0, inf)`.
 +    """
 +
 +    ssm_state_size: int
@@ -1620,28 +1652,35 @@ index 00000000..e4c63ebd
 +        new_ssm = as_cache_layout(states[last_chunk])
 +        return out, new_ssm
 diff --git a/python/sgl_jax/srt/layers/moe.py b/python/sgl_jax/srt/layers/moe.py
-index 18b2a09b..c4bc7535 100644
+index 18b2a09b..09fbd534 100644
 --- a/python/sgl_jax/srt/layers/moe.py
 +++ b/python/sgl_jax/srt/layers/moe.py
-@@ -42,6 +42,7 @@ class EPMoE(nnx.Module):
+@@ -42,6 +42,8 @@ class EPMoE(nnx.Module):
          weight_dtype: jnp.dtype = jnp.bfloat16,
          dtype: jnp.dtype = jnp.bfloat16,
          activation: str = "silu",
 +        gated: bool = True,
++        reduce_in_float32: bool = False,
          layer_id: int = 0,
          quantization_config=None,
          physical_to_logical_map: "jax.Array | None" = None,
-@@ -50,6 +51,9 @@ class EPMoE(nnx.Module):
+@@ -50,6 +52,15 @@ class EPMoE(nnx.Module):
          use_sc_permute: bool | None = None,
      ):
          self.num_experts_per_tok = num_experts_per_tok
 +        # A gated expert reads two input matrices and multiplies them.
 +        # Nemotron 3 experts read one and square the ReLU, so `wi_1` is absent.
 +        self.gated = gated
++        # The down projection contracts the intermediate axis, which the tensor
++        # axis shards. With this set, each shard's partial sum, the top-k
++        # weighted combine and the all-reduce over the tensor axis stay float32,
++        # and the result rounds to `dtype` once. Off, each shard rounds its
++        # partial to `dtype` and the all-reduce adds those.
++        self.reduce_in_float32 = reduce_in_float32
          # Opt-in SparseCore permute/unpermute kernels; ``None`` defers to the env flag.
          self.use_sc_permute = (
              moe_sc_permute_enabled_by_env() if use_sc_permute is None else bool(use_sc_permute)
-@@ -147,14 +151,17 @@ class EPMoE(nnx.Module):
+@@ -147,14 +158,17 @@ class EPMoE(nnx.Module):
                  )
              )
  
@@ -1666,7 +1705,7 @@ index 18b2a09b..c4bc7535 100644
  
              self.wo = nnx.Param(
                  jax.random.normal(
-@@ -171,6 +178,15 @@ class EPMoE(nnx.Module):
+@@ -171,6 +185,15 @@ class EPMoE(nnx.Module):
              self.wi_1_scale = None
              self.wo_scale = None
  
@@ -1682,7 +1721,7 @@ index 18b2a09b..c4bc7535 100644
      def _detect_device_capabilities(self):
          try:
              devices = jax.devices()
-@@ -342,6 +358,8 @@ class EPMoE(nnx.Module):
+@@ -342,6 +365,8 @@ class EPMoE(nnx.Module):
                      # dtype. Dummy loading must use that same weight contract.
                      for name in ("wi_0", "wi_1", "wo"):
                          param = getattr(self, name)
@@ -1691,7 +1730,7 @@ index 18b2a09b..c4bc7535 100644
                          param.value = jax.ShapeDtypeStruct(
                              param.value.shape, self.quantized_dtype, sharding=param.value.sharding
                          )
-@@ -379,13 +397,17 @@ class EPMoE(nnx.Module):
+@@ -379,13 +404,17 @@ class EPMoE(nnx.Module):
  
                  if hasattr(self, "wi_1_scale"):
                      del self.wi_1_scale
@@ -1715,7 +1754,7 @@ index 18b2a09b..c4bc7535 100644
                  )
  
                  if hasattr(self, "wo_scale"):
-@@ -415,12 +437,14 @@ class EPMoE(nnx.Module):
+@@ -415,12 +444,14 @@ class EPMoE(nnx.Module):
                  axis=1,
                  block_size=block_size_k,
              )
@@ -1736,7 +1775,7 @@ index 18b2a09b..c4bc7535 100644
              wo_value, wo_scale = quantize_tensor(
                  self.quantized_dtype,
                  self.wo.value,
-@@ -429,18 +453,21 @@ class EPMoE(nnx.Module):
+@@ -429,18 +460,21 @@ class EPMoE(nnx.Module):
              )
  
              self.wi_0 = nnx.Param(w0_value, out_sharding=P("expert", None, "tensor"))
@@ -1761,7 +1800,7 @@ index 18b2a09b..c4bc7535 100644
                  wo_scale = wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1])
  
              if hasattr(self, "wi_0_scale"):
-@@ -452,9 +479,13 @@ class EPMoE(nnx.Module):
+@@ -452,9 +486,13 @@ class EPMoE(nnx.Module):
  
              if hasattr(self, "wi_1_scale"):
                  del self.wi_1_scale
@@ -1778,7 +1817,7 @@ index 18b2a09b..c4bc7535 100644
              )
  
              if hasattr(self, "wo_scale"):
-@@ -515,7 +546,7 @@ class EPMoE(nnx.Module):
+@@ -515,7 +553,7 @@ class EPMoE(nnx.Module):
              )
              w1_scale = self._normalize_scale_for_gmm(
                  self.wi_1_scale.value if self.wi_1_scale is not None else None,
@@ -1787,7 +1826,7 @@ index 18b2a09b..c4bc7535 100644
                  scale_name="wi_1_scale",
              )
              wo_scale = self._normalize_scale_for_gmm(
-@@ -551,7 +582,7 @@ class EPMoE(nnx.Module):
+@@ -551,7 +589,7 @@ class EPMoE(nnx.Module):
                  topk_weights_reshard,
                  topk_ids_reshard,
                  self.wi_0.value,
@@ -1796,7 +1835,7 @@ index 18b2a09b..c4bc7535 100644
                  self.wo.value,
                  w0_scale,
                  w1_scale,
-@@ -607,7 +638,7 @@ class EPMoE(nnx.Module):
+@@ -607,7 +645,7 @@ class EPMoE(nnx.Module):
                  topk_weights,
                  topk_ids,
                  self.wi_0[...],
@@ -1805,7 +1844,16 @@ index 18b2a09b..c4bc7535 100644
                  self.wo[...],
              )
  
-@@ -756,7 +787,7 @@ class EPMoE(nnx.Module):
+@@ -698,7 +736,7 @@ class EPMoE(nnx.Module):
+         if self.ep_size > 1:
+             output = self._combine(output)
+ 
+-        return output
++        return output.astype(self.dtype)
+ 
+     def _gmm_compute(
+         self,
+@@ -756,7 +794,7 @@ class EPMoE(nnx.Module):
              acc_dtype=jnp.float32,
          )
  
@@ -1814,7 +1862,7 @@ index 18b2a09b..c4bc7535 100644
          layer_w0 = gmm(
              lhs=x,
              rhs=w0_kernel,
-@@ -766,24 +797,30 @@ class EPMoE(nnx.Module):
+@@ -766,26 +804,34 @@ class EPMoE(nnx.Module):
              activation_quantized_dtype=act_q_dtype,
              **gmm_kwargs,
          )
@@ -1854,8 +1902,21 @@ index 18b2a09b..c4bc7535 100644
 +            intermediate_layer = layer_act
  
          # === GEMM2: intermediate @ wo ===
++        if self.reduce_in_float32:
++            gmm_kwargs["preferred_element_type"] = jnp.float32
          return gmm(
-@@ -944,15 +981,24 @@ def create_moe_weights_mapping(
+             lhs=intermediate_layer,
+             rhs=wo_kernel,
+@@ -922,6 +968,8 @@ class EPMoE(nnx.Module):
+                 )
+                 output = contribution if output is None else output + contribution
+ 
++        if self.reduce_in_float32:
++            return output
+         final_output = output.astype(self.dtype)
+ 
+         return final_output
+@@ -944,15 +992,24 @@ def create_moe_weights_mapping(
      moe_path: str = "mlp",
      source_expert_pattern: str = "experts.{i}",
      physical_to_logical_map=None,  # np.ndarray shape (num_physical,) or None
@@ -1946,10 +2007,10 @@ index f44322a8..c5727164 100644
      def _kv_pool_layer_count(self: ModelRunner):
 diff --git a/python/sgl_jax/srt/models/nemotron_h.py b/python/sgl_jax/srt/models/nemotron_h.py
 new file mode 100644
-index 00000000..253fe621
+index 00000000..1dcaf33c
 --- /dev/null
 +++ b/python/sgl_jax/srt/models/nemotron_h.py
-@@ -0,0 +1,931 @@
+@@ -0,0 +1,958 @@
 +"""Nemotron 3: Mamba-2, attention and LatentMoE on one irregular stack.
 +
 +Covers `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16` and
@@ -2051,6 +2112,32 @@ index 00000000..253fe621
 +    """Validate `mlp_hidden_act` and hand the name to `EPMoE`."""
 +    mlp_activation(name)
 +    return name
++
++
++def row_parallel(linear: LinearBase, x: jax.Array) -> jax.Array:
++    """A row-parallel projection whose shards sum in float32.
++
++    `LinearBase` asks its dot for the weight dtype, so at BF16 each shard
++    rounds its partial sum to BF16 and the all-reduce over the tensor axis
++    adds BF16 numbers: 32 roundings and a BF16 sum at `--tp-size 32`, where
++    the reference rounds once. This asks for float32, so the all-reduce adds
++    float32 partials and the sum rounds once. A quantized linear, which a
++    quantization config swaps in, keeps its own path.
++    """
++    if type(linear) is not LinearBase:
++        out, _ = linear(x)
++        return out
++    weight = linear.weight.value
++    out = jax.lax.dot_general(
++        x,
++        weight,
++        (((x.ndim - 1,), (0,)), ((), ())),
++        preferred_element_type=jnp.float32,
++        out_sharding=NamedSharding(linear.mesh, P("data", *([None] * (x.ndim - 1)))),
++    )
++    if linear.bias is not None:
++        out = out + linear.bias.value.astype(jnp.float32)
++    return out.astype(weight.dtype)
 +
 +
 +def _quantization_config(config) -> QuantizationConfig | None:
@@ -2191,7 +2278,7 @@ index 00000000..253fe621
 +        )
 +
 +        y = self.norm(y.astype(jnp.float32) * jax.nn.silu(gate.astype(jnp.float32)))
-+        out, _ = self.out_proj(y.astype(self.dtype))
++        out = row_parallel(self.out_proj, y.astype(self.dtype))
 +        return out, state
 +
 +
@@ -2281,7 +2368,7 @@ index 00000000..253fe621
 +        v = v.reshape(-1, self.kv_head_num, self.head_dim, out_sharding=shape)
 +
 +        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
-+        out, _ = self.o_proj(attn_output)
++        out = row_parallel(self.o_proj, attn_output)
 +        return out, kv_fused
 +
 +
@@ -2320,7 +2407,7 @@ index 00000000..253fe621
 +    @named_scope
 +    def __call__(self, hidden_states: jax.Array) -> jax.Array:
 +        up, _ = self.up_proj(hidden_states)
-+        out, _ = self.down_proj(self.activation(up))
++        out = row_parallel(self.down_proj, self.activation(up))
 +        return out
 +
 +
@@ -2410,6 +2497,7 @@ index 00000000..253fe621
 +            dtype=dtype,
 +            activation=_epmoe_activation(config.mlp_hidden_act),
 +            gated=False,
++            reduce_in_float32=True,
 +            layer_id=layer_id,
 +            quantization_config=_quantization_config(config),
 +        )
@@ -2443,7 +2531,7 @@ index 00000000..253fe621
 +            # is row parallel. A `QuantizedLinear`, which a quantization config
 +            # swaps in, takes its input only on the layout it contracts over.
 +            routed = jax.sharding.reshard(routed, NamedSharding(self.mesh, P("data", "tensor")))
-+            routed, _ = self.fc2_latent_proj(routed)
++            routed = row_parallel(self.fc2_latent_proj, routed)
 +
 +        if self.shared_experts is not None:
 +            routed = routed + self.shared_experts(hidden_states)

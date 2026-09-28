@@ -18,6 +18,7 @@
 #   bash scripts/bootstrap_tpu_vm.sh
 #   bash scripts/bootstrap_tpu_vm.sh --model nemotron3   # plus a model from upstream/models/
 #   PATCHES=/path/to/upstream SGL_COMMIT=eb061d8 bash scripts/bootstrap_tpu_vm.sh
+#   EXTRA_PATCHES=glm5-capture-hook.patch bash scripts/bootstrap_tpu_vm.sh   # an upstream model's hook
 #   bash scripts/bootstrap_tpu_vm.sh --tree-only    # build the patched tree and stop
 #
 # Run it on the TPU VM, not on your workstation. It's safe to run twice: every step checks for
@@ -26,10 +27,12 @@
 # new one.
 #
 # --model NAME adds upstream/models/NAME-model.patch, then NAME-capture-hook.patch where one
-# exists: gpt-oss, inkling, kimi-k3 or nemotron3. The model patches count toward the tree, so a
-# second run with the same NAME keeps the tree, and a run with another NAME, or none, moves the
-# tree aside and builds the one it asks for. That's how one VM moves from one model to another:
-# gpt-oss, kimi-k3 and nemotron3 all edit layers/moe.py, and one tree takes one of them.
+# exists: deepseek-v41, glm5-next, gpt-oss, inkling, kimi-k3 or nemotron3. The model patches
+# count toward the tree, so a second run with the same NAME keeps the tree, and a run with
+# another NAME, or none, moves the tree aside and builds the one it asks for. That's how one VM
+# moves from one model to another: gpt-oss, kimi-k3 and nemotron3 all edit layers/moe.py,
+# deepseek-v41 collides with kimi-k3 and nemotron3, glm5-next carries deepseek-v41's runner
+# hooks, and one tree takes one of them.
 #
 # Each install writes its output to a log in $LOGS (default ~/bootstrap-logs). A step that fails
 # prints its whole log and stops. SGLANG_JAX_REPO clones from a local sglang-jax clone instead of
@@ -37,7 +40,7 @@
 # drives it on a workstation.
 set -uo pipefail
 
-USAGE="usage: bash scripts/bootstrap_tpu_vm.sh [--tree-only] [--model gpt-oss|inkling|kimi-k3|nemotron3]"
+USAGE="usage: bash scripts/bootstrap_tpu_vm.sh [--tree-only] [--model deepseek-v41|glm5-next|gpt-oss|inkling|kimi-k3|nemotron3]"
 TREE_ONLY=0
 MODEL=""
 while (($#)); do
@@ -93,6 +96,12 @@ if [[ -n "$MODEL" ]]; then
   [[ -f "$PATCHES/models/$MODEL-capture-hook.patch" ]] &&
     MODEL_PATCHES+=("models/$MODEL-capture-hook.patch")
 fi
+# EXTRA_PATCHES adds hooks for models that ship upstream, paths relative to $PATCHES, such as
+# EXTRA_PATCHES=glm5-capture-hook.patch for GLM-5 and GLM-5.3. They count toward the tree too.
+for p in ${EXTRA_PATCHES:-}; do
+  [[ "$p" != /* && -f "$PATCHES/$p" ]] || { log "no patch $p in $PATCHES"; exit 2; }
+  MODEL_PATCHES+=("$p")
+done
 
 if ((!TREE_ONLY)); then
   # Writeback throttling on the boot disk holds every read behind the flush of a big write. On a
@@ -180,6 +189,13 @@ run_logged flax-install uv pip install "flax==0.12.9"
 run_logged torch-install uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 # scripts/peak_hbm.py reads HBM through tpu-info's Python API, from outside the engine's process.
 run_logged tpu-info-install uv pip install tpu-info
+# sglang-jax pins transformers 5.12, which doesn't know `inkling_mm_model`, `glm5_next` or
+# `deepseek_v41`; an Inkling check on a v5p-64 stopped in AutoConfig on 5.12.1 (2026-09-27). The
+# CPU gates run the engine, every model patch included, on 5.17.0.
+case "$MODEL" in
+  inkling | glm5-next | deepseek-v41)
+    run_logged transformers-install uv pip install "transformers==5.17.0" ;;
+esac
 log "installs done; their logs are in $LOGS"
 
 mkdir -p /dev/shm/jaxcache

@@ -1,3 +1,13 @@
 # peak_hbm.py reads HBM through tpu-info's Python API, and test_peak_hbm.py calls that API on a
 # host with no TPU. The engine's own imports are in upstream/models/requirements.txt.
 tpu-info
+# check_capture.py streams a reference one decoder layer at a time through accelerate's offload,
+# for a model bigger than host RAM; test_streamed_reference.py runs it.
+accelerate
+# check_capture.py --trust-remote-code runs Kimi K3's own modeling_kimi_linear.py, which imports
+# einops, and its tokenization_kimi.py, which imports tiktoken.
+einops
+tiktoken
+# check_capture.py --deepseek-inference imports DeepSeek V4.1's inference/model.py, which imports
+# its image_processor.py, which imports PIL.
+pillow

@@ -24,7 +24,7 @@ chunked-scan formulation, and a dense attention rather than a paged one. The
 test builds a tiny random config, instantiates both models, copies one set of
 random weights into both, and runs one forward in float32.
 
-Fifteen checks. Every one drives the patched source.
+Eighteen checks. Every one drives the patched source.
 
 1. `scripts/cpu_engine.py` builds the tree the TPU VM serves, `sglang-jax` at
    `SGL_COMMIT` (default `eb061d8`) with `sglang-jax-877.patch` and both
@@ -59,8 +59,20 @@ Fifteen checks. Every one drives the patched source.
     `--ep-num-redundant-experts` stop the model build, and the defaults build.
 15. The runner resolves `nemotron_h` to its own recurrent config, builds
     `Mamba2AttnBackend` for it, and counts the state bytes a pool slot holds.
+16. One RMS group of Mamba-2 heads with softplus(dt_bias) under
+    `time_step_min`, where transformers floors dt, still matches in float32.
+17. BF16 on TPU arithmetic: the model at BF16 on a four-way tensor axis, with
+    every float32 dot left at the default precision rounded to BF16 the way a
+    TPU rounds it, against transformers in float32. Each layer's median
+    per-token error stays within twice transformers' own BF16 error, the gate
+    `scripts/check_capture.py` applies to a capture. The first on-chip check of
+    Ultra failed that gate at 2.6 times from layer 0 on.
+18. At BF16 on a four-way tensor axis, every row-parallel projection's dot
+    and the routed experts' all-reduce over the tensor axis yield float32, so
+    shards sum in float32 and round once. Read off the traced program: XLA on
+    CPU gathers small operands instead of reducing partials.
 
-The forwards in checks 2 to 8 and 13 put a dense attention stand-in behind
+The forwards in checks 2 to 8, 13, 16 and 17 put a dense attention stand-in behind
 `RadixAttention`. Checks 10 to 12 run a stack with no attention block through
 the engine's own pools, metadata and jit, the path the runner takes.
 
@@ -71,7 +83,8 @@ check that meets it.
 Every check carries a negative control. Check 1 refuses a patch with one
 context line rewritten, against a tree that patch hasn't touched. Check 5
 feeds the chunked side a decay 10% off. The capture check compares the
-captured streams one layer out of line. Twenty-three mutants follow, each
+captured streams one layer out of line. Check 17 first shows the rounding
+override moves a float32 einsum. Twenty-seven mutants follow, each
 breaking one weight, one connection or one line of the patched source, and
 each naming the check it has to move; a check no mutant names fails the run.
 Three of them turn the attention output, the Mamba-2 decode step and the
@@ -82,6 +95,7 @@ Point `SGLANG_JAX_REPO` at a clone that holds `eb061d8` to skip the download.
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import inspect
 import json
@@ -339,13 +353,25 @@ class DenseCausalAttention:
 class Harness:
     """A tiny Nemotron 3 on one mesh, plus the reference beside it."""
 
-    def __init__(self, repo: str, seed: int = 0, config: dict | None = None, tp: int = 1):
+    # Checks 8, 13 and 15 build a Harness through `__new__` and fill in only
+    # what they read, so the float32 default lives on the class.
+    dtype = jnp.float32
+
+    def __init__(
+        self,
+        repo: str,
+        seed: int = 0,
+        config: dict | None = None,
+        tp: int = 1,
+        dtype=jnp.float32,
+    ):
         sys.path.insert(0, os.path.join(repo, "python"))
         from sgl_jax.srt.configs.nemotron_h import NemotronHConfig
 
         self.settings = TINY if config is None else config
         self.cfg = NemotronHConfig(**self.settings)
         self.tp = tp
+        self.dtype = dtype
         self.mesh = Mesh(
             np.array(jax.devices()[:tp]).reshape(1, tp),
             axis_names=("data", "tensor"),
@@ -359,7 +385,7 @@ class Harness:
         from sgl_jax.srt.models.nemotron_h import NemotronHForCausalLM
 
         with jax.set_mesh(self.mesh):
-            return NemotronHForCausalLM(self.cfg, mesh=self.mesh, dtype=jnp.float32)
+            return NemotronHForCausalLM(self.cfg, mesh=self.mesh, dtype=self.dtype)
 
     @property
     def head(self):
@@ -588,7 +614,8 @@ def reference_forward(model, ids):
     with torch.no_grad():
         batch = torch.tensor(np.asarray(ids), dtype=torch.long)[None]
         out = model(batch, output_hidden_states=True)
-    hidden = [state[0].numpy() for state in out.hidden_states]
+    # A BF16 reference hands back BF16 states, which numpy can't hold.
+    hidden = [state[0].float().numpy() for state in out.hidden_states]
     # The reference appends the post-norm state last; the ones before it are
     # the residual stream entering each block.
     return hidden[:-1], hidden[-1], out.logits[0].numpy()
@@ -772,9 +799,8 @@ def discretize_honors_the_limit(quiet=False):
 
     The published checkpoints leave `mamba_dt_limit` at `(0.0, inf)`, where
     neither end binds. The reference floors prefill `dt` at `time_step_min`
-    instead, but this file's random weights keep `dt` above that floor, so the
-    model comparison can't tell one clamp from another. This reads the clamp
-    directly.
+    instead, and the main config's random weights keep `dt` above that floor,
+    so only check 16 reaches it. This reads the clamp directly.
     """
     from sgl_jax.srt.layers.attention.mamba.mamba2 import discretize
 
@@ -1039,7 +1065,8 @@ def wider_mesh_agrees(repo, ids, quiet=False):
     A one-device mesh normalizes every `kernel_axes` entry away, so nothing
     else here compiles a `shard_map` with more than one shard, exercises
     `_local_groups`, or splits an RMS group of the gated norm across shards.
-    Two groups on four shards is the layout Super runs at `--tp-size 32`.
+    Two groups on four shards split each group over two shards, and at
+    `--tp-size 32`, where Ultra served, all 8 groups split over four.
 
     The engine replicates KV heads up to the tensor axis before it builds the
     model, so this config carries the four heads that replication produces
@@ -1051,6 +1078,286 @@ def wider_mesh_agrees(repo, ids, quiet=False):
     _, _, thin = narrow.run(ids, [10, 6], pool_narrow)
     _, _, thick = wide.run(ids, [10, 6], pool_wide)
     return report("tp=4 against tp=1", thick, thin, quiet)
+
+
+# ---------------------------------------------------------------------------
+# Checks 16 and 17: dt under the reference's floor, and BF16 against the
+# reference's own BF16 error.
+# ---------------------------------------------------------------------------
+
+# softplus(-8) is 3.4e-4, under the 1e-3 `time_step_min` transformers floors dt
+# at in its chunked scan. Ultra's published weights hold 458 of 12,288 Mamba-2
+# heads with softplus(dt_bias) under that floor, 29 of the 256 in layer 0. The
+# random weights elsewhere in this file keep every head far above it.
+#
+# The heads of the first RMS group go under the floor, with A = -500 (Ultra's
+# layer 6 reaches -518) and no D skip. The floor then moves each token's decay
+# from exp(-0.17) to exp(-0.5), which reshapes what the state remembers, and
+# nothing else in the group hides it: the gated norm cancels a uniform scale,
+# a D skip outweighs a state this small, and a head beside a normal one in the
+# same group vanishes under that head's norm.
+#
+# That group's state is small, about B x / |A|, so its gated norm has to
+# normalize it rather than read it as zero. Both configs below run the norms at
+# an epsilon of 1e-12 for that; the published 1e-5 swamps a group this quiet.
+LOW_DT_BIAS = -8.0
+LOW_DT_A_LOG = math.log(500.0)
+FLOOR_CONFIG = dict(TINY, layer_norm_epsilon=1e-12)
+FLOOR_TP_CONFIG = dict(TINY_TP, layer_norm_epsilon=1e-12)
+
+# Check 17 packs two requests long enough to fill several chunks. 128 tokens
+# route 384 rows into the experts, a multiple of the 128-row tile the gmm
+# kernel picks for BF16.
+FLOOR_LENS = [80, 48]
+
+# `scripts/check_capture.py`'s gate: a capture's median per-token error may be
+# at most this many times a transformers BF16 forward's, plus ERROR_EPSILON.
+FLOOR_FACTOR = 2.0
+ERROR_EPSILON = 1e-6
+
+
+def under_the_floor(mixer, cfg, heads=None):
+    """Put `heads` of one reference mixer under the dt floor: the first RMS group by default."""
+    heads = cfg.mamba_num_heads // cfg.n_groups if heads is None else heads
+    mixer.dt_bias[:heads] = LOW_DT_BIAS
+    mixer.A_log[:heads] = LOW_DT_A_LOG
+    mixer.D[:heads] = 0.0
+
+
+def push_dt_under_the_floor(harness):
+    """Put the first RMS group of every Mamba-2 layer under the dt floor, in both models."""
+    with torch.no_grad():
+        for index, block in enumerate(harness.cfg.layers_block_type):
+            if block == "mamba":
+                under_the_floor(harness.reference.model.layers[index].mixer, harness.cfg)
+    harness.copy_weights()
+
+
+def dt_floor_matches(harness, ids, quiet=False):
+    """Check 16: float32 parity with one RMS group of Mamba-2 heads under the dt floor."""
+    return compare(harness, ids, [10, 6], "one head group under the dt floor", quiet)
+
+
+class tpu_default_precision:
+    """Round float32 dot operands to BF16 wherever the precision is left open.
+
+    A TPU runs a float32 `dot_general` at the default precision as one BF16
+    pass, so both operands lose their low 16 mantissa bits. XLA on CPU runs it
+    in float32 whatever `jax_default_matmul_precision` says: the flag maps
+    "bfloat16" to the default precision, and the CPU default is float32. This
+    swaps in a `dot_general` that rounds the operands itself when the call asks
+    for no precision or for the default one, which is the TPU's arithmetic on
+    CPU. `jnp.einsum` binds `lax.dot_general` as a default argument, so it
+    gets the override passed in.
+    """
+
+    def __enter__(self):
+        from jax._src.lax import lax as lax_internal
+
+        self.lax_internal = lax_internal
+        self.saved = (lax_internal.dot_general, jax.lax.dot_general, jnp.einsum)
+        original_dot, _, original_einsum = self.saved
+
+        def is_default(precision):
+            if precision is None:
+                return True
+            if isinstance(precision, (tuple, list)):
+                return all(is_default(p) for p in precision)
+            return precision == jax.lax.Precision.DEFAULT or str(precision).lower() in (
+                "default",
+                "bfloat16",
+                "fastest",
+            )
+
+        def rounded(x):
+            x = jnp.asarray(x)
+            return x.astype(jnp.bfloat16).astype(jnp.float32) if x.dtype == jnp.float32 else x
+
+        def dot_general(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None,
+                        **kwargs):
+            if is_default(precision):
+                lhs, rhs = rounded(lhs), rounded(rhs)
+            return original_dot(lhs, rhs, dimension_numbers, precision=precision,
+                                preferred_element_type=preferred_element_type, **kwargs)
+
+        def einsum(*args, **kwargs):
+            kwargs.setdefault("_dot_general", dot_general)
+            return original_einsum(*args, **kwargs)
+
+        lax_internal.dot_general = dot_general
+        jax.lax.dot_general = dot_general
+        jnp.einsum = einsum
+        return self
+
+    def __exit__(self, *exc):
+        self.lax_internal.dot_general, jax.lax.dot_general, jnp.einsum = self.saved
+        return False
+
+
+def tpu_rounding_is_live(quiet=False):
+    """The override moves a float32 product, and leaves a HIGHEST one alone."""
+    x = jnp.asarray(np.random.default_rng(0).standard_normal((32, 32)), jnp.float32)
+    exact = np.asarray(x, np.float64) @ np.asarray(x, np.float64)
+    with tpu_default_precision():
+        rounded = float(np.abs(np.asarray(jnp.einsum("ij,jk->ik", x, x), np.float64) - exact).max())
+        highest = float(np.abs(np.asarray(jnp.einsum(
+            "ij,jk->ik", x, x, precision=jax.lax.Precision.HIGHEST), np.float64) - exact).max())
+    plain = float(np.abs(np.asarray(jnp.einsum("ij,jk->ik", x, x), np.float64) - exact).max())
+    if not quiet:
+        print(f"    TPU rounding on a float32 einsum: {rounded:.2e}, at HIGHEST {highest:.2e}, "
+              f"outside the override {plain:.2e}")
+    if not (rounded > 100 * highest and rounded > 100 * plain):
+        raise AssertionError("the TPU rounding override doesn't reach jnp.einsum")
+
+
+def median_token_error(got, want) -> float:
+    """`scripts/check_capture.py`'s metric: each row's relative L2 error, median over rows.
+
+    A non-finite value reads as infinity, so a NaN fails the gate it meets.
+    """
+    got, want = np.asarray(got, np.float64), np.asarray(want, np.float64)
+    if not (np.all(np.isfinite(got)) and np.all(np.isfinite(want))):
+        return math.inf
+    norms = np.linalg.norm(want, axis=-1)
+    return float(np.median(np.linalg.norm(got - want, axis=-1) / np.where(norms > 0, norms, 1.0)))
+
+
+def bf16_floor_holds(repo, quiet=False):
+    """Check 17: the BF16 engine on TPU arithmetic against transformers' own BF16 error.
+
+    The checkpoint ships BF16, so the reference's weights round to BF16 first:
+    the float32 forward upcasts them without loss, as `from_pretrained(dtype=float32)`
+    does. The BF16 forward keeps `e_score_correction_bias` in float32, which is
+    what `_keep_in_fp32_modules_strict` does. The engine runs at BF16 on a
+    four-way tensor axis, so its row-parallel sums cross shards, and under
+    `tpu_default_precision`, so every float32 dot left at the default precision
+    loses what it loses on a TPU. Every Mamba-2 head sits under the dt floor:
+    with one group of two there, a dropped floor lands at 1.67 times the floor
+    after layer 0, which the gate can't see.
+
+    Returns how far the worst slot sits over `FLOOR_FACTOR` times the floor,
+    and zero when every slot holds.
+    """
+    engine = Harness(repo, config=FLOOR_TP_CONFIG, tp=4, dtype=jnp.bfloat16)
+    reference = engine.reference
+    with torch.no_grad():
+        for index, block in enumerate(engine.cfg.layers_block_type):
+            if block == "mamba":
+                mixer = reference.model.layers[index].mixer
+                under_the_floor(mixer, engine.cfg, heads=engine.cfg.mamba_num_heads)
+        for name, tensor in list(reference.named_parameters()) + list(reference.named_buffers()):
+            if "e_score_correction_bias" not in name:
+                tensor.copy_(tensor.to(torch.bfloat16).to(torch.float32))
+    engine.copy_weights()
+    floor = copy.deepcopy(reference).to(torch.bfloat16)
+    with torch.no_grad():
+        for (name, low), (_, full) in zip(floor.named_buffers(), reference.named_buffers()):
+            if "e_score_correction_bias" in name:
+                low.data = full.data.clone()
+
+    ids = np.random.default_rng(7).integers(3, TINY["vocab_size"], size=sum(FLOOR_LENS))
+    want, low = [], []
+    start = 0
+    for length in FLOOR_LENS:
+        chunk = ids[start : start + length]
+        layers, final, _ = reference_forward(reference, chunk)
+        want.append(layers + [final])
+        layers, final, _ = reference_forward(floor, chunk)
+        low.append([np.asarray(x, np.float32) for x in layers + [final]])
+        start += length
+    want = [np.concatenate(group, axis=0) for group in zip(*want)]
+    low = [np.concatenate(group, axis=0) for group in zip(*low)]
+
+    with tpu_default_precision():
+        layers, final, _ = engine.run(ids, FLOOR_LENS, engine.new_pool())
+    mine = [np.asarray(x, np.float32) for x in layers + [final]]
+
+    names = ["embedding"] + [f"after layer {i} ({b})" for i, b in
+                             enumerate(engine.cfg.layers_block_type[:-1])] + ["final norm"]
+    worst = 0.0
+    for name, got, floor_rows, ref in zip(names, mine, low, want):
+        error = median_token_error(got, ref)
+        floor_error = median_token_error(floor_rows, ref)
+        excess = error - (FLOOR_FACTOR * floor_error + ERROR_EPSILON)
+        worst = max(worst, excess) if not math.isnan(excess) else math.inf
+        if not quiet:
+            ratio = error / floor_error if floor_error > 0 else 0.0
+            mark = "ok  " if excess <= 0 else "OVER"
+            print(f"    [{mark}] {name:<28} token err {error:.5f}  bf16 floor {floor_error:.5f}  "
+                  f"ratio {ratio:5.2f}")
+    return worst
+
+
+def reduction_dtypes(jaxpr):
+    """Every `dot_general` and `psum` in a jaxpr and the jaxprs inside it, with output dtypes."""
+    found = []
+    for eqn in jaxpr.eqns:
+        name = eqn.primitive.name
+        if name == "dot_general" or name.startswith("psum"):
+            found.append((name, [str(v.aval.dtype) for v in eqn.outvars]))
+        for value in eqn.params.values():
+            for item in value if isinstance(value, (list, tuple)) else [value]:
+                inner = getattr(item, "jaxpr", item)
+                if hasattr(inner, "eqns"):
+                    found += reduction_dtypes(inner)
+    return found
+
+
+def bf16_reductions_stay_float32(repo, quiet=False):
+    """Check 18: at BF16 the tensor axis sums shards in float32.
+
+    Each row-parallel projection contracts an axis the tensor axis shards, so
+    every shard holds a partial sum and an all-reduce adds them. `LinearBase`
+    asks its dot for the weight dtype, which at BF16 rounds every partial and
+    has the all-reduce add BF16 numbers: 32 roundings at `--tp-size 32` where
+    transformers rounds once. On Ultra's layer 0 `out_proj` that doubles the
+    product's error, 1.7e-3 of the block's norm against 9.0e-4. XLA on CPU
+    gathers these small operands rather than reducing partials, so the
+    numbers here can't show it; the traced program can. Every row-parallel
+    projection's dot has to yield float32, and the experts' all-reduce over
+    the tensor axis has to add float32.
+
+    Returns how many of those sites don't.
+    """
+    harness = Harness(repo, config=TINY_TP, tp=4, dtype=jnp.bfloat16)
+    from sgl_jax.srt.models.nemotron_h import row_parallel
+
+    layers = harness.model.model.layers
+    kinds = harness.cfg.layers_block_type
+    mamba = layers[kinds.index("mamba")].mixer
+    attention = layers[kinds.index("attention")].mixer
+    moe = layers[kinds.index("moe")].mixer
+    sites = {
+        "Mamba-2 out_proj": mamba.out_proj,
+        "attention o_proj": attention.o_proj,
+        "LatentMoE fc2_latent_proj": moe.fc2_latent_proj,
+        "shared expert down_proj": moe.shared_experts.down_proj,
+    }
+    tokens = 8
+    offenders = 0
+    with jax.set_mesh(harness.mesh):
+        for name, linear in sites.items():
+            x = jnp.zeros((tokens, linear.weight.value.shape[0]), jnp.bfloat16)
+            dots = [dt for prim, dt in reduction_dtypes(
+                jax.make_jaxpr(lambda x, linear=linear: row_parallel(linear, x))(x).jaxpr)
+                if prim == "dot_general"]
+            bad = [d for d in dots if d != ["float32"]] or ([] if dots else ["no dot"])
+            offenders += bool(bad)
+            if not quiet:
+                print(f"    {name:<28} dot outputs {dots}")
+        experts = moe.experts
+        hidden = jnp.zeros((tokens, harness.cfg.expert_input_size), jnp.bfloat16)
+        weights = jnp.ones((tokens, harness.cfg.num_experts_per_tok), jnp.float32)
+        ids = (jnp.arange(tokens * harness.cfg.num_experts_per_tok, dtype=jnp.int32)
+               % harness.cfg.n_routed_experts).reshape(tokens, -1)
+        sums = [dt for prim, dt in reduction_dtypes(
+            jax.make_jaxpr(lambda h, w, i: experts(h, w, i))(hidden, weights, ids).jaxpr)
+            if prim.startswith("psum")]
+        bad = [d for d in sums if d != ["float32"]] or ([] if sums else ["no psum"])
+        offenders += bool(bad)
+        if not quiet:
+            print(f"    {'routed experts all-reduce':<28} psum outputs {sums}")
+    return float(offenders)
 
 
 # ---------------------------------------------------------------------------
@@ -1978,6 +2285,9 @@ CHECKS = {
     "cut": lambda run: cut_stack_matches(run.main, run.workdir, run.ids[:10], quiet=True),
     "placement": lambda run: placement_flags_stop_the_build(run.main, quiet=True),
     "pool": lambda run: runner_sizes_the_state_pool(run.main, quiet=True),
+    "floor": lambda run: dt_floor_matches(run.floor, run.ids, quiet=True),
+    "bf16": lambda run: bf16_floor_holds(run.repo, quiet=True),
+    "shards": lambda run: bf16_reductions_stay_float32(run.repo, quiet=True),
 }
 
 
@@ -2130,8 +2440,8 @@ def source_mutants():
         return rewrite_method(
             nemotron_h.NemotronHAttention,
             "__call__",
-            "out, _ = self.o_proj(attn_output)",
-            "out, _ = self.o_proj(attn_output * jnp.nan)",
+            "out = row_parallel(self.o_proj, attn_output)",
+            "out = row_parallel(self.o_proj, attn_output * jnp.nan)",
         )
 
     def decode_step_turns_nan():
@@ -2183,6 +2493,32 @@ def source_mutants():
             "if False:",
         )
 
+    def shards_round_to_bf16():
+        # LinearBase's contract: each shard's partial comes back in BF16.
+        return rewrite_method(
+            nemotron_h,
+            "row_parallel",
+            "preferred_element_type=jnp.float32,",
+            "preferred_element_type=weight.dtype,",
+        )
+
+    def experts_reduce_in_bf16():
+        return rewrite_method(
+            nemotron_h.NemotronHLatentMoE,
+            "__init__",
+            "reduce_in_float32=True,",
+            "reduce_in_float32=False,",
+        )
+
+    def drop_dt_floor():
+        # The clamp before the fix: mamba_dt_limit's (0.0, inf), with no floor.
+        return rewrite_property(
+            nemotron_config.NemotronHConfig,
+            "scan_dt_limit",
+            "return (max(float(low), float(self.time_step_min)), float(high))",
+            "return (float(low), float(high))",
+        )
+
     return {
         "request boundary reset dropped": (drop_boundary_reset, "isolation"),
         "request boundary as a zero decay": (boundary_as_zero_decay, "nonfinite"),
@@ -2198,6 +2534,10 @@ def source_mutants():
         "expert-placement flags let through": (let_placement_through, "placement"),
         "square SSM slot in the byte count": (square_state_bytes, "pool"),
         "runner misses the nemotron_h config": (runner_misses_the_config, "pool"),
+        "dt floor dropped": (drop_dt_floor, "floor"),
+        "dt floor dropped at BF16": (drop_dt_floor, "bf16"),
+        "row-parallel shards round to BF16": (shards_round_to_bf16, "shards"),
+        "experts all-reduce in BF16": (experts_reduce_in_bf16, "shards"),
     }
 
 
@@ -2272,6 +2612,19 @@ def main():
         print("check 15: the runner resolves the config, the backend and the state bytes")
         pool = runner_sizes_the_state_pool(harness)
 
+        print("check 16: one group of Mamba-2 heads under transformers' dt floor, in float32")
+        floor = Harness(repo, config=FLOOR_CONFIG)
+        push_dt_under_the_floor(floor)
+        dt_floor = dt_floor_matches(floor, ids)
+
+        print(f"check 17: BF16 on TPU arithmetic at tp=4, within {FLOOR_FACTOR:g}x "
+              "transformers' BF16 error")
+        tpu_rounding_is_live()
+        bf16 = bf16_floor_holds(repo)
+
+        print("check 18: at BF16 on a four-way tensor axis, shards sum in float32")
+        shards = bf16_reductions_stay_float32(repo)
+
         clean = {
             "single": single,
             "packed": packed,
@@ -2287,6 +2640,9 @@ def main():
             "cut": cut,
             "placement": placement,
             "pool": pool,
+            "floor": dt_floor,
+            "bf16": bf16,
+            "shards": shards,
         }
         worst = worst_of(clean.values())
         if not worst <= TOL:
@@ -2302,6 +2658,7 @@ def main():
             ids=ids,
             long_ids=long_ids,
             workdir=workdir,
+            floor=floor,
         )
         mutants = dict(weight_mutants(harness))
         mutants.update(source_mutants())

@@ -60,9 +60,10 @@ Eleven checks, each with a control that has to fail:
    compare.py leaves open, gets as far as the bank.
 8. A run that fails after the bank copy, here on a model directory with no tokenizer, leaves no
    `steer-control-*` directory behind. Control: `bank_with_control` on its own, whose copy stays.
-9. The last line reads the counts the summaries hold, for the counts the README's chain gave on
-   Gemma 4 26B-A4B: 4 of 4 prompts changed under both arms at three fractions. Control: the
-   feature ahead in coherent replies at one alpha gives exit 0.
+9. The last line reads the counts the summaries hold, for the counts the latent 7987 run of the
+   README's chain gave on Gemma 4 26B-A4B before the layer filter: 4 of 4 prompts changed under
+   both arms at three fractions. Control: the feature ahead in coherent replies at one alpha gives
+   exit 0.
 10. With a stub judge, the exit counts coherent changed replies. The latent 7987 run changed 4 of 4
     prompts under both arms at every fraction, with the feature coherent and the random direction
     broken at 0.1, and exits 0 at 0.1. The latent 1859 run changed 2 of 4 against 4 of 4 and exits 0
@@ -553,8 +554,8 @@ def check_verdict_line():
                 "changed_control": changed_control, "coherent": coherent,
                 "coherent_control": coherent_control}
 
-    # The counts the README's chain gave on Gemma 4 26B-A4B, scale 107.8419, with no coherent
-    # reply ahead of the random direction's.
+    # The counts the latent 7987 run of the README's chain gave on Gemma 4 26B-A4B before the
+    # layer filter, scale 107.8419, with no coherent reply ahead of the random direction's.
     tied = [summary(10.7842, 0.1, 4, 4, 0, 0), summary(53.9209, 0.5, 4, 4, 0, 0),
             summary(107.8419, 1.0, 4, 4, 0, 0)]
     line = compare.verdict_line(tied, 4, 1)

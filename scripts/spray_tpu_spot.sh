@@ -28,6 +28,10 @@
 #
 #   ACCEL=v6e-8 bash spray_tpu_spot.sh
 #   ACCEL=v6e-256 ZONES="us-east5-a us-east5-b" bash spray_tpu_spot.sh
+#   TPU_CREATE_FLAGS="--scopes=https://www.googleapis.com/auth/cloud-platform" ACCEL=v5p-64 bash spray_tpu_spot.sh
+#
+# TPU_CREATE_FLAGS goes to every `queued-resources create`, such as the scopes a slice needs to
+# mount its weights from a bucket with gcsfuse.
 set -uo pipefail
 
 # Piped through `tee`, the script's stdout dies with tee on a Ctrl-C, and the
@@ -61,8 +65,8 @@ indent() { local nl=$'\n'; printf '      %s' "${1//${nl}/${nl}      }"; }
 #
 # Use ondemand for anything a person logs into: Spot on v6e survived about an
 # hour per slice when measured, which is fine for a throwaway benchmark and
-# useless for a dev box. Spot is roughly half price, so it stays the default for
-# experiments.
+# useless for a dev box. Spot costs about a quarter of on demand for v5p in
+# us-east5, so it stays the default for experiments.
 MODE="${MODE:-spot}"
 case "$MODE" in
   spot)     SPOT_FLAG="--spot" ;;
@@ -135,7 +139,7 @@ submit() {
       --node-id="${name}" --zone="${zone}" --project="${PROJECT}" \
       --accelerator-type="${ACCEL}" --runtime-version="${RUNTIME}" \
       --valid-until-duration="${MAX_WAIT_SECONDS}s" \
-      ${SPOT_FLAG} --quiet 2>&1); then
+      ${SPOT_FLAG} ${TPU_CREATE_FLAGS:-} --quiet 2>&1); then
     echo "  submitted  ${zone}"
   # One printf per zone, so parallel workers don't interleave its lines.
   elif echo "${out}" | grep -qi "does not have permission"; then
@@ -269,10 +273,12 @@ trap on_exit EXIT
 catch_signals
 
 # Print "ZONE STATE" for each zone given, all at once. A request that's gone
-# prints GONE, and a zone gcloud can't list prints nothing.
+# prints GONE, and a zone gcloud can't list prints nothing. The poll loop stops
+# reading at the first READY zone, so a worker still printing writes into a
+# closed pipe; its printf error goes to /dev/null.
 poll_round() {
   printf '%s\n' "$@" | xargs -P 16 -I{} bash -c \
-    'state=$(request_state "$1" 2>/dev/null) && printf "%s %s\n" "$1" "${state:-GONE}"' _ {}
+    'state=$(request_state "$1" 2>/dev/null) && printf "%s %s\n" "$1" "${state:-GONE}" 2>/dev/null' _ {}
 }
 
 export -f submit request_name request_state indent

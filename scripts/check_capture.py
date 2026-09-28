@@ -72,10 +72,49 @@ own flag, and `--engine-arg chunked_prefill_size` is refused.
 The float32 reference needs host RAM of about 4 bytes per parameter: 103 GB for Gemma 4 26B-A4B.
 The BF16 forward loads after the float32 model is freed.
 
+`--trust-remote-code` builds the reference from the checkpoint's own modeling code, which Kimi K3
+needs, through `remote_code_reference.py`. When fla isn't installed, `fla_torch.py` stands in for
+its Triton kernels. MXFP4 experts dequantize to BF16 on load. With `--offload-folder` the decoder
+layers stream one at a time straight from the checkpoint's safetensors and nothing is written.
+`--reference-layers N` builds only the first N layers, for a dry run with `--reference-only`. It
+works on the `transformers` path too: the text config's layer count and every per-layer list cut
+to N before the model builds, and the checkpoint's later layers stay unread.
+
+`--engine-layers N` serves only the model's first N decoder layers. The engine gets
+`json_model_override_args` with `num_hidden_layers` set to N, merged into any override passed with
+`--engine-arg`, and the check compares slots 0 to N-1 against reference entries 0 to N-1. Entry k
+is the stream entering layer k, which depends only on the layers before it, so a whole-model
+reference stays valid for a cut engine, and the engine builds only N layers. N has to be
+below the reference's entry count, since its last entry is the final norm's output. A config whose
+`num_hidden_layers` write doesn't cut its layer list, as `configs/nemotron_h.py`'s does, builds
+the whole model, and the check then stops on the slot count.
+
+A model whose residual stream is several copies wide, such as GLM-5.3-Flash's four mHC streams,
+hands back `[seq, copies, d]` per layer. Each entry flattens to `[seq, copies * d]`, which is how
+the engine's capture slot lays the same values out. The last entry, the final norm's output, is
+then narrower than the rest, and `save_reference` writes it under its own key.
+
+`--deepseek-inference` builds the reference from the checkpoint's own `inference/model.py`,
+DeepSeek's runtime for V4.1-Flash, through `deepseek_reference.py`. `deepseek_cpu_kernels.py`
+stands in for its tilelang kernels. FP8 dense weights and FP4 experts dequantize to BF16 on load,
+the Engram tables read their rows from the memory-mapped safetensors, and each entry is the
+collapsed attention input of a layer, the slot the engine captures. `--offload-folder` streams the
+blocks one at a time from the safetensors, and nothing is written to the folder.
+
 Both HuggingFace forwards run before the engine starts. Importing `sgl_jax` registers its own
 config classes with `AutoConfig`, Gemma 4's among them, and `transformers` can't build the model
 from those. Engine() re-imports this module in its subprocesses, so everything sits behind
 `__main__`. `--engine-arg` gets parsed first, so a bad one stops the run before the forwards.
+
+A multimodal checkpoint runs through `AutoModelForImageTextToText`. `transformers` 5.17's Inkling
+class norms the embeddings twice there: `InklingModel.forward` applies `embed_norm`, then the text
+model applies it again. The reference lets each `embed_norm` run once per forward, the way
+upstream's fix (#48786), SGLang and the engine port run it. Each prompt's forward prints how many
+times `embed_norm` ran.
+
+`--save-capture NPZ` writes the engine capture and the token ids. `--capture-npz NPZ` reads them
+back instead of starting the engine, so a capture gates again against a new `--reference-npz`
+without loading the model. The ids have to match, and `--save-npz` files carry them too.
 
 `--save-npz caps` writes `caps.npz`, since `np.savez` adds the suffix, and prints that name.
 `--log-payloads`, or `LOG_PAYLOADS=1`, logs the request the engine gets, token ids and all, and a
@@ -275,7 +314,43 @@ def compare_layers(
         summary["worst_ratio"] = worst_ratio["ratio"]
         summary["worst_ratio_layer"] = worst_ratio["layer"]
         summary["floor_diverged_tokens"] = max(r["floor_diverged"] for r in rows)
+        summary["ratios"] = [round(r["ratio"], 4) for r in rows]
     return rows, summary
+
+
+def engine_layer_override(current, num_layers: int) -> str:
+    """`json_model_override_args` with `num_hidden_layers` set to `num_layers`, as a JSON string.
+
+    `current` is what `--engine-arg json_model_override_args=...` gave: None, a dict, or a JSON
+    string of one. A different `num_hidden_layers` in it raises.
+    """
+    if current is None:
+        merged = {}
+    elif isinstance(current, dict):
+        merged = dict(current)
+    else:
+        merged = json.loads(current)
+        if not isinstance(merged, dict):
+            raise ValueError(f"json_model_override_args is {current!r}, not a JSON object")
+    if merged.get("num_hidden_layers", num_layers) != num_layers:
+        raise ValueError(
+            f"--engine-layers {num_layers} and json_model_override_args num_hidden_layers "
+            f"{merged['num_hidden_layers']} disagree")
+    merged["num_hidden_layers"] = num_layers
+    return json.dumps(merged, sort_keys=True)
+
+
+def cut_entries(entries: list, num_layers: int) -> list:
+    """The first `num_layers` reference entries, the streams entering layers 0 to N-1.
+
+    The last entry of a reference is the final norm's output, which no cut engine's slot holds,
+    so `num_layers` has to be below the entry count.
+    """
+    if not 0 < num_layers < len(entries):
+        raise ValueError(
+            f"--engine-layers {num_layers}: the reference holds {len(entries)} entries, the "
+            f"streams entering {len(entries) - 1} layers plus the final norm's output")
+    return entries[:num_layers]
 
 
 def engine_capture(args, batch: list, extra: dict) -> list:
@@ -312,26 +387,462 @@ def engine_capture(args, batch: list, extra: dict) -> list:
     return captured
 
 
-def reference_forward(model_path: str, batch: list, dtype_name: str) -> list:
+def ceil_block_dequantize(quantized, scales, block, output_dtype):
+    """Block-FP8 weights to `output_dtype` when a dimension isn't a multiple of the block.
+
+    DeepSeek-style checkpoints scale each `block` tile of a weight, and the last tile along a
+    dimension that isn't a multiple of the block is partial: GLM-5.3's `kv_a_proj_with_mqa` is
+    576 x 6,144 with a 5 x 48 scale grid at block 128. transformers 5.17 derives the block by
+    dividing the weight by the grid, so it refuses these. Each scale repeats over its tile and the
+    padding comes off, which is how sglang and vLLM read the same checkpoint.
+    """
+    import torch
+
+    q = quantized.to(torch.float32)
+    rows, cols = q.shape[-2:]
+    s = scales.to(torch.float32)
+    if scales.dtype == torch.uint8:
+        s = (s - 127.0).exp2()
+    bm, bn = block
+    s = s.repeat_interleave(bm, dim=-2)[..., :rows, :].repeat_interleave(bn, dim=-1)[..., :cols]
+    return (q * s).to(output_dtype)
+
+
+def patch_fp8_ceil_blocks():
+    """Let transformers' FP8 dequantizer take partial tiles, through `ceil_block_dequantize`.
+
+    It changes nothing for a weight transformers already handles: the fallback runs only on the
+    "not divisible by scale grid" error, with the block from the checkpoint's
+    `weight_block_size`, default 128 x 128.
+    """
+    try:
+        from transformers.integrations import finegrained_fp8
+    except ImportError:
+        return
+    cls = getattr(finegrained_fp8, "Fp8Dequantize", None)
+    if cls is None or getattr(cls, "_ceil_blocks", False):
+        return
+    original = cls._dequantize_one
+
+    def dequantize_one(self, quantized, scales, output_dtype=None):
+        try:
+            return original(self, quantized, scales, output_dtype=output_dtype)
+        except ValueError as exc:
+            if "not divisible by scale grid" not in str(exc):
+                raise
+            import torch
+
+            cfg = getattr(getattr(self, "hf_quantizer", None), "quantization_config", None)
+            block = tuple(getattr(cfg, "weight_block_size", None) or (128, 128))
+            return ceil_block_dequantize(quantized, scales, block, output_dtype or torch.bfloat16)
+
+    cls._dequantize_one = dequantize_one
+    cls._ceil_blocks = True
+
+
+def model_class(config):
+    """The transformers auto class that builds this checkpoint's text model.
+
+    A causal LM goes through `AutoModelForCausalLM`. A multimodal checkpoint such as Inkling's
+    registers only an image-text class, and its forward on text ids alone runs the language model,
+    so the reference takes that class and reads the language model's hidden states.
+    """
+    import transformers
+
+    for cls in (transformers.AutoModelForCausalLM, transformers.AutoModelForImageTextToText):
+        if type(config) in cls._model_mapping:
+            return cls
+    return transformers.AutoModelForCausalLM
+
+
+def decoder_layers(model):
+    """`(prefix, layers)`: the model's decoder block list and its dotted name.
+
+    It's the shallowest `nn.ModuleList` named `layers`, `h` or `blocks`, with the config's layer
+    count when the config gives one. Nemotron 3 Ultra's config has no `num_hidden_layers`, and an
+    expert list can be longer than the decoder list, so length alone can't pick it.
+    """
+    import torch
+
+    want = getattr(model.config, "num_hidden_layers", None)
+    text = getattr(model.config, "text_config", None)
+    if want is None and text is not None:
+        want = getattr(text, "num_hidden_layers", None)
+    found = []
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.ModuleList) or len(module) == 0:
+            continue
+        if name.rsplit(".", 1)[-1] not in ("layers", "h", "blocks"):
+            continue
+        if want is not None and len(module) != want:
+            continue
+        found.append((name.count("."), name, module))
+    if not found:
+        raise ValueError("no decoder layer list named layers, h or blocks in the model")
+    _, name, module = min(found, key=lambda f: f[0])
+    return name, module
+
+
+def release_freed_memory() -> None:
+    """Hand freed heap memory back to the OS after a streamed layer drops its weights.
+
+    glibc keeps freed blocks under its mmap threshold, which grows to 32 MiB, in its heap arenas.
+    Kimi K3's BF16 expert weights sit under it, so each streamed BF16 layer left about 55 GiB of
+    freed heap resident: 7 layers reached 327 GiB anonymous RSS with 4 GiB of live tensors, and
+    the full BF16 pass was killed on a 354 GiB and then a 732 GiB machine (2026-09-26). With
+    `malloc_trim(0)` after each layer the same 5 layers held 0 to 1 GiB. No-op off glibc.
+    """
+    import ctypes
+
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def cut_config(config, num_layers: int | None):
+    """Cut the text config to its first `num_layers` layers, in place, and return it.
+
+    The layer count sits on `text_config` for a multimodal checkpoint. Every list attribute as
+    long as the old count is a per-layer plan (`layer_types`, `mlp_layer_types`,
+    `indexer_types`) and gets cut too, since transformers validates the two against each other.
+    """
+    if num_layers is None:
+        return config
+    text = getattr(config, "text_config", None) or config
+    old = int(text.num_hidden_layers)
+    if not 0 < num_layers <= old:
+        raise ValueError(f"--reference-layers {num_layers}: the model has {old} layers")
+    for key, value in list(vars(text).items()):
+        if isinstance(value, list) and len(value) == old:
+            setattr(text, key, value[:num_layers])
+    text.num_hidden_layers = num_layers
+    return config
+
+
+def flat_entry(h) -> np.ndarray:
+    """One hidden-states entry of a batch-1 forward as `[seq, width]` float64: a multi-copy stream
+    `[seq, copies, d]` flattens to `[seq, copies * d]`, the engine's slot layout."""
+    import torch
+
+    a = h[0]
+    return a.reshape(a.shape[0], -1).to(torch.float64).numpy()
+
+
+def checkpoint_value(loader, name: str, as_stored: bool):
+    """`loader[name]`, or with `as_stored` the tensor at the dtype its safetensors file holds.
+
+    accelerate's `OffloadedWeightsLoader` indexes a checkpoint tensor that needs no conversion in
+    place, and its index entry carries the dtype `from_pretrained` loaded it at. `streamed_model`
+    loads at BF16, so `loader[name]` rounds a float32 checkpoint tensor to BF16 before the float32
+    pass can upcast it. Nemotron 3 Ultra's router correction bias sits at 56.98 with experts
+    about 0.005 apart, and BF16's step there is 0.25: every expert reads 57.0, and the reference
+    routes as if the bias were one constant. The float32 pass and the modules transformers keeps
+    in float32 read the file's own dtype here. A tensor that from_pretrained converted and wrote to
+    the offload folder comes back from the loader as before.
+    """
+    info = getattr(loader, "index", {}).get(name) or {}
+    if not as_stored or name in getattr(loader, "state_dict", {}) or not info.get("safetensors_file"):
+        return loader[name]
+    from safetensors import safe_open
+
+    with safe_open(info["safetensors_file"], framework="pt", device="cpu") as f:
+        return f.get_tensor(info.get("weight_name", name))
+
+
+def streamed_model(model_path: str, dtype_name: str, offload_folder: str,
+                   num_layers: int | None = None):
+    """A HuggingFace model whose decoder layers load one at a time, for a model bigger than RAM.
+
+    `from_pretrained` runs once with every decoder layer on "disk", so transformers converts the
+    checkpoint's names and layouts itself and writes the converted weights to `offload_folder`
+    (or indexes the safetensors in place). Everything else stays in RAM. accelerate's hooks come
+    off, and a hook on each layer loads that layer's weights just before it runs and drops them
+    after, so RAM holds one layer at a time.
+
+    It builds transformers' own class for the model, as the plain path does, and never a repo's
+    remote code, so both paths run the same modeling file.
+
+    For float32 every floating weight upcasts from what the checkpoint holds, which is what
+    `from_pretrained(dtype=float32)` gives for a BF16 checkpoint. For bfloat16 each weight keeps
+    the dtype `from_pretrained` loaded it in, so modules transformers keeps in float32 stay there.
+    """
+    import torch
+    import transformers
+    from accelerate import init_empty_weights
+    from accelerate.hooks import remove_hook_from_module
+    from accelerate.utils import set_module_tensor_to_device
+
+    upcast = dtype_name == "float32"
+    config = cut_config(transformers.AutoConfig.from_pretrained(model_path), num_layers)
+    with init_empty_weights():
+        skeleton = model_class(config).from_config(config)
+    prefix, layers = decoder_layers(skeleton)
+    # accelerate's dispatch refuses a root "" entry beside "disk" entries (transformers 5.17,
+    # accelerate 1.15), so name every module beside the path down to the layer list.
+    device_map = {}
+    parts = prefix.split(".")
+    for depth in range(len(parts)):
+        parent = skeleton.get_submodule(".".join(parts[:depth])) if depth else skeleton
+        if any(True for _ in parent.named_parameters(recurse=False)):
+            raise ValueError(f"{'.'.join(parts[:depth]) or 'the model'} holds parameters of its own")
+        for child, _ in parent.named_children():
+            if child != parts[depth]:
+                device_map[".".join(parts[:depth] + [child])] = "cpu"
+    device_map.update({f"{prefix}.{i}": "disk" for i in range(len(layers))})
+    del skeleton
+    os.makedirs(offload_folder, exist_ok=True)
+    model = model_class(config).from_pretrained(
+        model_path, config=config, dtype=torch.bfloat16, device_map=device_map,
+        offload_folder=offload_folder,
+    )
+    loader = None
+    for module in model.modules():
+        hook = getattr(module, "_hf_hook", None)
+        weights_map = getattr(hook, "weights_map", None)
+        if weights_map is not None:
+            loader = getattr(weights_map, "dataset", weights_map)
+            break
+    if loader is None:
+        raise RuntimeError("from_pretrained offloaded nothing, so there's no weight map to stream from")
+    remove_hook_from_module(model, recurse=True)
+    if upcast:
+        for tensor in list(model.parameters()) + list(model.buffers()):
+            if tensor.device.type != "meta" and tensor.is_floating_point():
+                tensor.data = tensor.data.to(torch.float32)
+    _, layers = decoder_layers(model)
+    # from_pretrained keeps these modules in float32 even at BF16 (Inkling's short convolutions),
+    # and accelerate's meta tensors forget it, so the BF16 pass applies the rule itself.
+    keep_fp32 = set(getattr(model, "_keep_in_fp32_modules_strict", None) or [])
+
+    # accelerate materializes some small tensors at dispatch, through the same BF16 cast, so a
+    # tensor the offload index knows reloads each time even when it already sits on the CPU.
+    # On a tiny Nemotron-H the router correction bias arrives that way, as 57.0 for every expert.
+    indexed = set(getattr(loader, "index", {}) or {})
+
+    def names(i, layer):
+        return [(n, f"{prefix}.{i}.{n}") for n, t in
+                list(layer.named_parameters()) + list(layer.named_buffers())
+                if t.device.type == "meta" or f"{prefix}.{i}.{n}" in indexed]
+
+    def load(i):
+        def hook(layer, args, kwargs=None):
+            for local, full in names(i, layer):
+                keep = bool(keep_fp32 & set(full.split(".")))
+                value = checkpoint_value(loader, full, upcast or keep)
+                if upcast and value.is_floating_point():
+                    value = value.to(torch.float32)
+                # Without dtype=, accelerate casts the value to the meta tensor's dtype, the one
+                # from_pretrained chose: BF16, or float32 for a module transformers keeps there.
+                # The BF16 pass wants that. The float32 pass passes float32, or the upcast is lost.
+                keep = keep and value.is_floating_point()
+                set_module_tensor_to_device(
+                    layer, local, "cpu", value=value,
+                    dtype=torch.float32 if (upcast or keep) and value.is_floating_point() else None)
+        return hook
+
+    def drop(layer, args, output):
+        for local, t in list(layer.named_parameters()) + list(layer.named_buffers()):
+            if t.device.type == "cpu":
+                set_module_tensor_to_device(layer, local, "meta")
+        gc.collect()
+        release_freed_memory()
+
+    for i, layer in enumerate(layers):
+        loaded = names(i, layer)
+        if not loaded:
+            continue
+        layer.register_forward_pre_hook(load(i))
+        layer.register_forward_hook(drop)
+        layer._streamed_names = loaded
+    print(f"streamed reference: {len(layers)} layers under {prefix!r} load one at a time from "
+          f"{offload_folder}, {dtype_name}", flush=True)
+    return model
+
+
+def norm_embeddings_once(model) -> dict:
+    """Let every module named `embed_norm` run once per forward of `model`, and pass later calls through.
+
+    `transformers` 5.17 norms Inkling's embeddings twice. `InklingModel.forward` applies
+    `language_model.embed_norm`, then `InklingTextModel.forward` applies the same module again, so
+    the stream entering layer 0 is `embed_norm(embed_norm(embed))`. The published weight has mean
+    0.17 and max 7.6, so the second norm moves that stream by 0.94 of its norm, median over
+    tokens. Upstream commit 3384908511 ("Fix inkling embedding norm", #48786, 2026-09-14) moves the
+    norm into the embedding, where it runs once, and SGLang's PyTorch model and this repo's engine
+    port run it once too. On a `transformers` with the fix the module runs once and the hook never
+    changes an output.
+
+    A pre-hook on `model` resets the count at each forward. Returns the counts: `skipped` is how
+    many second calls passed their input through.
+    """
+    counts = {"modules": 0, "calls": 0, "skipped": 0}
+    norms = [m for name, m in model.named_modules() if name.rsplit(".", 1)[-1] == "embed_norm"]
+    if not norms:
+        return counts
+    counts["modules"] = len(norms)
+
+    def reset(module, args):
+        counts["calls"] = 0
+
+    def once(module, args, output):
+        counts["calls"] += 1
+        if counts["calls"] > 1:
+            counts["skipped"] += 1
+            return args[0]
+        return output
+
+    model.register_forward_pre_hook(reset)
+    for norm in norms:
+        norm.register_forward_hook(once)
+    return counts
+
+
+def reference_forward(model_path: str, batch: list, dtype_name: str,
+                      offload_folder: str | None = None, trust_remote_code: bool = False,
+                      num_layers: int | None = None, deepseek_inference: bool = False) -> list:
     """HuggingFace hidden states on the host CPU: per prompt, one `[seq, d]` float64 array per entry.
 
-    Each prompt runs alone, so no padding or attention mask enters the reference.
+    Each prompt runs alone, so no padding or attention mask enters the reference. With
+    `offload_folder` the decoder layers stream from disk one at a time (`streamed_model`).
+
+    `trust_remote_code` runs the checkpoint's own modeling file through `remote_code_reference`,
+    which Kimi K3 needs. There `offload_folder` only turns streaming on: the layers stream from the
+    checkpoint's safetensors in place and nothing goes to the folder. `num_layers` builds only
+    the first layers, for a dry run.
+
+    `deepseek_inference` runs the checkpoint's own `inference/model.py`, DeepSeek V4.1-Flash's
+    runtime, through `deepseek_reference` on CPU stand-ins for its CUDA kernels. There too
+    `offload_folder` only turns streaming on.
     """
     import torch
     import transformers
 
+    if deepseek_inference:
+        import deepseek_reference
+
+        return deepseek_reference.reference_forward(
+            model_path, batch, dtype_name, streamed=bool(offload_folder), num_layers=num_layers)
+    if trust_remote_code:
+        import remote_code_reference
+
+        return remote_code_reference.reference_forward(
+            model_path, batch, dtype_name, streamed=bool(offload_folder), num_layers=num_layers)
     dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[dtype_name]
-    model = transformers.AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype)
+    patch_fp8_ceil_blocks()
+    if offload_folder:
+        model = streamed_model(model_path, dtype_name, offload_folder, num_layers)
+    else:
+        config = cut_config(transformers.AutoConfig.from_pretrained(model_path), num_layers)
+        model = model_class(config).from_pretrained(model_path, config=config, dtype=dtype)
     model.eval()
+    norm_counts = norm_embeddings_once(model)
     states = []
     with torch.no_grad():
-        for ids in batch:
-            out = model(input_ids=torch.tensor([ids]), output_hidden_states=True)
-            states.append([h[0].to(torch.float64).numpy() for h in out.hidden_states])
+        for n, ids in enumerate(batch):
+            # No cache: the reference runs each prompt once, and a cut GLM-5.3-Flash of KDA layers
+            # alone has no attention layer for transformers' cache to read a length from.
+            out = model(input_ids=torch.tensor([ids]), output_hidden_states=True, use_cache=False)
+            states.append([flat_entry(h) for h in out.hidden_states])
             del out
+            if norm_counts["modules"]:
+                print(f"{dtype_name} reference, prompt {n}: embed_norm ran {norm_counts['calls']} "
+                      f"time(s); {'the second call passed its input through' if norm_counts['calls'] > 1 else 'nothing skipped'}",
+                      flush=True)
     del model
     gc.collect()
     return states
+
+
+def _stack_entries(entries: list, key: str, arrays: dict) -> None:
+    """`key` holds the entries stacked. When the last entry is narrower than the rest, as the
+    final norm is beside a model's multi-copy streams, it goes under `key_last` instead."""
+    entries = [np.asarray(e, np.float32) for e in entries]
+    if len(entries) > 1 and entries[-1].shape != entries[0].shape:
+        arrays[key] = np.stack(entries[:-1])
+        arrays[key + "_last"] = entries[-1]
+    else:
+        arrays[key] = np.stack(entries)
+
+
+def _unstack_entries(data, key: str) -> list:
+    out = [a.astype(np.float64) for a in data[key]]
+    if key + "_last" in data.files:
+        out.append(data[key + "_last"].astype(np.float64))
+    return out
+
+
+def save_reference(path: str, batch: list, reference: list, floor: list | None) -> str:
+    """Write the token ids and the reference forwards, float32, so a TPU host can read them."""
+    if not path.endswith(".npz"):
+        path += ".npz"
+    arrays = {}
+    for n, ids in enumerate(batch):
+        arrays[f"ids{n}"] = np.asarray(ids, np.int64)
+        _stack_entries(reference[n], f"reference{n}", arrays)
+        if floor:
+            _stack_entries(floor[n], f"floor{n}", arrays)
+    np.savez(path, **arrays)
+    return path
+
+
+def load_reference(path: str, batch: list, no_floor: bool):
+    """The reference and floor `save_reference` wrote, per prompt as lists of `[seq, d]` arrays.
+
+    Every prompt's token ids have to equal the ids this run built, or the arrays belong to other
+    prompts. Values come back float64, as `reference_forward` returns them. They went through a
+    float32 file, which holds both the BF16 floor and the float32 reference without rounding.
+    """
+    data = np.load(path)
+    stored = sorted(int(k[3:]) for k in data.files if k.startswith("ids"))
+    if stored != list(range(len(batch))):
+        raise SystemExit(f"{path} holds {len(stored)} prompt(s); this run built {len(batch)}")
+    reference, floor = [], []
+    for n, ids in enumerate(batch):
+        if list(data[f"ids{n}"]) != list(ids):
+            raise SystemExit(f"prompt {n}: the token ids in {path} differ from this run's")
+        reference.append(_unstack_entries(data, f"reference{n}"))
+        if not no_floor:
+            if f"floor{n}" not in data.files:
+                raise SystemExit(f"{path} has no bf16 floor; pass --no-floor or rerun --reference-only")
+            floor.append(_unstack_entries(data, f"floor{n}"))
+    return reference, (floor if not no_floor else None)
+
+
+def save_capture(path: str, batch: list, captured: list) -> str:
+    """Write each prompt's token ids and its engine capture, `[seq, slots, d]` float32."""
+    if not path.endswith(".npz"):
+        path += ".npz"
+    arrays = {}
+    for n, (ids, got) in enumerate(zip(batch, captured)):
+        arrays[f"ids{n}"] = np.asarray(ids, np.int64)
+        arrays[f"capture{n}"] = np.asarray(got, np.float32)
+    np.savez(path, **arrays)
+    return path
+
+
+def load_capture(path: str, batch: list) -> list:
+    """The captures `save_capture` or `--save-npz` wrote, one `[seq, slots, d]` array per prompt.
+
+    Every prompt's token ids have to equal the ids this run built, or the capture belongs to
+    other prompts. A `--save-npz` file from before the ids went into it can't show them, so it's
+    refused.
+    """
+    data = np.load(path)
+    stored = sorted(int(k[7:]) for k in data.files if k.startswith("capture"))
+    if stored != list(range(len(batch))):
+        raise SystemExit(f"{path} holds {len(stored)} capture(s); this run built {len(batch)} prompts")
+    captured = []
+    for n, ids in enumerate(batch):
+        if f"ids{n}" not in data.files:
+            raise SystemExit(f"{path} holds no token ids for prompt {n}, so nothing ties the "
+                             "capture to this run's prompts")
+        if not np.array_equal(data[f"ids{n}"], np.asarray(ids, np.int64)):
+            raise SystemExit(f"prompt {n}: {path} holds other token ids than this run built")
+        got = data[f"capture{n}"].astype(np.float32)
+        if got.shape[0] != len(ids):
+            raise SystemExit(f"prompt {n}: {path} holds {got.shape[0]} rows for {len(ids)} tokens")
+        captured.append(got)
+    return captured
 
 
 def main(argv=None) -> int:
@@ -363,6 +874,60 @@ def main(argv=None) -> int:
     ap.add_argument("--control-factor", type=float, default=3.0)
     ap.add_argument("--save-npz", help="write every capture and reference array here, for a closer look")
     ap.add_argument(
+        "--save-capture",
+        metavar="NPZ",
+        help="write the engine capture and the token ids to NPZ, so --capture-npz can gate it again "
+        "against another reference without the engine",
+    )
+    ap.add_argument(
+        "--capture-npz",
+        metavar="NPZ",
+        help="read the capture from an NPZ that --save-capture or --save-npz wrote, instead of "
+        "starting the engine; the token ids have to match",
+    )
+    ap.add_argument(
+        "--offload-folder",
+        help="stream the reference one decoder layer at a time through this folder, for a model "
+        "bigger than host RAM",
+    )
+    ap.add_argument(
+        "--reference-only",
+        metavar="NPZ",
+        help="run the reference forwards, write them and the token ids to NPZ, and stop before "
+        "the engine; for a CPU VM that holds the checkpoint",
+    )
+    ap.add_argument(
+        "--reference-npz",
+        help="read the reference forwards from an NPZ that --reference-only wrote, instead of "
+        "running them; the token ids have to match",
+    )
+    ap.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="run the checkpoint's own modeling code for the reference, with a pure-torch fla when "
+        "fla isn't installed; Kimi K3 needs it",
+    )
+    ap.add_argument(
+        "--deepseek-inference",
+        action="store_true",
+        help="run the checkpoint's own inference/model.py for the reference, on CPU stand-ins for "
+        "its CUDA kernels; DeepSeek V4.1-Flash needs it",
+    )
+    ap.add_argument(
+        "--reference-layers",
+        type=int,
+        metavar="N",
+        help="build only the first N decoder layers, for a dry run of the reference; needs "
+        "--reference-only",
+    )
+    ap.add_argument(
+        "--engine-layers",
+        type=int,
+        metavar="N",
+        help="serve only the first N decoder layers, through json_model_override_args, and "
+        "compare slots 0 to N-1 against reference entries 0 to N-1",
+    )
+    ap.add_argument(
         "--engine-arg",
         action="append",
         default=[],
@@ -375,6 +940,16 @@ def main(argv=None) -> int:
         help="log the engine request and a summary of each reply to stderr; LOG_PAYLOADS=1 too",
     )
     args = ap.parse_args(argv)
+    if args.reference_layers is not None and not args.reference_only:
+        ap.error("--reference-layers needs --reference-only: a cut model can't gate a capture")
+    if args.trust_remote_code and args.deepseek_inference:
+        ap.error("--trust-remote-code and --deepseek-inference pick two different references")
+    if args.capture_npz and args.reference_only:
+        ap.error("--capture-npz gates a saved capture, and --reference-only stops before any gate")
+    if args.capture_npz and args.save_capture:
+        ap.error("--capture-npz reads a capture, so there's no new one for --save-capture to write")
+    if args.capture_npz and args.engine_layers is not None:
+        ap.error("--engine-layers cuts the engine, and --capture-npz never starts it")
 
     from capture_activations import (
         enable_payload_log,
@@ -387,11 +962,32 @@ def main(argv=None) -> int:
         extra = parse_engine_args(args.engine_arg, reserved=RESERVED_ENGINE_ARGS)
     except ValueError as exc:
         ap.error(str(exc))
+    if args.engine_layers is not None:
+        if args.engine_layers < 1:
+            ap.error("--engine-layers takes a count of 1 or more")
+        if args.reference_only:
+            ap.error("--engine-layers cuts the engine, and --reference-only never starts it")
+        try:
+            extra["json_model_override_args"] = engine_layer_override(
+                extra.get("json_model_override_args"), args.engine_layers)
+        except ValueError as exc:
+            ap.error(str(exc))
+        print(f"engine cut to its first {args.engine_layers} decoder layers: "
+              f"json_model_override_args={extra['json_model_override_args']}")
     if payload_log_requested(args.log_payloads):
         enable_payload_log()
     save_npz = args.save_npz
     if save_npz and not save_npz.endswith(".npz"):
         save_npz += ".npz"
+
+    if int(os.environ.get("SGL_NODE_RANK", "0") or 0) > 0 and not args.reference_only:
+        # A non-zero rank of a multi-host slice starts its engine and blocks in the scheduler.
+        # Only rank 0 sends prompts and compares, so only rank 0 reads the prompt file and the
+        # reference; both live on host 0 alone (multihost_exec.sh copies nothing by default).
+        # With --capture-npz no rank starts an engine.
+        if not args.capture_npz:
+            engine_capture(args, [], extra)
+        os._exit(0)
 
     from transformers import AutoTokenizer
 
@@ -408,7 +1004,7 @@ def main(argv=None) -> int:
         prompts.append("\n".join(corpus[args.num_prompts : need]))
     else:
         prompts = [args.prompt]
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=args.trust_remote_code)
     bos = tokenizer.bos_token_id
     batch = []
     for text in prompts:
@@ -426,21 +1022,54 @@ def main(argv=None) -> int:
     if len(batch) > args.batch_size:
         raise SystemExit(f"{len(batch)} prompts need --batch-size {len(batch)} or more")
 
-    reference = reference_forward(args.model_path, batch, "float32")
-    print(f"float32 reference: {len(reference[0])} entries per prompt")
-    floor = None
-    if not args.no_floor:
-        floor = reference_forward(args.model_path, batch, "bfloat16")
-        print("bf16 floor: done")
-    captured = engine_capture(args, batch, extra)
-    print("engine capture: " + ", ".join(str(c.shape) for c in captured))
+    if args.reference_npz:
+        reference, floor = load_reference(args.reference_npz, batch, args.no_floor)
+        print(f"reference read from {args.reference_npz}: {len(reference[0])} entries per prompt"
+              f"{', with the bf16 floor' if floor else ''}")
+    else:
+        remote = dict(trust_remote_code=args.trust_remote_code, num_layers=args.reference_layers,
+                      deepseek_inference=args.deepseek_inference)
+        reference = reference_forward(args.model_path, batch, "float32", args.offload_folder, **remote)
+        print(f"float32 reference: {len(reference[0])} entries per prompt")
+        floor = None
+        if not args.no_floor:
+            floor = reference_forward(args.model_path, batch, "bfloat16", args.offload_folder, **remote)
+            print("bf16 floor: done")
+    if args.reference_only:
+        path = save_reference(args.reference_only, batch, reference, floor)
+        print(f"wrote {path}: {len(batch)} prompt(s), float32 reference"
+              f"{' and bf16 floor' if floor else ''}. The engine didn't run.")
+        os._exit(0)
+    if args.engine_layers is not None:
+        try:
+            reference = [cut_entries(r, args.engine_layers) for r in reference]
+            floor = [cut_entries(f, args.engine_layers) for f in floor] if floor else floor
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        print(f"comparing reference entries 0 to {args.engine_layers - 1}")
+    if args.capture_npz:
+        captured = load_capture(args.capture_npz, batch)
+        print(f"capture read from {args.capture_npz}: " + ", ".join(str(c.shape) for c in captured))
+    else:
+        captured = engine_capture(args, batch, extra)
+        print("engine capture: " + ", ".join(str(c.shape) for c in captured))
+    if args.engine_layers is not None:
+        for n, got in enumerate(captured):
+            if got.shape[1] != args.engine_layers:
+                raise SystemExit(
+                    f"prompt {n}: --engine-layers {args.engine_layers}, and the capture holds "
+                    f"{got.shape[1]} slots, so the model didn't take the cut")
+    if args.save_capture:
+        print(f"capture written to {save_capture(args.save_capture, batch, captured)}: "
+              f"{len(batch)} prompt(s) with their token ids")
     if save_npz:
         arrays = {}
         for n, got in enumerate(captured):
+            arrays[f"ids{n}"] = np.asarray(batch[n], np.int64)
             arrays[f"capture{n}"] = got.astype(np.float32)
-            arrays[f"reference{n}"] = np.stack(reference[n]).astype(np.float32)
+            _stack_entries(reference[n], f"reference{n}", arrays)
             if floor:
-                arrays[f"floor{n}"] = np.stack(floor[n]).astype(np.float32)
+                _stack_entries(floor[n], f"floor{n}", arrays)
         np.savez(save_npz, **arrays)
         print(f"wrote {save_npz}")
 

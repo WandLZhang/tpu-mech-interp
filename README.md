@@ -19,10 +19,11 @@ host, 16 GiB of HBM each.
 | BF16 dense | 459 TFLOPS | 14.7 PFLOPS |
 | ICI | 1,200 GB/s bidirectional | 3D mesh; slices below a 64-chip cube have no wraparound links |
 
-No KDA model has run on a chip here. The KDA kernels in `sglang-jax` never read the chip
-generation, so which generation serves a KDA model best stays open until one runs. Mamba-2 needs
-no kernel at all: [`scan/mamba2.py`](scan/mamba2.py) is plain XLA, and Nemotron 3 Super served on a
-`v5p-8`.
+Two KDA models ran on a `v5p-64`: Kimi K3 through the engine's Pallas KDA kernels, and
+GLM-5.3-Flash through the port's plain-XLA KDA. The KDA kernels in `sglang-jax` never read the chip
+generation, and no KDA model has run on v6e here, so which generation serves one best stays open.
+Mamba-2 needs no kernel at all: [`scan/mamba2.py`](scan/mamba2.py) is plain XLA, and both Nemotron
+3 sizes served on v5p.
 
 ### Rates
 
@@ -56,15 +57,17 @@ narrow the spray and `MODE=ondemand` to skip Spot. It doesn't book Flex Start or
 PROJECT=your-project ACCEL=v5p-64 bash scripts/spray_tpu_spot.sh
 ```
 
-Untested at `v5p-64`: the recorded sprays asked for `v5litepod-8` and `v5p-8`, and
-[Run it](#run-it) gives the `v5litepod-8` line.
+The recorded sprays asked for `v5litepod-8`, `v5p-8` and `v5p-64`, and [Run it](#run-it) gives
+the `v5litepod-8` line. Each model page names the zone and date of the slice its runs got. A slice
+whose hosts read a GCS bucket needs the cloud-platform scope:
+`TPU_CREATE_FLAGS="--scopes=https://www.googleapis.com/auth/cloud-platform"`.
 
 The spray prints the `ssh` command for the slice it kept. That `ssh` needs a firewall rule on the
 slice's network that admits TCP port 22 from your address. The recorded runs added one for each
 run and deleted it at teardown. On the VM,
 [`scripts/bootstrap_tpu_vm.sh`](scripts/bootstrap_tpu_vm.sh) installs the engine, and its smoke
 test prints the chips the host sees: `DEVICES 8 TPU v5 lite` on a `v5litepod-8`, 4 on a `v5p-8`.
-A `v5p-64` spans 8 hosts, and nothing here has run across hosts.
+A `v5p-64` spans 8 hosts; [Across hosts](#across-hosts) covers it.
 
 ### Tear down
 
@@ -86,6 +89,37 @@ gcloud compute tpus tpu-vm list --zone=- --project=PROJECT --format="value(name)
 The spray also prints the zones it tried, as a `ZONES="..."` line under its spraying line. On its
 way out it prints both list commands as a loop over those zones, with the project filled in.
 
+### Across hosts
+
+A `v5p-64` is 8 hosts of 4 chips, and every model here over 380 GiB needs one. Six models ran that
+way in us-east5-a on 2026-09-27 and 28, each through its row of
+[`scripts/multihost_run.sh`](scripts/multihost_run.sh). A run needs four things first:
+
+1. The checkpoint in a GCS bucket in the slice's region, one folder per model, named as the
+   script's row expects. A 1 TB-class checkpoint doesn't fit a host's RAM, so every host reads it
+   through gcsfuse, which [`scripts/multihost_setup.sh`](scripts/multihost_setup.sh) mounts.
+2. A capture reference in the bucket's `refs/` folder, built on a CPU VM that holds one decoder
+   layer at a time: `scripts/check_capture.py --offload-folder DIR --reference-only`, with the
+   flags the script's header gives.
+3. The slice, created with the cloud-platform scope above so its hosts can read the bucket.
+4. A firewall rule that lets the hosts reach each other on their internal IPs, and SSH from your
+   machine to each host.
+
+Then, from the repo root:
+
+```bash
+BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE MODEL setup check measure
+```
+
+`setup` bootstraps every host, mounts the bucket and checks that every host sees all 32 chips.
+`check` runs the capture check against the reference. `measure` runs `measure_model.sh` with the
+engine spread over every host by [`scripts/multihost_exec.sh`](scripts/multihost_exec.sh). Each
+model page gives its row and its results.
+
+Notes: nobody has replayed this section as written from a clean start; the model pages' runs came
+from the same script. When a host's external IP stops answering, `SLICE_SSH_CONFIG` takes an ssh
+config that reaches it through host 0.
+
 ## 2. Models
 
 | Family | Repo | Total / active | Architecture | BF16 GiB | Status | Code |
@@ -94,27 +128,25 @@ way out it prints both list commands as a loop over those zones, with the projec
 | [Gemma 4 26B-A4B](models/gemma4-26b-a4b.md) | `google/gemma-4-26B-A4B-it` | 25.8B / 3.8B | MoE, 128 experts top-8 plus 1 shared, 5:1 SWA | 48.1 | **measured on TPU**, `v5litepod-8`, 2026-09-25, with the layer filter | upstream |
 | Qwen3-8B, no page; the [capture guide](docs/activation-capture.md#the-whole-chain-measured) has its numbers | `Qwen/Qwen3-8B` | 8.2B | GQA | 15.3 | **measured on TPU**, `v5litepod-8`, 2026-09-25, with the layer filter | upstream |
 | [gpt-oss-120b](models/gpt-oss-120b.md) | `openai/gpt-oss-120b` | 116.8B / 5.1B | MoE 128 experts top-4, 1:1 SWA, sinks | 217.6 | **measured on TPU**, `v5p-8`, 2026-09-25, with the layer filter | our patch |
-| [Nemotron 3 Super](models/nemotron3-super.md) | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16` | 123.6B / 12B | Mamba-2 + LatentMoE | 230.2 | **measured on TPU**, `v5p-8`, 2026-09-25, with the layer filter | our patch |
-| [Nemotron 3 Ultra](models/nemotron3-ultra.md) | `nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16` | 560.5B / 55B | Mamba-2 + LatentMoE | 1,044.1 | **CPU only**, needs a `v5p-64` across 8 hosts | our patch, shared with Super |
-| [Inkling](models/inkling.md) | `thinkingmachines/Inkling` | 975B / 41B | MoE, no RoPE, short conv | 1,773.9 | **CPU only**, needs a `v5p-64` across 8 hosts | our patch |
-| [Kimi K3](models/kimi-k3.md) | `moonshotai/Kimi-K3` | 2.78T / 104B | 69 KDA + 24 gated MLA | 5,178 | **CPU only**, needs a `v5p-128` or a `v6e-256` | our patch |
-| [GLM-5.3](models/glm5.3.md) | `zai-org/GLM-5.3` | 753B / 40B | MLA + sparse top-2048 indexer | 1,403 | **untested**, served upstream and never run here | upstream, our capture hook |
-| [GLM-5.3-Flash](models/glm5.3-flash.md) | `zai-org/GLM-5.3-Flash` | 320B / 18B | 34 KDA + 11 sparse MLA, mHC | 598.5 | **not runnable**, no `sglang-jax` implementation | none |
-| [DeepSeek V4.1-Flash](models/deepseek-v4.1-flash.md) | `deepseek-ai/DeepSeek-V4.1-Flash` | 552B + 196.6B Engram | encoder-decoder, n-gram memory | 1,394 | **not runnable**, no JAX implementation | none |
+| [Nemotron 3 Super](models/nemotron3-super.md) | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16` | 123.6B / 12B | Mamba-2 + LatentMoE | 230.2 | **measured on TPU**, `v5p-8`, 2026-09-28, with the layer filter | our patch |
+| [Nemotron 3 Ultra](models/nemotron3-ultra.md) | `nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16` | 560.5B / 55B | Mamba-2 + LatentMoE | 1,044.1 | **measured on TPU**, `v5p-64`, 2026-09-28, with the layer filter | our patch, shared with Super |
+| [Inkling](models/inkling.md) | `thinkingmachines/Inkling` | 975B / 41B | MoE, no RoPE, short conv | 1,773.9 | **captured on TPU**, `v5p-64`, 2026-09-27; every layer within the BF16 floor, one control under its bar; not measured ([roadmap](docs/roadmap.md)) | our patch |
+| [Kimi K3](models/kimi-k3.md) | `moonshotai/Kimi-K3` | 2.78T / 104B | 69 KDA + 24 gated MLA | 5,178 | **captured on TPU**, `v5p-64`, 2026-09-27; the capture check passes, prefill runs at 0.6 tokens/s; not measured ([roadmap](docs/roadmap.md)) | our patch |
+| [GLM-5.3](models/glm5.3.md) | `zai-org/GLM-5.3` | 753B / 40B | MLA + sparse top-2048 indexer | 1,403 | **measured on TPU**, `v5p-64`, 2026-09-27 and 28, with the layer filter | upstream, our capture hook and two fixes |
+| [GLM-5.3-Flash](models/glm5.3-flash.md) | `zai-org/GLM-5.3-Flash` | 320B / 18B | 34 KDA + 11 sparse MLA, mHC | 598.5 | **measured on TPU**, `v5p-64`, 2026-09-28, with the layer filter | our patch |
+| [DeepSeek V4.1-Flash](models/deepseek-v4.1-flash.md) | `deepseek-ai/DeepSeek-V4.1-Flash` | 552B + 196.6B Engram | encoder-decoder, n-gram memory | 1,394 | **measured on TPU**, `v5p-64`, 2026-09-27, with the layer filter | our patch |
 
 **Status** says what has been shown, strongest first. Every model page opens with the same status.
 
 | Status | Meaning |
 |---|---|
 | **measured on TPU**, slice, dates | served and captured on that slice on those dates; the model page has the numbers and the command behind them |
-| **CPU only** | a test serves the patched model on CPU against a reference, and no chip has run it: HuggingFace `transformers` for Inkling and Nemotron 3; for Kimi K3, which `transformers` doesn't implement, float64 references per component and a float64 forward of a four-layer model the engine serves |
-| **untested** | the model code ships upstream in `sglang-jax`, our patch adds only the capture hook, and nothing here has run it on a chip or on CPU |
-| **not runnable** | nothing here serves it; the page scopes the work |
+| **captured on TPU**, slice, date | served on that slice and captured for the capture check; the model page gives the check's result, and the roadmap says what the measure still needs |
 
 **With the layer filter** means the capture passed `--return-hidden-states-layers`, so the engine
 copied only the kept slot to the host.
 
-The slices a **CPU only** row needs span several hosts, and nothing here has run across hosts.
+Open work, Kimi K3 and Inkling first, sits in [the roadmap](docs/roadmap.md).
 
 **Code** says where the model lives. `upstream` ships in `sglang-jax` as is. `our patch` lives in
 [`upstream/models/`](upstream/models/), and the capture hooks live in [`upstream/`](upstream/).
@@ -122,13 +154,16 @@ The slices a **CPU only** row needs span several hosts, and nothing here has run
 runs.
 
 Kimi K3, GLM-5.3-Flash and both Nemotron 3 sizes carry a recurrent state. The Kimi K3 and
-Nemotron 3 patches keep it in a state pool beside the paged KV cache, which is how Nemotron 3 Super
-serves. Splitting one long sequence across chips takes the sharded scan in [`scan/`](scan/).
+Nemotron 3 patches keep it in a state pool beside the paged KV cache, which is how Kimi K3 and both
+Nemotron 3 sizes serve. Splitting one long sequence across chips takes the sharded scan in
+[`scan/`](scan/).
 
 A 32-chip v5p slice holds 3,040 GiB, so every row except Kimi K3 fits one slice at BF16. The
-engine shards a model within one slice, and Kimi K3's 5,178 GiB takes a 64-chip `v5p-128`, 6,080
-GiB, or a `v6e-256`, 8,192 GiB. Its routed experts ship MXFP4. Kept packed, they bring the
-weights to 1,453 GiB and fit a `v5p-64`, which needs a `gmm` that reads MXFP4 operands.
+engine shards a model within one slice, so Kimi K3's 5,178 GiB of BF16 weights would take a
+64-chip `v5p-128`, 6,080 GiB, or a `v6e-256`, 8,192 GiB. Its routed experts ship MXFP4, and kept
+packed they bring the weights to 1,453 GiB, which is how it runs on one `v5p-64`: the patch decodes
+each expert stack to BF16 just before its grouped matmul. That decode is one suspect for its slow
+prefill.
 
 Both Gemma 4 rows count a vision encoder of about 550M parameters. The model cards give the
 language model alone: 30.7B for 31B and 25.2B for 26B-A4B.
@@ -136,9 +171,9 @@ language model alone: 30.7B for 31B and 25.2B for 26B-A4B.
 gpt-oss-120b also ships MXFP4 routed experts, 60.8 GiB on disk. It decodes to BF16 at load, so
 the 217.6 GiB in the table is what lands in HBM.
 
-The BF16 column is the checkpoint on disk, and several checkpoints carry parts the engine doesn't
-build: both Nemotron 3 rows and GLM-5.3 count a multi-token-prediction head, and Inkling counts its
-head plus vision and audio towers. Each model page gives what lands in HBM.
+The BF16 column counts each checkpoint's parameters at 2 bytes, and several checkpoints carry parts
+the engine doesn't build: both Nemotron 3 rows and GLM-5.3 count a multi-token-prediction head, and
+Inkling counts its head plus vision and audio towers. Each model page gives what lands in HBM.
 
 ## 3. Operations
 
@@ -151,10 +186,10 @@ head plus vision and audio towers. Each model page gives what lands in HBM.
 
 [`docs/activation-capture.md`](docs/activation-capture.md) covers all four.
 
-All four run on hardware. On a `v5litepod-8` on 2026-09-25, with the layer filter, the Run-it
-chain below went the whole way on Gemma 4 26B-A4B. Against a float32 forward, every captured layer
-stays within 1.23 times a BF16 forward's error, on one prompt and on a batch that splits a prompt
-across prefill passes.
+All four run on hardware. On a `v5litepod-8` Spot slice in us-south1-a on 2026-09-25, with the
+layer filter, the Run-it chain below went the whole way on Gemma 4 26B-A4B. Against a float32
+forward, every captured layer stays within 1.23 times a BF16 forward's error, on one prompt and on
+a batch that splits a prompt across prefill passes.
 Step 2 captures 2.2M tokens, step 3 trains an SAE for 4,000 steps, and step 4 steers one of its
 features beside a random direction of the same length. At a tenth of the stream's norm the
 feature rewords three of four replies and the served model judges all three coherent. The random
@@ -172,10 +207,10 @@ workstation:
 PROJECT=your-project ACCEL=v5litepod-8 bash scripts/spray_tpu_spot.sh
 ```
 
-The spray prints the `ssh` command for the slice it kept. On the VM, `git clone` this repo from
-the URL you're reading it at, `cd` into the clone and start `tmux`. Run every line below from the
-repo root in that one `tmux` shell. `SNAP` and `FEATURE` exist only in that shell, and a dropped
-`ssh` session leaves a `tmux` shell running.
+The spray prints the `ssh` command for the slice it kept. On the VM, run
+`git clone https://github.com/WandLZhang/tpu-mech-interp && cd tpu-mech-interp` and start `tmux`.
+Run every line below from the repo root in that one `tmux` shell. `SNAP` and `FEATURE` exist only
+in that shell, and a dropped `ssh` session leaves a `tmux` shell running.
 
 ```bash
 bash scripts/bootstrap_tpu_vm.sh && source ~/.tpu_env
@@ -209,13 +244,14 @@ python3 steering/compare.py --model-path "$SNAP" --bank steer_l15.npz --steering
 `pick.log` keeps the ranking `pick_feature.py` prints. Its last line, `FEATURE=<id>`, names the
 latent that `from_sae.py` and `compare.py` take.
 
-On a `v5litepod-8` on 2026-09-25, with the layer filter, the chain took 76 minutes from bootstrap
-to `compare.py`. The fetch took 54 of them at 15.9 MB/s, because the 49.9 GB first shard came down
-one HTTP connection. The steps from the first check to `compare.py` took 21.5 minutes: the first
-check 3, the capture 6, the second check 3, the SAE 6 and `compare.py` 3. Every other step took
-under a minute. The fetch rate varies. The record holds 52.4 MB/s on 2026-09-24, 105.9 MB/s on
-2026-09-25 before the layer filter, and 15.9 MB/s on this run. A killed fetch starts over from
-zero.
+On a `v5litepod-8` Spot slice in us-south1-a on 2026-09-25, with the layer filter, the chain took
+76 minutes from bootstrap to `compare.py`. The fetch took 54 of them at 15.9 MB/s, because the
+49.9 GB first shard came down one HTTP connection. The steps from the first check to `compare.py`
+took 21.5 minutes: the first check 3, the capture 6, the second check 3, the SAE 6 and
+`compare.py` 3. Every other step took under a minute. The fetch rate varies. The record holds
+52.4 MB/s on 2026-09-24, 105.9 MB/s on 2026-09-25 before the layer filter, 15.9 MB/s on this run,
+and 123.7 MB/s on a replay in us-east1-c on 2026-09-28, whose steps from the first check to
+`compare.py` took 21.7 minutes. A killed fetch starts over from zero.
 
 `--steering-layer` is the capture slot minus one. `compare.py` sends each prompt as a chat turn,
 because the `-it` model continues raw text badly, and sends the turn as token ids, so it opens on
@@ -259,9 +295,10 @@ Some output looks like an error and isn't:
   after N empty round(s)`, in `measure_model.sh`'s `hbm_*.log` files. `peak_hbm.py` starts
   before the engine holds the TPU, and `libtpu` serves its metrics only once a process holds it.
 
-Each measured model page ends with the command behind its throughput and HBM figures, a call to
-[`scripts/measure_model.sh`](scripts/measure_model.sh). It runs on the slice the chain used, after
-the same bootstrap, inside `tmux`. Qwen3-8B has no page, and on a `v5litepod-8` its call reads:
+Each measured model page gives the command behind its throughput and HBM figures. A single-host
+page calls [`scripts/measure_model.sh`](scripts/measure_model.sh) after the same bootstrap, inside
+`tmux`. A `v5p-64` page runs the same script through the `measure` step of
+`scripts/multihost_run.sh`. Qwen3-8B has no page, and on a `v5litepod-8` its call reads:
 
 ```bash
 PROMPTS=1000 bash scripts/measure_model.sh Qwen/Qwen3-8B 18 ~/results/qwen3-8b
@@ -280,12 +317,17 @@ Delete the slice when you're done. [Tear down](#tear-down) has the commands.
 
 The CPU gates need no TPU. Run them from the repo root on any Linux machine, in a Python 3.12 venv
 of their own, because the TPU VM's `~/v312` carries `transformers` 5.12 and
-`upstream/models/requirements.txt` pins `transformers>=5.17` for the model tests. They take about
-70 minutes on 8 cores and 30 to 32 on 90 vCPUs. The capture, check and throughput
+`upstream/models/requirements.txt` pins `transformers>=5.17` for the model tests. On a 90-vCPU
+`c3d-highcpu-90` in us-central1-a on 2026-09-28, all 46 gates passed in 2 hours 3 minutes, most of
+it in the model tests under `upstream/models/`: `test_deepseek_v41_model.py` took 27 minutes and
+`test_glm5_next_model.py` 21. The capture, check and throughput
 gates start the real engine on CPU, on the patched `sglang-jax`, against a tiny random-weight
 Qwen3. The steering gates do the same against a cut-down Gemma 4 26B-A4B. So the venv also takes
 the engine's own imports, which `upstream/models/requirements.txt` lists, and `tpu-info` from
-`scripts/requirements.txt`. A gate that fails prints its whole log, and the logs stay on disk.
+`scripts/requirements.txt`. Each gate prints its line when it ends, so the terminal stays quiet for
+up to 27 minutes while a model test runs. Its log grows meanwhile in the `/tmp/test_all-logs.*`
+folder the script makes. A gate that fails prints its whole log, and the logs stay on disk. A clean
+run deletes the folder, so run one test file alone to read its checks.
 
 ```bash
 command -v uv || curl -LsSf https://astral.sh/uv/install.sh | sh   # installs uv if it's missing
@@ -317,7 +359,8 @@ returns those slots alone in ascending order, so `hs[token, 0, :]` is slot 15.
 
 `bootstrap_tpu_vm.sh` builds the engine with this patch and the steering patches. To build the
 capture tree by hand, run this from the repo root. `git am` makes a commit, so the `-c` pair gives
-it a committer on a machine with no git identity.
+it a committer on a machine with no git identity. No recorded run typed these lines. The measured
+runs built their trees through `bootstrap_tpu_vm.sh`, which runs the same `git am`.
 
 ```bash
 REPO=$PWD
@@ -326,7 +369,7 @@ git checkout eb061d8            # every patch in upstream/ applies here
 git -c user.name=you -c user.email=you@example.com am < "$REPO/upstream/sglang-jax-877.patch"
 ```
 
-`bash scripts/verify_patches.sh` applies all 14 patches to a clean checkout at `eb061d8`, in 12
+`bash scripts/verify_patches.sh` applies all 21 patches to a clean checkout at `eb061d8`, in 17
 checks, and names what fails. Main moves, so a hunk that applies at `eb061d8` can stop applying
 on main with no change on this side. `SGL_COMMIT=main` runs the same check against main.
 
@@ -391,7 +434,8 @@ one, so it carries the hook too. On a model without it, `--enable-return-hidden-
 to start.
 [`upstream/glm5-capture-hook.patch`](upstream/glm5-capture-hook.patch) adds it to `glm5_moe`,
 which serves [GLM-5.3](models/glm5.3.md). [GLM-5.3-Flash](models/glm5.3-flash.md) is a different
-architecture that `sglang-jax` doesn't implement.
+architecture, `glm5_next`, which `sglang-jax` doesn't implement; this repo's model patch adds it
+with the hook.
 
 [`upstream/capture-hooks/`](upstream/capture-hooks/) adds it to four more: `kimi_linear`,
 `qwen3_5`, `deepseek_v3` and `glm4_moe`. Those are Kimi-Linear-48B, Qwen3.5, DeepSeek V3 and
@@ -405,11 +449,14 @@ hook's patched layer loop against a float64 reference.
 land as one patch that carries the hook already, covering `openai/gpt-oss-120b` and
 `openai/gpt-oss-20b`, and `thinkingmachines/Inkling` and `thinkingmachines/Inkling-Small`.
 gpt-oss-20b shares the [gpt-oss-120b page](models/gpt-oss-120b.md) and has never served on a chip.
-Inkling-Small shares the [Inkling page](models/inkling.md).
+Inkling-Small shares the [Inkling page](models/inkling.md). `deepseek_v41` and `glm5_next` land as
+one patch each with the hook, covering `deepseek-ai/DeepSeek-V4.1-Flash` and
+`zai-org/GLM-5.3-Flash`.
 
-gpt-oss, Kimi K3 and Nemotron 3 all edit `layers/moe.py`, so one clone takes one of them. A
-serving instance runs one model anyway. [`upstream/models/README.md`](upstream/models/README.md)
-lists which patches share a file.
+gpt-oss, Kimi K3 and Nemotron 3 all edit `layers/moe.py`, DeepSeek V4.1 collides with Kimi K3 and
+Nemotron 3, and GLM-5.3-Flash carries the runner hooks DeepSeek V4.1 does, so one clone takes one
+model patch. A serving instance runs one model anyway.
+[`upstream/models/README.md`](upstream/models/README.md) lists which patches share a file.
 
 Capture moves one BF16 residual stream per kept slot per token to the host.
 `capture_activations.py` starts the engine with `--return-hidden-states-layers` set to its
@@ -422,7 +469,8 @@ of Gemma 4 31B is 10,752 and all 60 are 645,120, at 5,376. The capture script co
 returned elements times the engine dtype's width, 2 for BF16, so its figure shows which slots came
 back for every token. It isn't a reading of the link. On the CPU rig's tiny Qwen3, six slots of 64
 at BF16, `scripts/test_capture_activations.py` check 0 prints 768 wire bytes a token at
-`--layers all` and 128 at `--layers 3`.
+`--layers all` and 128 at `--layers 3`. Run the file alone to see those lines; `test_all.sh` keeps
+a gate's log only when something fails.
 
 Capture costs throughput. On a `v5litepod-8` Spot slice in us-south1-a on 2026-09-25, with the
 layer filter and one kept slot, Gemma 4 26B-A4B served 13,158.8 and 13,185.7 tokens/s with capture
@@ -430,10 +478,15 @@ off on two runs, and 9,535.1 and 9,553.6 with it on, 1.38x both times. Gemma 4 3
 and 6,937.4 off and 5,469.8 and 5,477.7 on, 1.27x both times. Qwen3-8B, at `PROMPTS=1000`, served
 32,778.7 off and 16,210.5 on, 2.02x. The same day, on a `v5p-8` Spot slice in europe-west4-b with
 the same filter, gpt-oss-120b served 7,279.2 and 7,271.9 off and 5,859.4 and 5,870.3 on, 1.24x
-both times. Nemotron 3 Super served 4,360.2 and 4,360.3 off and 3,299.4 and 3,321.7 on, 1.32x and
-1.31x. Each rate reads a steady window. The model pages and
-[`docs/activation-capture.md`](docs/activation-capture.md) give them, each beside that model's
-figure from before the filter.
+both times; a replay on 2026-09-28 matched within 0.1%. On a `v5p-8` Spot slice in europe-west4-b
+on 2026-09-28, Nemotron 3 Super served 3,916.3 and 3,917.1 off and 2,979.4 and 2,999.0 on, 1.31x
+both times, 10% under its 2026-09-25 rates from before its patch summed tensor shards in float32.
+On a `v5p-64` Spot slice in us-east5-a on 2026-09-27 and 28, with the same filter and one
+run each, Nemotron 3 Ultra served 3,095.3 off and 2,218.2 on, 1.40x. GLM-5.3 served 2,685.8 and
+2,417.1, 1.11x. GLM-5.3-Flash served 1,791.0 and 1,293.5, 1.38x. DeepSeek V4.1-Flash served
+3,414.5 and 2,570.2, 1.33x. Each rate reads a steady window, and the model pages give each window.
+The single-host pages set each rate beside that model's rate from before the filter, and
+[`docs/activation-capture.md`](docs/activation-capture.md) tabulates the single-host runs.
 
 ## 4. Sharded scan
 
@@ -457,7 +510,9 @@ on 8 simulated CPU devices. The four tests that build a mesh print which backend
 `test_deepseek_v4_layers.py` runs no jax.
 
 The first line runs all six from the repo root and names any that fails. The second shows which
-backend the mesh took.
+backend the mesh took. On a TPU VM one process holds the chips at a time, so run them when no
+engine step is running; a scan test that overlaps an engine start makes the engine fail with "The
+TPU is already in use".
 
 ```bash
 for t in scan/test_*.py; do python3 "$t" || echo "FAIL $t"; done
@@ -465,8 +520,8 @@ python3 scan/test_affine_scan.py | grep mesh   # mesh: ctx=8 on tpu
 ```
 
 On eight real chips, a `v5litepod-8`, the sharded scan matches one device to 3.7e-08 to 2.5e-07
-relative on three runs, one on 2026-09-24 and two on 2026-09-25. That's the interconnect claim,
-and on CPU the same check reads 3.7e-08 to 4.4e-07. All six tests passed on the first run. On the
+relative on four runs, one on 2026-09-24, two on 2026-09-25 and one in us-east1-c on 2026-09-28.
+That's the interconnect claim, and on CPU the same check reads 3.7e-08 to 4.8e-07. All six tests passed on the first run. On the
 second, `test_nemotron3_layers` failed the three checks that save a config through the VM's
 `transformers` 5.12.1, which writes the old layer names. Its chip checks and the other five tests
 passed. The test now reads either set of names. It passes under 5.12.1 on CPU, and all six passed

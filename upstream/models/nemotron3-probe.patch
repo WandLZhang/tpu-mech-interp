@@ -1,0 +1,676 @@
+Subject: [PATCH] feat(nemotron_h): per-run switches that swap one MoE piece for a reference version
+
+The first on-chip check of Nemotron 3 Ultra on a v5p-64 read 2.62 to 12.08
+times transformers' own BF16 error at slots 4 to 7. The pieces that run
+differently on a TPU are the Pallas top-k kernel, the grouped matmul kernel,
+and float32 dots left at the default precision. Each switch below swaps one
+of them for a plain JAX version, so one engine start per setting names the
+piece. The fault turned out to sit in the CPU reference, which rounded the
+float32 router bias to BF16, and against the rebuilt reference all 108
+layers passed on 2026-09-28 (models/nemotron3-ultra.md).
+
+layers/moe_probe.py reads SGL_PROBE_TOPK, SGL_PROBE_GMM, SGL_PROBE_ROUTER,
+SGL_PROBE_LATENT, SGL_PROBE_MOE, SGL_PROBE_SHARED, SGL_PROBE_MOE_OUT and
+SGL_PROBE_MATMUL when the model traces. All are off by default, and a run with
+none set traces the program the tree traced before. SGL_PROBE_TOPK=jnp turns the
+Pallas top-k kernels off in layers/gate.py. SGL_PROBE_GMM=xla runs each routed
+expert's matmuls as a masked dense dot per local expert, with float32
+accumulation and gmm's output dtypes, and xla32 keeps the up projection and the
+activation in float32 too. SGL_PROBE_ROUTER=f32highest computes the router's dot
+as an explicit float32 dot_general at HIGHEST and writes the sigmoid out.
+SGL_PROBE_LATENT=f32 runs fc1_latent_proj and fc2_latent_proj in float32 at
+HIGHEST, so fc2's dot doesn't round the float32 expert output to BF16 on a TPU.
+
+The v5p-64 run of those four on 2026-09-27 left slots 2 to 7 where the baseline
+put them. SGL_PROBE_MOE=dense takes EPMoE's dispatch out: each shard runs every
+local expert over every token in float32 at HIGHEST, scales each row by the
+token's float32 top-k weight for that expert, and sums, with no sort by expert,
+group sizes, padding, gmm or unpermute; the reduce over the tensor and expert
+axes stays EPMoE's, in float32. SGL_PROBE_SHARED=f32 runs the shared expert in
+float32 at HIGHEST and adds it in float32. SGL_PROBE_MOE_OUT=f32 keeps the
+block's output float32: EPMoE's float32 sum isn't rounded, fc2_latent_proj runs
+in float32 at HIGHEST, and the next block's residual add and the capture read
+float32 before the stream rounds back. SGL_PROBE_MATMUL=highest sets
+jax.default_matmul_precision("highest") over the MoE block and clears it around
+the top-k and gmm calls. JAX_DEFAULT_MATMUL_PRECISION=highest over the whole
+process reached the Pallas gmm on the slice, and Mosaic refused it ("Bad lhs
+type"). A value outside these raises, and the model logs the switches that are
+on.
+
+HybridLinearKVPool forwards set_kv_buffer_legacy, the write NativeAttention
+takes off TPU, so a CPU engine serves a Nemotron 3 stack that holds an
+attention block. The TPU's flash backend never calls it. The Kimi K3 model
+patch carries the same forwarding for its own tree.
+---
+ python/sgl_jax/srt/layers/gate.py           |   4 +
+ python/sgl_jax/srt/layers/moe.py            | 152 ++++++++++++++++++++++++++++----
+ python/sgl_jax/srt/layers/moe_probe.py      | 226 ++++++++++++++++++++++++++++++++++++++++++++++++
+ python/sgl_jax/srt/mem_cache/memory_pool.py |  12 +++
+ python/sgl_jax/srt/models/nemotron_h.py     |  83 ++++++++++++++++--
+ 5 files changed, 453 insertions(+), 24 deletions(-)
+
+diff --git a/python/sgl_jax/srt/layers/gate.py b/python/sgl_jax/srt/layers/gate.py
+index c5cd89e3..c29990ef 100644
+--- a/python/sgl_jax/srt/layers/gate.py
++++ b/python/sgl_jax/srt/layers/gate.py
+@@ -14,10 +14,14 @@ from sgl_jax.srt.eplb.expert_location import (
+ )
+ from sgl_jax.srt.kernels.biased_topk import biased_topk_pallas, topk_pallas
+ from sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas
++from sgl_jax.srt.layers import moe_probe
+ from sgl_jax.srt.utils.profiling_utils import named_scope
+ 
+ 
+ def _topk_kernel_enabled() -> bool:
++    # SGL_PROBE_TOPK=jnp takes the plain JAX top-k a CPU run takes.
++    if moe_probe.probe("TOPK") == "jnp":
++        return False
+     server_args = get_global_server_args()
+     return (
+         server_args is not None and server_args.enable_topk_kernel and server_args.device == "tpu"
+diff --git a/python/sgl_jax/srt/layers/moe.py b/python/sgl_jax/srt/layers/moe.py
+index 09fbd534..7d90cdec 100644
+--- a/python/sgl_jax/srt/layers/moe.py
++++ b/python/sgl_jax/srt/layers/moe.py
+@@ -18,6 +18,7 @@ from sgl_jax.srt.kernels.sparse_core.moe_permute import (
+     sc_dispatch_gather,
+     should_use_sparse_core,
+ )
++from sgl_jax.srt.layers import moe_probe
+ 
+ # Re-export for backward compatibility: external code imports from this module.
+ from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
+@@ -512,6 +513,8 @@ class EPMoE(nnx.Module):
+         out_sharding: jax.sharding.NamedSharding | None = None,
+     ) -> jax.Array:
+         if self.replicate_experts:
++            if moe_probe.probe("MOE"):
++                raise ValueError("SGL_PROBE_MOE runs the expert-parallel EPMoE only")
+             if out_sharding is None:
+                 out_sharding = jax.sharding.NamedSharding(
+                     self.mesh,
+@@ -562,8 +565,12 @@ class EPMoE(nnx.Module):
+                 scale_name="wo_scale",
+             )
+ 
++            # SGL_PROBE_MOE=dense swaps the body for one without the dispatch.
++            body = (
++                self._probe_dense_forward if moe_probe.probe("MOE") == "dense" else self._forward
++            )
+             result = shard_map(
+-                partial(self._forward, scatter_on_tensor=scatter_on_tensor),
++                partial(body, scatter_on_tensor=scatter_on_tensor),
+                 mesh=self.moe_mesh,
+                 in_specs=(
+                     P(None),
+@@ -701,22 +708,24 @@ class EPMoE(nnx.Module):
+                 flat_experts < group_offset + self.experts_per_device
+             )
+ 
+-        intermediate_output = self._gmm_compute(
+-            inputs_2d,
+-            token_indices,
+-            group_sizes,
+-            w0_weights,
+-            w1_weights,
+-            wo_weights,
+-            group_offset,
+-            w0_kernel_scale,
+-            w1_kernel_scale,
+-            wo_kernel_scale,
+-            w0_kernel_bias,
+-            w1_kernel_bias,
+-            wo_kernel_bias,
+-            local_range=local_range,
+-        )
++        # SGL_PROBE_MATMUL=highest stops at the gmm kernels.
++        with moe_probe.kernel_precision():
++            intermediate_output = self._gmm_compute(
++                inputs_2d,
++                token_indices,
++                group_sizes,
++                w0_weights,
++                w1_weights,
++                wo_weights,
++                group_offset,
++                w0_kernel_scale,
++                w1_kernel_scale,
++                wo_kernel_scale,
++                w0_kernel_bias,
++                w1_kernel_bias,
++                wo_kernel_bias,
++                local_range=local_range,
++            )
+ 
+         output = self._unpermute(
+             intermediate_output,
+@@ -736,8 +745,63 @@ class EPMoE(nnx.Module):
+         if self.ep_size > 1:
+             output = self._combine(output)
+ 
++        return self._probe_out(output)
++
++    def _probe_out(self, output):
++        """The shard_map's result: `self.dtype`, or float32 under `SGL_PROBE_MOE_OUT=f32`
++        when the sum is float32 already."""
++        if moe_probe.probe("MOE_OUT") == "f32" and output.dtype == jnp.float32:
++            return output
+         return output.astype(self.dtype)
+ 
++    def _probe_act(self, h0, h1):
++        """The expert's activation for `SGL_PROBE_MOE=dense`, on float32 inputs."""
++        out = moe_probe.expert_activation(self.activation, h0)
++        return out if h1 is None else out * h1
++
++    def _probe_dense_forward(
++        self,
++        hidden_states,
++        topk_weights,
++        topk_ids,
++        w0_weights,
++        w1_weights,
++        wo_weights,
++        w0_kernel_scale=None,
++        w1_kernel_scale=None,
++        wo_kernel_scale=None,
++        w0_kernel_bias=None,
++        w1_kernel_bias=None,
++        wo_kernel_bias=None,
++        *,
++        scatter_on_tensor: bool = False,
++    ):
++        """`SGL_PROBE_MOE=dense`: `_forward` with the permute, gmm and unpermute replaced by
++        `moe_probe.dense_experts`. The reduce over the tensor and expert axes is `_forward`'s,
++        on a float32 sum."""
++        scales = (w0_kernel_scale, w1_kernel_scale, wo_kernel_scale)
++        if any(s is not None for s in scales) or self.activation_quantized_dtype is not None:
++            raise ValueError("SGL_PROBE_MOE runs unquantized experts only")
++        first = jax.lax.axis_index("expert") * self.experts_per_device
++        output = moe_probe.dense_experts(
++            hidden_states,
++            topk_weights,
++            topk_ids,
++            w0_weights,
++            w1_weights if self.gated else None,
++            wo_weights,
++            first,
++            self._probe_act,
++        )
++        if self.tp_size > 1:
++            if scatter_on_tensor:
++                output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=0, tiled=True)
++            else:
++                output = jax.lax.psum(output, "tensor")
++        if self.ep_size > 1:
++            output = self._combine(output)
++        return self._probe_out(output)
++
+     def _gmm_compute(
+         self,
+         inputs_2d,
+@@ -784,6 +848,20 @@ class EPMoE(nnx.Module):
+         # tile, hit a kernel auto-tiler edge case at decode bs=8 / top_k=8
+         # (m=64 -> 128) and triggered an on-device SparseCore halt.
+         group_sizes = group_sizes.astype(jnp.int32)
++        probe_gmm = moe_probe.probe("GMM")
++        if probe_gmm:
++            return self._probe_gmm_compute(
++                probe_gmm,
++                inputs_2d if pre_gather_q is None and local_range is None else None,
++                x,
++                token_indices,
++                group_sizes,
++                w0_kernel,
++                w1_kernel,
++                wo_kernel,
++                group_offset,
++                (w0_kernel_scale, w1_kernel_scale, wo_kernel_scale),
++            )
+         act_q_dtype = self.activation_quantized_dtype
+ 
+         gmm_kwargs = dict(
+@@ -842,6 +920,46 @@ class EPMoE(nnx.Module):
+             **gmm_kwargs,
+         )
+ 
++    def _probe_gmm_compute(
++        self,
++        mode,
++        inputs_2d,
++        x,
++        token_indices,
++        group_sizes,
++        w0_kernel,
++        w1_kernel,
++        wo_kernel,
++        group_offset,
++        scales,
++    ):
++        """`SGL_PROBE_GMM`: the three grouped matmuls as masked dense dots.
++
++        `xla` keeps `gmm`'s dtypes: the up projection hands back `self.dtype`
++        and the down projection float32 under `reduce_in_float32`. `xla32`
++        gathers the latent at its own dtype and keeps the up projection and
++        the activation in float32 into the down projection.
++        """
++        if any(s is not None for s in scales) or self.activation_quantized_dtype is not None:
++            raise ValueError("SGL_PROBE_GMM runs unquantized experts only")
++        if mode == "xla32" and inputs_2d is not None:
++            x = inputs_2d[token_indices]
++        mid = jnp.float32 if mode == "xla32" else self.dtype
++        layer_w0 = moe_probe.dense_gmm(x, w0_kernel, group_sizes, group_offset, mid)
++        if self.activation == "silu":
++            layer_act = jax.nn.silu(layer_w0)
++        elif self.activation == "gelu":
++            layer_act = jax.nn.gelu(layer_w0)
++        elif self.activation == "relu2":
++            layer_act = jnp.square(jax.nn.relu(layer_w0))
++        else:
++            raise ValueError(f"Unsupported activation function {self.activation}")
++        if self.gated:
++            layer_w1 = moe_probe.dense_gmm(x, w1_kernel, group_sizes, group_offset, mid)
++            layer_act = jnp.multiply(layer_act, layer_w1)
++        out_dtype = jnp.float32 if self.reduce_in_float32 else self.dtype
++        return moe_probe.dense_gmm(layer_act, wo_kernel, group_sizes, group_offset, out_dtype)
++
+     def _dispatch(self, group_sizes, expert_shard_id):
+         if self.ep_size <= 1:
+             return jnp.array(0, dtype=jnp.int32)
+diff --git a/python/sgl_jax/srt/layers/moe_probe.py b/python/sgl_jax/srt/layers/moe_probe.py
+new file mode 100644
+index 00000000..9b6f478b
+--- /dev/null
++++ b/python/sgl_jax/srt/layers/moe_probe.py
+@@ -0,0 +1,226 @@
++"""Per-run switches that swap one MoE piece for a reference-precision version.
++
++Each switch is an environment variable, read when the model traces, so one
++engine start runs one setting on every host. All are off by default, and a
++run with none set traces the same program as a tree without this file.
++
++    SGL_PROBE_TOPK=jnp        routing top-k in plain JAX instead of the Pallas
++                              top-k kernels `layers/gate.py` runs on a TPU
++    SGL_PROBE_GMM=xla         the routed experts' grouped matmuls as one dense
++                              dot per local expert, masked to its rows, float32
++                              accumulation, the output dtypes `gmm` returns
++    SGL_PROBE_GMM=xla32       the same, and the up projection's output and the
++                              activation stay float32 into the down projection
++    SGL_PROBE_ROUTER=f32highest
++                              the router's dot as an explicit float32
++                              dot_general at HIGHEST precision, and the sigmoid
++                              written out as 1 / (1 + exp(-x))
++    SGL_PROBE_LATENT=f32      fc1_latent_proj and fc2_latent_proj in float32 at
++                              HIGHEST precision, so the float32 expert output
++                              isn't rounded to BF16 inside fc2's dot
++    SGL_PROBE_MOE=dense       the routed experts without EPMoE's dispatch: no
++                              sort by expert, no group sizes, no padding, no
++                              gmm and no unpermute. Each shard runs every one of
++                              its local experts over every token in float32 at
++                              HIGHEST, scales each token's row by that token's
++                              float32 top-k weight for the expert (zero when the
++                              token didn't pick it), and sums. The shards add
++                              in float32 as before. `dense_experts` below.
++    SGL_PROBE_SHARED=f32      the shared expert in float32 at HIGHEST, and its
++                              add to the routed output in float32
++    SGL_PROBE_MOE_OUT=f32     the MoE block's output stays float32: EPMoE's
++                              float32 sum isn't rounded, fc2_latent_proj runs in
++                              float32 at HIGHEST, the shared expert adds in
++                              float32, and the next residual add and the capture
++                              read float32. The stream rounds to the model dtype
++                              after the capture, inside the next block.
++    SGL_PROBE_MATMUL=highest  every dot in the MoE block that leaves its
++                              precision open runs at HIGHEST
++                              (`jax.default_matmul_precision`), except inside
++                              the Pallas kernels: `kernel_precision()` clears
++                              the setting around the top-k and gmm calls, since
++                              Mosaic refuses a BF16 gmm at HIGHEST ("Bad lhs
++                              type"). It doesn't reach the Mamba-2 or attention
++                              blocks.
++
++A value other than these raises, so a typo can't run the default path under a
++probe's name. `active()` names the switches that are on; the model logs it once
++per build.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import os
++
++import jax
++import jax.numpy as jnp
++
++CHOICES = {
++    "TOPK": ("jnp",),
++    "GMM": ("xla", "xla32"),
++    "ROUTER": ("f32highest",),
++    "LATENT": ("f32",),
++    "MOE": ("dense",),
++    "SHARED": ("f32",),
++    "MOE_OUT": ("f32",),
++    "MATMUL": ("highest",),
++}
++
++
++def probe(name: str) -> str:
++    """The value of `SGL_PROBE_<name>`, or "" when it's unset or empty."""
++    value = os.environ.get(f"SGL_PROBE_{name}", "").strip().lower()
++    if value and value not in CHOICES[name]:
++        raise ValueError(
++            f"SGL_PROBE_{name}={value!r}; it takes one of {list(CHOICES[name])} or nothing"
++        )
++    return value
++
++
++def active() -> dict:
++    """Every switch that's on, name to value."""
++    return {name: probe(name) for name in CHOICES if probe(name)}
++
++
++def block_precision():
++    """The MoE block's context: HIGHEST under `SGL_PROBE_MATMUL=highest`, else nothing."""
++    if probe("MATMUL") == "highest":
++        return jax.default_matmul_precision("highest")
++    return contextlib.nullcontext()
++
++
++def kernel_precision():
++    """Around a Pallas kernel call: clear `SGL_PROBE_MATMUL`'s setting, else nothing."""
++    if probe("MATMUL") == "highest":
++        return jax.default_matmul_precision(None)
++    return contextlib.nullcontext()
++
++
++def expert_activation(name: str, x: jax.Array) -> jax.Array:
++    """EPMoE's activation by its name."""
++    if name == "silu":
++        return jax.nn.silu(x)
++    if name == "gelu":
++        return jax.nn.gelu(x)
++    if name == "relu2":
++        return jnp.square(jax.nn.relu(x))
++    raise ValueError(f"Unsupported activation function {name}")
++
++
++def dense_experts(
++    x: jax.Array,
++    topk_weights: jax.Array,
++    topk_ids: jax.Array,
++    w0: jax.Array,
++    w1: jax.Array | None,
++    wo: jax.Array,
++    first_expert: jax.Array,
++    act,
++) -> jax.Array:
++    """`SGL_PROBE_MOE=dense` on one shard: the routed experts without a dispatch.
++
++    `x` is `[t, k]`, every token of the pass. `topk_weights` and `topk_ids` are
++    `[t, top_k]`. `w0` and `w1` are `[local, k, n]` and `wo` is `[local, n, k]`:
++    the shard's experts, from global id `first_expert` on, and the shard's
++    slice of the intermediate axis. `act(h0, h1)` is the expert's activation,
++    with `h1` None for an ungated expert.
++
++    For each local expert `e` this computes `y = act(x @ w0[e]) @ wo[e]` for
++    every token, and adds `c[t] * y[t]`, where `c[t]` is the sum of token t's
++    top-k weights whose id is `first_expert + e`: its weight for `e`, or zero.
++    Summed over every expert of every shard, row t is
++    `sum_j topk_weights[t, j] * expert_{topk_ids[t, j]}(x[t])`, which is what
++    gathering each token's top-k experts and running them gives. Every dot
++    takes float32 operands at HIGHEST, and the weights stay float32. Memory is
++    one `[t, n]` intermediate and one `[t, k]` accumulator in float32 at a
++    time, whatever top_k is. The shard's result is a partial sum over its
++    experts and its slice of `n`; the caller adds the shards.
++    """
++    xf = x.astype(jnp.float32)
++    weights = topk_weights.astype(jnp.float32)
++    ids = topk_ids.astype(jnp.int32)
++    first = jnp.asarray(first_expert, jnp.int32).reshape(())
++
++    def dot(a, b):
++        return jax.lax.dot_general(
++            a,
++            b.astype(jnp.float32),
++            (((1,), (0,)), ((), ())),
++            precision=jax.lax.Precision.HIGHEST,
++            preferred_element_type=jnp.float32,
++        )
++
++    def body(e, acc):
++        coef = jnp.sum(jnp.where(ids == first + e, weights, 0.0), axis=-1)
++        h0 = dot(xf, jax.lax.dynamic_index_in_dim(w0, e, axis=0, keepdims=False))
++        h1 = None
++        if w1 is not None:
++            h1 = dot(xf, jax.lax.dynamic_index_in_dim(w1, e, axis=0, keepdims=False))
++        y = dot(act(h0, h1), jax.lax.dynamic_index_in_dim(wo, e, axis=0, keepdims=False))
++        return acc + coef[:, None] * y
++
++    acc = jnp.zeros((x.shape[0], wo.shape[-1]), jnp.float32)
++    return jax.lax.fori_loop(0, w0.shape[0], body, acc)
++
++
++def dense_gmm(
++    lhs: jax.Array,
++    rhs: jax.Array,
++    group_sizes: jax.Array,
++    group_offset: jax.Array | None,
++    out_dtype,
++) -> jax.Array:
++    """What `gmm` computes, as one masked dense dot per local expert.
++
++    `lhs` is `[m, k]` with its rows sorted by expert, `group_sizes` counts the
++    rows of every expert, and `rhs` is `[local, k, n]`: the experts from
++    `group_offset` on. Row `r` of the output is `lhs[r] @ rhs[e]` for the local
++    expert `e` that owns it and zero for a row no local expert owns, which is
++    what `gmm` with `zero_initialize=True` returns. Each dot takes its operands
++    at their own dtypes, promoted to a common one, at HIGHEST precision, and
++    accumulates in float32. BF16 operands multiply to exact float32 products.
++    """
++    m = lhs.shape[0]
++    local = rhs.shape[0]
++    ends = jnp.cumsum(group_sizes.astype(jnp.int32))
++    starts = ends - group_sizes.astype(jnp.int32)
++    offset = jnp.asarray(0 if group_offset is None else group_offset, jnp.int32).reshape(())
++    starts = jax.lax.dynamic_slice_in_dim(starts, offset, local)
++    ends = jax.lax.dynamic_slice_in_dim(ends, offset, local)
++    common = jnp.promote_types(lhs.dtype, rhs.dtype)
++    x = lhs.astype(common)
++    rows = jnp.arange(m, dtype=jnp.int32)[:, None]
++
++    def body(e, acc):
++        w = jax.lax.dynamic_index_in_dim(rhs, e, axis=0, keepdims=False).astype(common)
++        y = jax.lax.dot_general(
++            x,
++            w,
++            (((1,), (0,)), ((), ())),
++            precision=jax.lax.Precision.HIGHEST,
++            preferred_element_type=jnp.float32,
++        )
++        mine = (rows >= starts[e]) & (rows < ends[e])
++        return acc + jnp.where(mine, y, 0.0)
++
++    acc = jnp.zeros((m, rhs.shape[-1]), jnp.float32)
++    acc = jax.lax.fori_loop(0, local, body, acc)
++    return acc.astype(out_dtype)
++
++
++def highest_dot(x: jax.Array, w: jax.Array) -> jax.Array:
++    """`x @ w` over x's last axis, both operands float32, HIGHEST, float32 out."""
++    return jax.lax.dot_general(
++        x.astype(jnp.float32),
++        w.astype(jnp.float32),
++        (((x.ndim - 1,), (0,)), ((), ())),
++        precision=jax.lax.Precision.HIGHEST,
++        preferred_element_type=jnp.float32,
++    )
++
++
++def exact_sigmoid(x: jax.Array) -> jax.Array:
++    """The logistic function written out, in float32."""
++    x = x.astype(jnp.float32)
++    return 1.0 / (1.0 + jnp.exp(-x))
+diff --git a/python/sgl_jax/srt/mem_cache/memory_pool.py b/python/sgl_jax/srt/mem_cache/memory_pool.py
+index 4569dbbc..6320cc21 100644
+--- a/python/sgl_jax/srt/mem_cache/memory_pool.py
++++ b/python/sgl_jax/srt/mem_cache/memory_pool.py
+@@ -1658,6 +1658,18 @@ class HybridLinearKVPool(KVCache):
+             self._to_physical(layer_id), loc, cache_k, cache_v, is_decode
+         )
+ 
++    def set_kv_buffer_legacy(
++        self,
++        layer_id: int,
++        loc: jax.Array,
++        cache_k: jax.Array,
++        cache_v: jax.Array,
++    ) -> jax.Array:
++        """The write NativeAttention takes off TPU, on the inner pool's own layer index."""
++        return self.full_kv_pool.set_kv_buffer_legacy(
++            self._to_physical(layer_id) + self.full_kv_pool.start_layer, loc, cache_k, cache_v
++        )
++
+     def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
+         """Accept COMPACTED list (length L_full, in full_attention_layer_ids order).
+ 
+diff --git a/python/sgl_jax/srt/models/nemotron_h.py b/python/sgl_jax/srt/models/nemotron_h.py
+index 7055db89..a2c47d63 100644
+--- a/python/sgl_jax/srt/models/nemotron_h.py
++++ b/python/sgl_jax/srt/models/nemotron_h.py
+@@ -54,6 +54,7 @@ from sgl_jax.srt.layers.gate import GateLogit, TopK
+ from sgl_jax.srt.layers.layernorm import RMSNorm
+ from sgl_jax.srt.layers.linear import LinearBase
+ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
++from sgl_jax.srt.layers import moe_probe
+ from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
+ from sgl_jax.srt.layers.radix_attention import RadixAttention
+ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+@@ -503,14 +504,35 @@ class NemotronHLatentMoE(nnx.Module):
+ 
+     @named_scope
+     def __call__(self, hidden_states: jax.Array, dispatch_info=None) -> jax.Array:
+-        router_logits = self.moe_gate(hidden_states)
+-        correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
+-        topk_weights, topk_ids = self.topk(
+-            router_logits, correction_bias, dispatch_info=dispatch_info
++        # SGL_PROBE_MATMUL=highest covers the block, and stops at its Pallas kernels.
++        with moe_probe.block_precision():
++            return self._forward(hidden_states, dispatch_info)
++
++    def _forward(self, hidden_states: jax.Array, dispatch_info=None) -> jax.Array:
++        # `layers/moe_probe.py`: per-run switches, all off by default.
++        probe_router = moe_probe.probe("ROUTER")
++        probe_latent = moe_probe.probe("LATENT") and type(self.fc1_latent_proj) is LinearBase
++        probe_out = moe_probe.probe("MOE_OUT") and type(self.fc2_latent_proj) in (
++            LinearBase,
++            type(None),
+         )
++        if probe_router:
++            router_logits = moe_probe.exact_sigmoid(
++                moe_probe.highest_dot(hidden_states, self.moe_gate.kernel.value)
++            )
++        else:
++            router_logits = self.moe_gate(hidden_states)
++        correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
++        with moe_probe.kernel_precision():
++            topk_weights, topk_ids = self.topk(
++                router_logits, correction_bias, dispatch_info=dispatch_info
++            )
+ 
+         latent = hidden_states
+-        if self.use_latent:
++        if self.use_latent and probe_latent:
++            latent = moe_probe.highest_dot(hidden_states, self.fc1_latent_proj.weight.value)
++            latent = jax.sharding.reshard(latent, NamedSharding(self.mesh, P("data", "tensor")))
++        elif self.use_latent:
+             latent, _ = self.fc1_latent_proj(hidden_states)
+         routed = self.experts(latent, topk_weights, topk_ids)
+         if self.use_latent:
+@@ -518,12 +540,50 @@ class NemotronHLatentMoE(nnx.Module):
+             # is row parallel. A `QuantizedLinear`, which a quantization config
+             # swaps in, takes its input only on the layout it contracts over.
+             routed = jax.sharding.reshard(routed, NamedSharding(self.mesh, P("data", "tensor")))
+-            routed = row_parallel(self.fc2_latent_proj, routed)
++            if probe_latent or probe_out:
++                routed = jax.lax.dot_general(
++                    routed.astype(jnp.float32),
++                    self.fc2_latent_proj.weight.value.astype(jnp.float32),
++                    (((routed.ndim - 1,), (0,)), ((), ())),
++                    precision=jax.lax.Precision.HIGHEST,
++                    preferred_element_type=jnp.float32,
++                    out_sharding=NamedSharding(self.mesh, P("data", None)),
++                )
++                if not probe_out:
++                    routed = routed.astype(self.fc2_latent_proj.weight.value.dtype)
++            else:
++                routed = row_parallel(self.fc2_latent_proj, routed)
+ 
+         if self.shared_experts is not None:
+-            routed = routed + self.shared_experts(hidden_states)
++            shared_f32 = type(self.shared_experts.up_proj) is LinearBase
++            if moe_probe.probe("SHARED") == "f32" and shared_f32:
++                out_dtype = routed.dtype
++                routed = routed.astype(jnp.float32) + self._probe_shared_f32(hidden_states)
++                if not probe_out:
++                    routed = routed.astype(out_dtype)
++            else:
++                routed = routed + self.shared_experts(hidden_states)
+         return routed, topk_ids
+ 
++    def _probe_shared_f32(self, hidden_states: jax.Array) -> jax.Array:
++        """`SGL_PROBE_SHARED=f32`: the shared expert in float32 at HIGHEST, float32 out."""
++        mlp = self.shared_experts
++        up = moe_probe.highest_dot(hidden_states, mlp.up_proj.weight.value)
++        up = jax.sharding.reshard(up, NamedSharding(self.mesh, P("data", "tensor")))
++        if mlp.up_proj.bias is not None:
++            up = up + mlp.up_proj.bias.value.astype(jnp.float32)
++        out = jax.lax.dot_general(
++            mlp.activation(up),
++            mlp.down_proj.weight.value.astype(jnp.float32),
++            (((up.ndim - 1,), (0,)), ((), ())),
++            precision=jax.lax.Precision.HIGHEST,
++            preferred_element_type=jnp.float32,
++            out_sharding=NamedSharding(self.mesh, P("data", None)),
++        )
++        if mlp.down_proj.bias is not None:
++            out = out + mlp.down_proj.bias.value.astype(jnp.float32)
++        return out
++
+ 
+ class NemotronHBlock(nnx.Module):
+     """One norm, one mixer, one residual add.
+@@ -541,6 +601,7 @@ class NemotronHBlock(nnx.Module):
+         dtype: jnp.dtype = jnp.bfloat16,
+     ):
+         self.layer_id = layer_id
++        self.dtype = dtype
+         self.block_type = config.layers_block_type[layer_id]
+         self.norm = RMSNorm(
+             config.hidden_size,
+@@ -576,6 +637,9 @@ class NemotronHBlock(nnx.Module):
+     ):
+         if residual is not None:
+             hidden_states += residual
++            if moe_probe.probe("MOE_OUT"):
++                # The capture read the float32 sum; the stream rounds here.
++                hidden_states = hidden_states.astype(self.dtype)
+         residual = hidden_states
+         hidden_states = self.norm(hidden_states)
+ 
+@@ -671,6 +735,8 @@ class NemotronHModel(nnx.Module):
+ 
+         if residual is not None:
+             hidden_states += residual
++            if moe_probe.probe("MOE_OUT"):
++                hidden_states = hidden_states.astype(self.embed_tokens.dtype)
+         hidden_states = self.norm(hidden_states)
+         return (
+             hidden_states,
+@@ -737,6 +803,9 @@ class NemotronHForCausalLM(nnx.Module):
+         self.config = config
+         self.mesh = mesh
+         self.dtype = dtype
++        probes = moe_probe.active()
++        if probes:
++            logger.warning("nemotron_h probe switches on: %s", probes)
+         self.model = NemotronHModel(config, mesh=mesh, dtype=dtype)
+         if not getattr(config, "tie_word_embeddings", False):
+             self.lm_head = ParallelLMHead(

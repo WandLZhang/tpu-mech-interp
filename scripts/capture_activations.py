@@ -543,8 +543,29 @@ def engine_settings(batch_size: int = 8, token_padding: int = 1024, **kwargs) ->
         "precompile_bs_paddings": [batch_size],
         "precompile_token_paddings": [token_padding],
     }
+    settings.update(multinode_settings())
     settings.update(kwargs)
     return settings
+
+
+def multinode_settings(env: dict | None = None) -> dict:
+    """Engine keywords for one host of a multi-host slice, read from the environment.
+
+    `scripts/multihost_exec.sh` runs the same command on every host and sets `SGL_NNODES`,
+    `SGL_NODE_RANK` and `SGL_DIST_INIT_ADDR` (host 0's internal address and a port) on each. Rank 0
+    serves the requests; every other rank's Engine starts its scheduler and blocks there, which
+    is how sglang-jax runs a non-zero rank. With `SGL_NNODES` unset or 1 this returns nothing, so a
+    single-host run is unchanged.
+    """
+    env = os.environ if env is None else env
+    nnodes = int(env.get("SGL_NNODES", "1") or 1)
+    if nnodes <= 1:
+        return {}
+    rank = int(env["SGL_NODE_RANK"])
+    addr = env["SGL_DIST_INIT_ADDR"]
+    if not 0 <= rank < nnodes:
+        raise ValueError(f"SGL_NODE_RANK={rank} is outside 0..{nnodes - 1}")
+    return {"nnodes": nnodes, "node_rank": rank, "dist_init_addr": addr}
 
 
 def parse_engine_args(items: Iterable[str], reserved: dict | None = None) -> dict:
@@ -553,6 +574,10 @@ def parse_engine_args(items: Iterable[str], reserved: dict | None = None) -> dic
     VALUE goes through JSON, then `PYTHON_LITERALS`, and falls back to a string. `reserved` maps a
     key the script sets itself to what to do instead, and such a key raises ValueError before
     anything loads. So does an item with no `=`, which would hand the Engine an empty string.
+
+    `json_model_override_args` stays a JSON string. `ServerArgs` types it as one and runs
+    `json.loads` on it, so the dict JSON decoding makes of `{"num_hidden_layers": 4}` would raise
+    TypeError inside the engine.
     """
     reserved = RESERVED_ENGINE_ARGS if reserved is None else reserved
     extra = {}
@@ -567,6 +592,8 @@ def parse_engine_args(items: Iterable[str], reserved: dict | None = None) -> dic
             extra[key] = json.loads(value)
         except json.JSONDecodeError:
             extra[key] = PYTHON_LITERALS.get(value.strip(), value)
+        if key == "json_model_override_args" and isinstance(extra[key], dict):
+            extra[key] = json.dumps(extra[key], sort_keys=True)
     return extra
 
 
@@ -1281,7 +1308,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if payload_log_requested(args.log_payloads):
         enable_payload_log()
 
-    prompts = read_prompts(args.prompts, args.text_field)
+    # A non-zero rank of a multi-host slice only starts its engine and blocks in the scheduler, so
+    # only rank 0 reads the prompts; the file lives on host 0 alone.
+    if int(os.environ.get("SGL_NODE_RANK", "0") or 0) > 0:
+        prompts = []
+    else:
+        prompts = read_prompts(args.prompts, args.text_field)
     print(f"{len(prompts)} prompt(s) from {args.prompts}")
     cfg = CaptureConfig(
         model=args.model_path,

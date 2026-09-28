@@ -33,15 +33,15 @@ Greedy decoding turns on near-ties, so a small push anywhere can change a few to
 arm steers a random unit direction, seeded by `--seed`, at the same alphas, with the feature's
 probe, threshold and scale.
 
-A count of changed prompts can't tell a coherent word swap from broken text. On Gemma 4 26B-A4B,
-latent 7987 changed 4 of 4 prompts at fractions 0.1, 0.5 and 1.0, and so did the random direction.
-At 0.1 the feature swapped a word or two and kept the text coherent, while the random direction
-fell into "to to to". So the served model judges every changed reply. It runs unsteered and gets
-the prompt and the reply as one user turn that asks for one word, `coherent` or `broken`. The
-engine returns the log probability of each label's first token at the first position of the
-answer, and the label with the higher one is the answer. No text gets parsed. The judge's
-requests go in one batch, and two controls of known label lead it: `JUDGE_CONTROLS` holds a
-coherent reply and a broken one. The exit code reads:
+A count of changed prompts can't tell a coherent word swap from broken text. In a run of the
+README's chain on Gemma 4 26B-A4B before the layer filter, latent 7987 changed 4 of 4 prompts at
+fractions 0.1, 0.5 and 1.0, and so did the random direction. At 0.1 the feature swapped a word or
+two and kept the text coherent, while the random direction fell into "to to to". So the served
+model judges every changed reply. It runs unsteered and gets the prompt and the reply as one user
+turn that asks for one word, `coherent` or `broken`. The engine returns the log probability of
+each label's first token at the first position of the answer, and the label with the higher one
+is the answer. No text gets parsed. The judge's requests go in one batch, and two controls of
+known label lead it: `JUDGE_CONTROLS` holds a coherent reply and a broken one. The exit code reads:
 
 - 2 when the judge mislabels a control or gives no label, for example when the engine rates
   neither label's token. The judge's answers to the controls print, and the counts don't set the
@@ -53,7 +53,8 @@ argparse also exits 2, on a bad command line, before the engine loads.
 
 The judge doesn't use the engine's grammar path. At eb061d8 the grammar cache hands one llguidance
 matcher to every request in a batch that asks for the same grammar. On the CPU rig a batch of 18
-answers under `coherent|broken` came back as fragments such as "co", "herent" and "br".
+answers under `coherent|broken` came back as fragments such as "co", "herent" and "br". Upstream
+merged a fix in sgl-project/sglang-jax#1710 on 2026-09-28, after eb061d8.
 
 `--steering-layer` is one less than the capture slot the SAE was trained on: capture reads the
 stream entering a block and the hook writes the stream leaving the one you name. `from_sae.py`

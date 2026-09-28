@@ -28,6 +28,10 @@
 #   TP        tensor-parallel size; the chip count (default 8)
 #   MEM_FRAC  mem_fraction_static (default 0.6); 0.8 leaves a large model room for its KV pool
 #   PROMPTS   prompts to build (default 400)
+#   MODEL_DIR read the weights from this directory, such as a gcsfuse mount, and skip the fetch
+#   ENGINE_WRAP  command that runs each engine step, such as "bash scripts/multihost_exec.sh"
+#             on host 0 of a multi-host slice; peak HBM then reads host 0's chips
+#   ENGINE_ARGS  extra KEY=VALUE engine keywords, space-separated, for both engine runs
 set -uo pipefail
 set -m   # background jobs keep SIGINT, so peak_hbm.py stops cleanly and writes its result
 
@@ -40,6 +44,9 @@ SLOT=$2
 OUT=$3
 TP=${TP:-8}
 MEM_FRAC=${MEM_FRAC:-0.6}
+read -r -a WRAP <<< "${ENGINE_WRAP:-}"
+EXTRA=()
+for kv in ${ENGINE_ARGS:-}; do EXTRA+=(--engine-arg "$kv"); done
 PROMPTS=${PROMPTS:-400}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CAPS=/dev/shm/caps-$(basename "$OUT")
@@ -135,9 +142,14 @@ keep_results() { tr '\r' '\n' | grep '^RESULT' | tee -a "$OUT/results.txt"; }
 # to 4 hours and then writes over hbm_<stage>.json. Stop it when the script exits.
 trap '[ -n "${HBM_PID:-}" ] && kill -INT "$HBM_PID" 2>/dev/null' EXIT
 
-log "FETCH $REPO"
-python3 -u "$HERE/fetch_weights.py" "$REPO" | tee "$OUT/fetch.log"
-SNAP=$(awk '/^PATH /{print $2}' "$OUT/fetch.log")
+log "FETCH ${MODEL_DIR:-$REPO}"
+if [ -n "${MODEL_DIR:-}" ]; then
+  echo "MODEL_DIR is set, so the engine reads $MODEL_DIR and nothing is fetched"
+  SNAP=$MODEL_DIR
+else
+  python3 -u "$HERE/fetch_weights.py" "$REPO" | tee "$OUT/fetch.log"
+  SNAP=$(awk '/^PATH /{print $2}' "$OUT/fetch.log")
+fi
 [ -d "$SNAP" ] || { log "fetch gave no snapshot directory"; exit 1; }
 
 log "CORPUS"
@@ -150,8 +162,8 @@ export HF_HUB_OFFLINE=1   # the engine reads the local snapshot from here on
 free_tpu
 log "CAPTURE OFF, tp=$TP mem_frac=$MEM_FRAC"
 hbm_start off
-python3 -u "$HERE/serve_throughput.py" --model-path "$SNAP" --prompts "$OUT/prompts.jsonl" \
-  --tp-size "$TP" --engine-arg "mem_fraction_static=$MEM_FRAC" >"$OUT/capture_off.out" 2>&1
+"${WRAP[@]}" python3 -u "$HERE/serve_throughput.py" --model-path "$SNAP" --prompts "$OUT/prompts.jsonl" \
+  --tp-size "$TP" --engine-arg "mem_fraction_static=$MEM_FRAC" "${EXTRA[@]}" >"$OUT/capture_off.out" 2>&1
 OFF_RC=$?
 echo "CAPTURE_OFF_RC=$OFF_RC"
 ((OFF_RC == 0)) || RC=1
@@ -167,10 +179,10 @@ free_tpu
 # engine copies the one slot to the host, and wire_bytes_per_token reads d_model x 2 at bf16.
 log "CAPTURE ON, slot $SLOT"
 hbm_start on
-python3 -u "$HERE/capture_activations.py" --model-path "$SNAP" --prompts "$OUT/prompts.jsonl" \
+"${WRAP[@]}" python3 -u "$HERE/capture_activations.py" --model-path "$SNAP" --prompts "$OUT/prompts.jsonl" \
   --out "$CAPS" --layers "$SLOT" --tp-size "$TP" --batch-size 8 \
   --shard-bytes 4294967296 --dtype float32 --engine-arg "mem_fraction_static=$MEM_FRAC" \
-  >"$OUT/capture_on.out" 2>&1
+  "${EXTRA[@]}" >"$OUT/capture_on.out" 2>&1
 ON_RC=$?
 echo "CAPTURE_ON_RC=$ON_RC"
 ((ON_RC == 0)) || RC=1

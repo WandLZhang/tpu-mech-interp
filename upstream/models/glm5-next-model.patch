@@ -1,0 +1,1481 @@
+Subject: [PATCH] feat(glm5_next): add zai-org/GLM-5.3-Flash
+
+GLM-5.3-Flash is 45 layers, 34 Kimi Delta Attention and 11 sparse MLA with no
+position encoding, hidden 4096, a 4-wide mHC residual, 288 routed experts
+top-8 plus one shared, 320B parameters and 18B active. The checkpoint names
+Glm5NextForConditionalGeneration with model_type glm5_next and ships the
+attention, KDA, router and mHC weights in BF16 and the MLA projections, the
+dense MLPs and every expert in FP8 E4M3 with a weight_scale_inv per 128 x 128
+tile. This serves the text backbone. The vision tower and the MTP layer load
+nothing.
+
+The port follows transformers 5.17 models/glm5_next/modeling_glm5_next.py.
+
+models/glm5_next.py:
+
+- mHC: each sublayer collapses the four copies with its own pre mix, and post
+  and a Sinkhorn-normalized comb expand its output and mix the residual in.
+  The final hidden state is the mean of the copies, then the norm. Plain XLA,
+  since kernels/mhc/tune.py schedules v6e alone.
+- KDA: the per-channel decay with the lower bound,
+  lower_bound * sigmoid(exp(A_log) * (f + dt_bias)), the width-4 causal
+  convolutions on q, k and v, and the sigmoid-gated RMS norm on the output.
+  The recurrence runs as the chunked form in plain XLA, 64 tokens a chunk,
+  the grid cut at every request start, one lax.scan over the chunks.
+- Sparse MLA: q and the 512-wide latent from the LoRA projections, the
+  attention absorbed against the cached latent, heads split over the tensor
+  axis in shard_map. The indexer pools each run of index_kpool keys with a
+  per-channel softmax over gate scores plus a learned position term, scores
+  the pools with ReLU dot products weighted per head, keeps the best
+  index_topk // index_kpool of those whose last token the query sees, and
+  adds the open tail. The per-head scores sum across shards with one psum.
+- MoE: sigmoid routing with a selection-only bias, normalized top-k weights
+  times routed_scaling_factor, EPMoE with its gmm step overridden for the
+  SwiGLU clamp (gate from above, up both sides, at swiglu_limit), one shared
+  expert.
+
+State lives in mem_cache/glm5_next_state_pool.py, one row per request slot
+plus a dummy row 0: the FP32 KDA state and convolution window of every KDA
+layer, and per token the latent and the indexer's key and gate score of every
+MLA layer. Every read is masked by the request's prefix length, so a slot
+needs no reset. It holds no prefix, so the model refuses the radix cache.
+model_runner_kv_cache_mixin.py gains the hooks a model class can define:
+build_extra_memory_pools, paged_kv_layers and paged_kv_token_cap, so the
+unused paged KV pool stays small.
+
+configs/glm5_next.py registers Glm5NextServingConfig for glm5_next.
+transformers ships Glm5NextConfig from 5.16 and sglang-jax pins 5.12. The
+class flattens text_config, fills the defaults transformers fills, moves
+quantization_config to checkpoint_quantization_config so the engine doesn't
+serve FP8 linears, and moves layer_types aside from the sliding-window count.
+
+The loader reads the safetensors headers itself, widens FP8 on the host, and
+places every expert stack with make_array_from_callback, so a host
+dequantizes only its own devices' experts. It raises on a checkpoint tensor
+it neither reads nor skips, and on a parameter nothing wrote.
+
+Capture: slot k of layers_to_capture holds the four copies entering layer k,
+flattened to hc_mult * hidden_size values a token, which is transformers'
+hidden_states[k] reshaped [tokens, 4 * 4096].
+---
+ python/sgl_jax/srt/configs/glm5_next.py       |  125 ++
+ python/sgl_jax/srt/hf_transformers_utils.py   |    2 +
+ .../srt/mem_cache/glm5_next_state_pool.py     |   76 ++
+ .../model_runner_kv_cache_mixin.py            |   20 +
+ python/sgl_jax/srt/models/glm5_next.py        | 1129 +++++++++++++++++
+ 5 files changed, 1352 insertions(+)
+ create mode 100644 python/sgl_jax/srt/configs/glm5_next.py
+ create mode 100644 python/sgl_jax/srt/mem_cache/glm5_next_state_pool.py
+ create mode 100644 python/sgl_jax/srt/models/glm5_next.py
+
+diff --git a/python/sgl_jax/srt/configs/glm5_next.py b/python/sgl_jax/srt/configs/glm5_next.py
+new file mode 100644
+index 0000000..70e2bf4
+--- /dev/null
++++ b/python/sgl_jax/srt/configs/glm5_next.py
+@@ -0,0 +1,125 @@
++"""Config for GLM-5.3-Flash (`model_type: glm5_next`).
++
++The published `config.json` nests the language model under `text_config`. `transformers` ships
++`Glm5NextConfig` from 5.16, and `sglang-jax` pins 5.12, so the engine registers this class for
++`glm5_next` instead. It flattens `text_config` onto itself, so `get_hf_text_config` returns the
++config itself and every text field sits at the top, and it fills the defaults
++`Glm5NextTextConfig.__post_init__` fills.
++
++Four fields move so the engine sizes nothing from them:
++
++- `quantization_config` goes to `checkpoint_quantization_config`. The engine reads
++  `quant_method: fp8` as a request to serve FP8 linears, and this model widens its FP8 weights to
++  the serving dtype in its own loader.
++- `layer_types` goes to `attn_layer_types`. `ModelConfig.get_hybrid_layer_counts` reads
++  `layer_types` for sliding-window layers.
++- `num_key_value_heads` is 1 and `head_dim` 256. The model keeps every cache in its own pool, and
++  the runner's paged KV pool, which nothing reads, then costs 1 KiB a token.
++- `vision_config` stays aside. Only the text backbone loads.
++"""
++
++from __future__ import annotations
++
++from transformers import PretrainedConfig
++
++# Glm5NextTextConfig's defaults for fields a config may leave out.
++_DEFAULTS = {
++    "vocab_size": 154880,
++    "hidden_size": 4096,
++    "intermediate_size": 12288,
++    "moe_intermediate_size": 2048,
++    "num_hidden_layers": 45,
++    "num_attention_heads": 64,
++    "n_shared_experts": 1,
++    "n_routed_experts": 288,
++    "routed_scaling_factor": 2.5,
++    "kv_lora_rank": 512,
++    "q_lora_rank": 1536,
++    "qk_rope_head_dim": 0,
++    "v_head_dim": 256,
++    "qk_nope_head_dim": 256,
++    "n_group": 1,
++    "topk_group": 1,
++    "num_experts_per_tok": 8,
++    "norm_topk_prob": True,
++    "hidden_act": "silu",
++    "max_position_embeddings": 1048576,
++    "rms_norm_eps": 1e-5,
++    "index_topk": 2048,
++    "index_head_dim": 128,
++    "index_n_heads": 32,
++    "swiglu_limit": 10.0,
++    "linear_head_dim": 128,
++    "linear_num_heads": 64,
++    "linear_conv_kernel_dim": 4,
++    "linear_lower_bound": -5.0,
++    "hc_mult": 4,
++    "hc_eps": 1e-6,
++    "hc_sinkhorn_iters": 20,
++    "index_kpool": 16,
++    "index_kpool_always_select_tail": True,
++    "tie_word_embeddings": False,
++}
++
++
++class Glm5NextServingConfig(PretrainedConfig):
++    model_type = "glm5_next"
++
++    def __init__(self, text_config=None, vision_config=None, **kwargs):
++        quant = kwargs.pop("quantization_config", None)
++        if quant is not None:
++            kwargs.setdefault("checkpoint_quantization_config", quant)
++        if hasattr(text_config, "to_dict"):
++            text_config = text_config.to_dict()
++        text = dict(text_config or {})
++        text.pop("model_type", None)
++        text.update({k: v for k, v in kwargs.items() if k != "architectures"})
++        for key, value in _DEFAULTS.items():
++            text.setdefault(key, value)
++        linear = text.get("linear_attn_config")
++        if linear is not None:
++            text["linear_head_dim"] = linear.get("head_dim", text["linear_head_dim"])
++            text["linear_num_heads"] = linear.get("num_heads", text["linear_num_heads"])
++            text["linear_conv_kernel_dim"] = linear.get(
++                "short_conv_kernel_size", text["linear_conv_kernel_dim"]
++            )
++            text["linear_lower_bound"] = linear.get("gate_lower_bound", text["linear_lower_bound"])
++            if linear.get("safe_gate", True) and text["linear_lower_bound"] is None:
++                text["linear_lower_bound"] = -5.0
++        n = int(text["num_hidden_layers"])
++        layer_types = text.pop("layer_types", None)
++        if layer_types is None:
++            layer_types = [
++                "linear_attention" if i % 4 != 3 else "deepseek_sparse_attention" for i in range(n)
++            ]
++        text["attn_layer_types"] = [
++            "deepseek_sparse_attention" if t == "full_attention" else t for t in layer_types
++        ]
++        if text.get("mlp_layer_types") is None:
++            text["mlp_layer_types"] = ["dense"] * min(3, n) + ["sparse"] * max(n - 3, 0)
++        if text.get("indexer_types") is None:
++            text["indexer_types"] = ["full"] * n
++        text["qk_head_dim"] = int(text["qk_nope_head_dim"]) + int(text["qk_rope_head_dim"])
++        text["published_num_key_value_heads"] = text.get("num_key_value_heads")
++        text["num_key_value_heads"] = 1
++        text["head_dim"] = text["qk_head_dim"]
++        self.vision_config = vision_config
++        if "architectures" in kwargs:
++            text["architectures"] = kwargs["architectures"]
++        super().__init__(**text)
++        for key, value in text.items():
++            if not hasattr(self, key):
++                setattr(self, key, value)
++        self.head_dim = int(text["head_dim"])
++        self.v_head_dim = int(text["v_head_dim"])
++        self.num_key_value_heads = 1
++
++    def __setattr__(self, key, value):
++        # `--model-layer-nums` and a `num_hidden_layers` override write the count; the per-layer
++        # lists follow it, so a cut stack keeps a consistent plan.
++        super().__setattr__(key, value)
++        if key == "num_hidden_layers" and isinstance(value, int):
++            for name in ("attn_layer_types", "mlp_layer_types", "indexer_types"):
++                current = self.__dict__.get(name)
++                if isinstance(current, list) and len(current) > value:
++                    super().__setattr__(name, current[:value])
+diff --git a/python/sgl_jax/srt/hf_transformers_utils.py b/python/sgl_jax/srt/hf_transformers_utils.py
+index 51805fa..fe5de62 100644
+--- a/python/sgl_jax/srt/hf_transformers_utils.py
++++ b/python/sgl_jax/srt/hf_transformers_utils.py
+@@ -22,6 +22,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
+ 
+ from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
+ from sgl_jax.srt.configs.gemma4 import Gemma4Config
++from sgl_jax.srt.configs.glm5_next import Glm5NextServingConfig
+ from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
+ from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
+ from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
+@@ -40,6 +41,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+         Qwen3_5DenseConfig,
+         Qwen4ExpConfig,
+         Gemma4Config,
++        Glm5NextServingConfig,
+     ]
+ }
+ 
+diff --git a/python/sgl_jax/srt/mem_cache/glm5_next_state_pool.py b/python/sgl_jax/srt/mem_cache/glm5_next_state_pool.py
+new file mode 100644
+index 0000000..3f3c029
+--- /dev/null
++++ b/python/sgl_jax/srt/mem_cache/glm5_next_state_pool.py
+@@ -0,0 +1,76 @@
++"""Per-request state of GLM-5.3-Flash.
++
++One row per request slot, plus the dummy slot 0 that padding tokens write to. Row `i + 1`
++belongs to the request at `req_pool_indices == i`. What a row holds, per
++`models/glm5_next.state_shapes`:
++
++- `kda_state[l]`: the FP32 recurrent state `[heads, head_dim, head_dim]` of KDA layer `l`.
++- `kda_conv[l]`: the last `conv_kernel - 1` q, k and v projections of KDA layer `l`, the
++  convolution's window.
++- `mla_kv[l]`, `idx_k[l]`: per token of MLA layer `l`, the normed 512-wide latent, and the
++  indexer's key and pool-gate score.
++
++A request reads only rows it wrote itself: the model masks every read by the request's own
++prefix length, so a slot needs no reset between requests. Nothing here is paged and nothing is
++shared between requests, so the model runs with the radix cache off.
++"""
++
++from __future__ import annotations
++
++import jax
++import jax.numpy as jnp
++from jax.sharding import NamedSharding
++from jax.sharding import PartitionSpec as P
++from jax.tree_util import register_pytree_node_class
++
++
++@register_pytree_node_class
++class Glm5NextStatePool:
++    def __init__(self, state: dict, num_slots: int, mesh=None):
++        self.state = state
++        self.num_slots = num_slots
++        self.mesh = mesh
++
++    @classmethod
++    def create(cls, cfg, max_num_reqs: int, context_len: int, dtype, mesh):
++        from sgl_jax.srt.models.glm5_next import state_shapes
++
++        num_slots = max_num_reqs + 1
++        sharding = NamedSharding(mesh, P()) if mesh is not None else None
++        shapes = state_shapes(cfg, num_slots, context_len, dtype)
++        state = {}
++        with jax.set_mesh(mesh) if mesh is not None else _null():
++            for key, entries in shapes.items():
++                state[key] = [jnp.zeros(shape, dt, device=sharding) for shape, dt in entries]
++        return cls(state, num_slots, mesh)
++
++    def size_bytes(self) -> int:
++        return sum(a.size * a.dtype.itemsize for v in self.state.values() for a in v)
++
++    def replace_buffer(self, new_state) -> None:
++        if set(new_state) != set(self.state):
++            raise ValueError(f"state keys {sorted(new_state)} != {sorted(self.state)}")
++        self.state = {k: list(v) for k, v in new_state.items()}
++
++    def tree_flatten(self):
++        keys = sorted(self.state)
++        lens = tuple(len(self.state[k]) for k in keys)
++        leaves = [a for k in keys for a in self.state[k]]
++        return leaves, (tuple(keys), lens, self.num_slots, self.mesh)
++
++    @classmethod
++    def tree_unflatten(cls, aux, leaves):
++        keys, lens, num_slots, mesh = aux
++        state, i = {}, 0
++        for k, n in zip(keys, lens):
++            state[k] = list(leaves[i : i + n])
++            i += n
++        return cls(state, num_slots, mesh)
++
++
++class _null:
++    def __enter__(self):
++        return None
++
++    def __exit__(self, *exc):
++        return False
+diff --git a/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py
+index f44322a..3344c2b 100644
+--- a/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -781,6 +781,16 @@ class ModelRunnerKVCacheMixin:
+         else:
+             self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)
+ 
++        # A model that keeps state outside the paged KV pool builds its own pools here, and its
++        # forward returns their new buffers under the same names. GLM-5.3-Flash keeps its KDA
++        # state, convolution windows, MLA latents and indexer keys per request.
++        build_extra = getattr(type(getattr(self, "model", None)), "build_extra_memory_pools", None)
++        if build_extra is not None:
++            extra = build_extra(
++                self.model_config, self.server_args, max_num_reqs, self.mesh, self.dtype
++            )
++            self.memory_pools = MemoryPools(**self.memory_pools._pools, **extra)
++
+         # --- Allocator ---
+         if self.token_to_kv_pool_allocator is None:
+             if self.is_hybrid:
+@@ -852,6 +862,13 @@ class ModelRunnerKVCacheMixin:
+                 self.server_args.max_num_reqs = max_num_reqs
+                 self.server_args.draft_runner_cache_size = self.max_total_num_tokens
+ 
++        # A model that keeps its caches in its own pools caps the paged pool: the scheduler still
++        # hands each token a slot there, and nothing reads it.
++        cap_fn = getattr(type(getattr(self, "model", None)), "paged_kv_token_cap", None)
++        if cap_fn is not None:
++            cap = int(cap_fn(self.server_args, self.model_config, max_num_reqs))
++            max_total_tokens = cap if max_total_tokens is None else min(max_total_tokens, cap)
++
+         # 6. Apply constraints (CI, user cap, page align, dp).
+         self.max_total_num_tokens = self._apply_token_constraints(
+             self.max_total_num_tokens,
+@@ -925,4 +942,7 @@ class ModelRunnerKVCacheMixin:
+         cfg = self.linear_recurrent_config
+         if cfg is not None:
+             return len(cfg.full_attention_layer_ids)
++        layers = getattr(type(getattr(self, "model", None)), "paged_kv_layers", None)
++        if layers is not None:
++            return int(layers)
+         return self.adjust_layer_num()
+diff --git a/python/sgl_jax/srt/models/glm5_next.py b/python/sgl_jax/srt/models/glm5_next.py
+new file mode 100644
+index 0000000..c599871
+--- /dev/null
++++ b/python/sgl_jax/srt/models/glm5_next.py
+@@ -0,0 +1,1129 @@
++"""GLM-5.3-Flash text backbone (`Glm5NextForConditionalGeneration`, `model_type: glm5_next`).
++
++Ported from `transformers` 5.17 `models/glm5_next/modeling_glm5_next.py`. Names follow it:
++`HyperConnection`, `LinearAttention` (KDA), `Indexer`, `Attention` (MLA), `MoE`.
++
++What the model is, in the terms this file uses:
++
++- The residual stream is `hc_mult` (4) parallel copies. Each sublayer collapses them with its own
++  `pre` mix, runs, and `post` and a Sinkhorn-normalized `comb` expand its output back to four
++  copies and mix the residual in (mHC). The final hidden state is the mean of the four copies,
++  then the norm.
++- 34 layers run Kimi Delta Attention: per-channel decay with a lower bound
++  (`lower_bound * sigmoid(exp(A_log) * (f + dt_bias))`), a width-4 causal convolution on q, k and
++  v, and a gated RMS norm on the output. It runs here as the chunked form in plain XLA, 64 tokens
++  a chunk, the grid cut at every request start.
++- 11 layers run MLA with no position encoding (`qk_rope_head_dim` 0) and a sparse indexer. The
++  indexer pools each run of `index_kpool` keys into one, scores the pools, keeps the best
++  `index_topk // index_kpool`, and always adds the open tail pool. The attention runs absorbed
++  against the cached 512-wide latent, heads split over the `tensor` axis.
++- Layers 0-2 run a dense SwiGLU MLP, the rest 288 routed experts top-8 with one shared expert.
++  Every SwiGLU clamps: the gate from above, the up branch both sides, at `swiglu_limit`.
++
++State. Every cache lives in `Glm5NextStatePool`, one row per request slot plus the dummy slot 0
++that padding tokens write to: the KDA recurrent state and the last `conv_kernel - 1` convolution
++inputs of every KDA layer, and the latent and the indexer's key and pool-gate score of every
++token of every MLA layer. Every read is masked by the request's own prefix length, so a slot needs
++no reset between requests. The pool isn't paged and holds no prefix, so the model runs without
++prefix caching.
++
++Capture. Slot `k` of `layers_to_capture` holds the four copies entering layer `k`, flattened to
++`hc_mult * hidden_size` values a token. That's `hidden_states[k]` of the `transformers` model,
++reshaped `[tokens, 4 * 4096]`.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import glob
++import json
++import logging
++import os
++import struct
++
++import jax
++import jax.numpy as jnp
++import numpy as np
++from flax import nnx
++from jax.sharding import NamedSharding
++from jax.sharding import PartitionSpec as P
++
++from sgl_jax.srt.layers import moe as _moe
++from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
++from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
++from sgl_jax.srt.layers.moe import EPMoE
++
++logger = logging.getLogger(__name__)
++
++KDA_CHUNK = 64
++
++
++# --------------------------------------------------------------------------------------------
++# Numerics shared by every layer
++# --------------------------------------------------------------------------------------------
++
++
++def rms_norm(x, weight, eps):
++    """`Glm5NextTextRMSNorm`: FP32 statistics, cast back, then the weight in the input dtype."""
++    xf = x.astype(jnp.float32)
++    xf = xf * jax.lax.rsqrt(jnp.mean(xf * xf, axis=-1, keepdims=True) + eps)
++    return weight.astype(x.dtype) * xf.astype(x.dtype)
++
++
++def layer_norm(x, weight, bias, eps):
++    """`nn.LayerNorm`, statistics in FP32."""
++    xf = x.astype(jnp.float32)
++    mean = jnp.mean(xf, axis=-1, keepdims=True)
++    var = jnp.mean(jnp.square(xf - mean), axis=-1, keepdims=True)
++    y = (xf - mean) * jax.lax.rsqrt(var + eps)
++    return (y * weight.astype(jnp.float32) + bias.astype(jnp.float32)).astype(x.dtype)
++
++
++def l2norm(x, eps=1e-6):
++    """FLA's `l2norm`: x / sqrt(sum(x^2) + eps)."""
++    return x / jnp.sqrt(jnp.sum(x * x, axis=-1, keepdims=True) + eps)
++
++
++def swiglu(gate, up, limit):
++    gate = gate.astype(jnp.float32)
++    up = up.astype(jnp.float32)
++    if limit is not None and limit > 0:
++        gate = jnp.minimum(gate, limit)
++        up = jnp.clip(up, -limit, limit)
++    return jax.nn.silu(gate) * up
++
++
++def hc_mix(x, fn, scale, base, hc, iters, hc_eps, norm_eps):
++    """`Glm5NextTextHyperConnection.forward`: `post`, `comb` and the collapsed stream.
++
++    `x` is `[T, hc, D]`. The flattened copies get an unweighted RMS norm in FP32 before the
++    projection. Sinkhorn starts from a row softmax, normalizes the columns, then alternates rows
++    and columns `iters - 1` more times."""
++    flat = x.reshape(x.shape[0], -1).astype(jnp.float32)
++    flat = flat * jax.lax.rsqrt(jnp.mean(flat * flat, axis=-1, keepdims=True) + norm_eps)
++    mixes = flat @ fn.astype(jnp.float32).T
++    scale = scale.astype(jnp.float32)
++    base = base.astype(jnp.float32)
++    pre = jax.nn.sigmoid(mixes[:, :hc] * scale[0] + base[:hc]) + hc_eps
++    post = 2.0 * jax.nn.sigmoid(mixes[:, hc : 2 * hc] * scale[1] + base[hc : 2 * hc])
++    comb = mixes[:, 2 * hc :].reshape(-1, hc, hc) * scale[2] + base[2 * hc :].reshape(hc, hc)
++    comb = jax.nn.softmax(comb, axis=-1) + hc_eps
++    comb = comb / (jnp.sum(comb, axis=-2, keepdims=True) + hc_eps)
++    for _ in range(iters - 1):
++        comb = comb / (jnp.sum(comb, axis=-1, keepdims=True) + hc_eps)
++        comb = comb / (jnp.sum(comb, axis=-2, keepdims=True) + hc_eps)
++    collapsed = jnp.sum(pre[..., None] * x.astype(jnp.float32), axis=1).astype(x.dtype)
++    return post, comb, collapsed
++
++
++def hc_expand(y, residual, post, comb):
++    """`post[j] * y + sum_i comb[i, j] * residual[i]`, in the stream dtype as the reference does."""
++    dt = residual.dtype
++    mixed = jnp.einsum("tij,tid->tjd", comb.astype(dt), residual)
++    return post.astype(dt)[..., None] * y.astype(dt)[:, None, :] + mixed
++
++
++# --------------------------------------------------------------------------------------------
++# Token metadata
++# --------------------------------------------------------------------------------------------
++
++
++@jax.tree_util.register_pytree_node_class
++@dataclasses.dataclass
++class TokenMeta:
++    """Per-token and per-request views of one forward batch, all on device.
++
++    `slot` is the state-pool row a token reads and writes: `req_pool_index + 1`, or 0 for a padding
++    token. `prefix` is how many tokens of the request the pool already holds, `end` how many it
++    holds after this pass, `idx` the token's place inside its request's chunk, `req` its request's
++    row in the batch.
++    """
++
++    valid: jax.Array  # [T] bool
++    pos: jax.Array  # [T] int32
++    slot: jax.Array  # [T] int32
++    prefix: jax.Array  # [T] int32
++    end: jax.Array  # [T] int32
++    idx: jax.Array  # [T] int32
++    req: jax.Array  # [T] int32
++    req_slot: jax.Array  # [B] int32
++    req_prefix: jax.Array  # [B] int32
++    req_lens: jax.Array  # [B] int32
++    req_start: jax.Array  # [B] int32
++
++    def tree_flatten(self):
++        return tuple(getattr(self, f.name) for f in dataclasses.fields(self)), None
++
++    @classmethod
++    def tree_unflatten(cls, aux, children):
++        return cls(*children)
++
++
++def token_meta(num_tokens, req_pool_indices, prefix_lens, extend_lens) -> TokenMeta:
++    """Tokens sit request after request, each request's in position order, the layout
++    `ForwardBatch` uses for extend and decode alike. `extend_lens[b] == 0` marks a padding
++    request."""
++    req_pool_indices = jnp.asarray(req_pool_indices, jnp.int32)
++    prefix_lens = jnp.asarray(prefix_lens, jnp.int32)
++    extend_lens = jnp.asarray(extend_lens, jnp.int32)
++    cum = jnp.cumsum(extend_lens)
++    start = cum - extend_lens
++    t = jnp.arange(num_tokens, dtype=jnp.int32)
++    b = jnp.clip(jnp.searchsorted(cum, t, side="right"), 0, extend_lens.shape[0] - 1)
++    valid = t < cum[-1]
++    idx = t - start[b]
++    prefix = prefix_lens[b]
++    req_slot = jnp.where(extend_lens > 0, req_pool_indices + 1, 0)
++    return TokenMeta(
++        valid=valid,
++        pos=jnp.where(valid, prefix + idx, 0),
++        slot=jnp.where(valid, req_slot[b], 0),
++        prefix=jnp.where(valid, prefix, 0),
++        end=jnp.where(valid, prefix + extend_lens[b], 0),
++        idx=jnp.where(valid, idx, 0),
++        req=jnp.where(valid, b, 0).astype(jnp.int32),
++        req_slot=req_slot,
++        req_prefix=prefix_lens,
++        req_lens=extend_lens,
++        req_start=start,
++    )
++
++
++def _replicated(x):
++    """The engine shards batch arrays over `data`. Metadata here is small and every token reads
++    all of it, so it runs replicated."""
++    return jax.sharding.reshard(jnp.asarray(x, jnp.int32), P())
++
++
++def meta_from_forward_batch(forward_batch) -> TokenMeta:
++    num_tokens = forward_batch.input_ids.shape[0]
++    req = _replicated(forward_batch.req_pool_indices)
++    if forward_batch.forward_mode.is_decode():
++        seq_lens = _replicated(forward_batch.seq_lens)
++        lens = (seq_lens > 0).astype(jnp.int32)
++        return token_meta(num_tokens, req, jnp.maximum(seq_lens - 1, 0), lens)
++    return token_meta(
++        num_tokens,
++        req,
++        _replicated(forward_batch.extend_prefix_lens),
++        _replicated(forward_batch.extend_seq_lens),
++    )
++
++
++# --------------------------------------------------------------------------------------------
++# Layer plan and state
++# --------------------------------------------------------------------------------------------
++
++
++def kda_layer_ids(cfg) -> list[int]:
++    n = int(cfg.num_hidden_layers)
++    return [i for i in range(n) if cfg.attn_layer_types[i] == "linear_attention"]
++
++
++def mla_layer_ids(cfg) -> list[int]:
++    n = int(cfg.num_hidden_layers)
++    return [i for i in range(n) if cfg.attn_layer_types[i] == "deepseek_sparse_attention"]
++
++
++def check_layer_plan(cfg):
++    """Raise on a plan this port doesn't serve. A `shared` indexer reuses the previous layer's
++    selection, which the reference hands down only from an MLA layer right before it."""
++    n = int(cfg.num_hidden_layers)
++    for name in ("attn_layer_types", "mlp_layer_types", "indexer_types"):
++        if len(getattr(cfg, name)) < n:
++            raise ValueError(f"{name} holds {len(getattr(cfg, name))} entries for {n} layers")
++    for i in range(n):
++        kind = cfg.attn_layer_types[i]
++        if kind not in ("linear_attention", "deepseek_sparse_attention"):
++            raise ValueError(f"layer {i}: unknown attention type {kind!r}")
++        if kind == "deepseek_sparse_attention" and cfg.indexer_types[i] == "shared":
++            if i == 0 or cfg.attn_layer_types[i - 1] != "deepseek_sparse_attention":
++                raise ValueError(f"layer {i} shares the indexer of layer {i - 1}, which isn't MLA")
++    if int(cfg.qk_rope_head_dim) != 0:
++        raise ValueError("glm5_next attention carries no rotary part; qk_rope_head_dim must be 0")
++    if int(cfg.n_group) != 1 or int(cfg.topk_group) != 1:
++        raise ValueError("grouped routing (n_group > 1) isn't ported")
++    if int(cfg.index_topk) % int(cfg.index_kpool):
++        raise ValueError("index_topk must be a multiple of index_kpool")
++
++
++def state_shapes(cfg, num_slots, max_context, dtype):
++    """Shapes and dtypes of every state array, keyed the way the model reads them. `num_slots`
++    counts the dummy slot 0. `max_context` rounds up to a whole pool."""
++    kpool = int(cfg.index_kpool)
++    ctx = -(-int(max_context) // kpool) * kpool
++    h, dk = int(cfg.linear_num_heads), int(cfg.linear_head_dim)
++    width = 3 * h * dk
++    conv = int(cfg.linear_conv_kernel_dim) - 1
++    kda = kda_layer_ids(cfg)
++    mla = mla_layer_ids(cfg)
++    out = {
++        "kda_state": [((num_slots, h, dk, dk), jnp.float32) for _ in kda],
++        "kda_conv": [((num_slots, conv, width), dtype) for _ in kda],
++        "mla_kv": [((num_slots, ctx, int(cfg.kv_lora_rank)), dtype) for _ in mla],
++        "idx_k": [((num_slots, ctx, 2 * int(cfg.index_head_dim)), dtype) for _ in mla],
++    }
++    return out
++
++
++def init_state(cfg, num_slots, max_context, dtype, sharding=None):
++    shapes = state_shapes(cfg, num_slots, max_context, dtype)
++    return {
++        key: [jnp.zeros(shape, dt, device=sharding) for shape, dt in entries]
++        for key, entries in shapes.items()
++    }
++
++
++def _scatter_rows(buf, slot, row, values, write):
++    """buf[slot, row] = values where `write`, else into the dummy slot 0 at row 0."""
++    slot = jnp.where(write, slot, 0)
++    row = jnp.where(write, row, 0)
++    return buf.at[slot, row].set(values.astype(buf.dtype))
++
++
++def _tensor_ways():
++    mesh = jax.sharding.get_abstract_mesh()
++    try:
++        return int(dict(mesh.shape).get("tensor", 1))
++    except Exception:  # no mesh set
++        return 1
++
++
++# --------------------------------------------------------------------------------------------
++# Parameters
++# --------------------------------------------------------------------------------------------
++
++
++def _param(shape, dtype, spec=None):
++    spec = spec or (None,) * len(shape)
++    return nnx.Param(jnp.zeros(shape, dtype=dtype, out_sharding=P(*spec)))
++
++
++class Glm5NextMLP(nnx.Module):
++    """`Glm5NextTextMLP`: the dense layers' MLP and the shared expert."""
++
++    def __init__(self, dim, inter, dtype, limit):
++        self.limit = float(limit)
++        self.gate_proj = _param((dim, inter), dtype)
++        self.up_proj = _param((dim, inter), dtype)
++        self.down_proj = _param((inter, dim), dtype)
++
++    def __call__(self, x):
++        act = swiglu(x @ self.gate_proj.value, x @ self.up_proj.value, self.limit)
++        return act.astype(x.dtype) @ self.down_proj.value
++
++
++class Glm5NextEPMoE(EPMoE):
++    """`EPMoE` with the SwiGLU clamp the checkpoint trained with: the up branch clamped on both
++    sides, the gate branch from above (`Glm5NextTextExperts._apply_gate`)."""
++
++    swiglu_limit: float = 0.0
++
++    def _gmm_compute(
++        self,
++        inputs_2d,
++        token_indices,
++        group_sizes,
++        w0_kernel,
++        w1_kernel,
++        wo_kernel,
++        group_offset,
++        w0_kernel_scale=None,
++        w1_kernel_scale=None,
++        wo_kernel_scale=None,
++        w0_kernel_bias=None,
++        w1_kernel_bias=None,
++        wo_kernel_bias=None,
++        local_range=None,
++    ):
++        if token_indices.shape[0] == 0:
++            return jnp.zeros((0, wo_kernel.shape[-1]), dtype=inputs_2d.dtype)
++        if local_range is not None:
++            x = _moe.sc_dispatch_gather(inputs_2d, token_indices, *local_range).astype(self.dtype)
++        else:
++            x = inputs_2d[token_indices].astype(self.dtype)
++        group_sizes = group_sizes.astype(jnp.int32)
++        kwargs = dict(
++            group_sizes=group_sizes,
++            preferred_element_type=self.dtype,
++            group_offset=group_offset,
++            maybe_quantize_lhs=False,
++            acc_dtype=jnp.float32,
++        )
++        gate = _moe.gmm(lhs=x, rhs=w0_kernel, rhs_scale=w0_kernel_scale, rhs_bias=w0_kernel_bias,
++                        zero_initialize=False, **kwargs)
++        up = _moe.gmm(lhs=x, rhs=w1_kernel, rhs_scale=w1_kernel_scale, rhs_bias=w1_kernel_bias,
++                      zero_initialize=False, **kwargs)
++        act = swiglu(gate, up, self.swiglu_limit).astype(self.dtype)
++        return _moe.gmm(lhs=act, rhs=wo_kernel, rhs_scale=wo_kernel_scale, rhs_bias=wo_kernel_bias,
++                        zero_initialize=True, **kwargs)
++
++
++class Glm5NextMoE(nnx.Module):
++    """`Glm5NextTextMoE`: sigmoid routing with a selection-only bias, normalized top-k weights
++    times `routed_scaling_factor`, one shared expert."""
++
++    def __init__(self, cfg, mesh, layer_id, dtype, ep_size):
++        dim, inter = int(cfg.hidden_size), int(cfg.moe_intermediate_size)
++        self.n_experts = int(cfg.n_routed_experts)
++        self.topk = int(cfg.num_experts_per_tok)
++        self.norm_topk_prob = bool(cfg.norm_topk_prob)
++        self.route_scale = float(cfg.routed_scaling_factor)
++        self.gate_weight = _param((self.n_experts, dim), jnp.float32)
++        self.gate_bias = _param((self.n_experts,), jnp.float32)
++        self.experts = Glm5NextEPMoE(
++            hidden_size=dim,
++            num_experts=self.n_experts,
++            num_experts_per_tok=self.topk,
++            ep_size=ep_size,
++            mesh=mesh,
++            intermediate_dim=inter,
++            weight_dtype=dtype,
++            dtype=dtype,
++            layer_id=layer_id,
++        )
++        self.experts.swiglu_limit = float(cfg.swiglu_limit)
++        self.shared = Glm5NextMLP(dim, inter * int(cfg.n_shared_experts), dtype, cfg.swiglu_limit)
++
++    def route(self, x):
++        scores = jax.nn.sigmoid(x.astype(jnp.float32) @ self.gate_weight.value.astype(jnp.float32).T)
++        _, idx = jax.lax.top_k(scores + self.gate_bias.value.astype(jnp.float32)[None, :], self.topk)
++        weights = jnp.take_along_axis(scores, idx, axis=-1)
++        if self.norm_topk_prob:
++            weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + 1e-20)
++        return weights * self.route_scale, idx
++
++    def __call__(self, x):
++        weights, idx = self.route(x)
++        routed = self.experts(x, weights.astype(x.dtype), idx.astype(jnp.int32))
++        return (routed.astype(jnp.float32) + self.shared(x).astype(jnp.float32)).astype(x.dtype)
++
++
++# --------------------------------------------------------------------------------------------
++# Kimi Delta Attention
++# --------------------------------------------------------------------------------------------
++
++
++def chunk_grid(meta: TokenMeta, num_tokens: int, chunk: int):
++    """Cut every request's tokens into chunks of `chunk`. Returns, per grid chunk, the token rows
++    it gathers (`[NC, chunk]`, clamped), which of them are real, its request's row in the batch,
++    and whether it opens or closes that request. A chunk holds one request's tokens only."""
++    lens = meta.req_lens
++    n_req = lens.shape[0]
++    per = (lens + chunk - 1) // chunk
++    cum = jnp.cumsum(per)
++    first = cum - per
++    nc = num_tokens // chunk + n_req
++    c = jnp.arange(nc, dtype=jnp.int32)
++    r = jnp.clip(jnp.searchsorted(cum, c, side="right"), 0, n_req - 1).astype(jnp.int32)
++    live = c < cum[-1]
++    k = c - first[r]
++    off = k[:, None] * chunk + jnp.arange(chunk, dtype=jnp.int32)[None, :]
++    ok = live[:, None] & (off < lens[r][:, None])
++    rows = jnp.clip(meta.req_start[r][:, None] + off, 0, num_tokens - 1)
++    opens = live & (k == 0)
++    closes = live & (k == per[r] - 1)
++    return rows, ok, r, opens, closes
++
++
++def kda_chunk_scan(q, k, v, g, beta, init, meta: TokenMeta, chunk: int = KDA_CHUNK):
++    """`chunk_kimi_delta_attention` on a packed batch.
++
++    q, k: `[T, H, K]` already L2-normalized, q scaled; v `[T, H, V]`; g `[T, H, K]` the log decay;
++    beta `[T, H]`; init `[B, H, K, V]` each request's state before this pass. Returns the output
++    `[T, H, V]` and each request's state after it, `[B, H, K, V]`. Everything runs in FP32.
++
++    Padding slots of a chunk read k = v = beta = 0 and g = 0, so they neither write the state nor
++    decay it; they sit only after a request's last token, so they can't touch a real output."""
++    num_tokens = q.shape[0]
++    rows, ok, r, opens, closes = chunk_grid(meta, num_tokens, chunk)
++
++    def gather(x):
++        y = x[rows]
++        return jnp.where(ok.reshape(*ok.shape, *([1] * (y.ndim - 2))), y, 0.0)
++
++    qc, kc, vc, gc, bc = (gather(x.astype(jnp.float32)) for x in (q, k, v, g, beta))
++    h = q.shape[1]
++    tri_incl = jnp.tril(jnp.ones((chunk, chunk), bool))  # j <= i
++    tri_strict = jnp.tril(jnp.ones((chunk, chunk), bool), -1)  # j < i
++    eye = jnp.eye(chunk, dtype=jnp.float32)
++
++    def step(carry, xs):
++        state, finals = carry
++        qi, ki, vi, gi, bi, ri, oi, ci = xs
++        state = jnp.where(oi, init[ri], state)
++        gcs = jnp.cumsum(gi, axis=0)  # [C, H, K]
++        diff = gcs[:, None] - gcs[None, :]  # [i, j, H, K]
++        decay = jnp.exp(jnp.where(tri_incl[:, :, None, None], diff, -jnp.inf))
++        kb = ki * bi[..., None]
++        a = -jnp.einsum("ihk,jhk,ijhk->hij", kb, ki, decay)
++        a = jnp.where(tri_strict[None], a, 0.0)
++        # (I - A)^-1 by forward substitution, the reference's row loop in closed form
++        tmat = jax.scipy.linalg.solve_triangular(
++            eye[None] - a, jnp.broadcast_to(eye, (h, chunk, chunk)), lower=True, unit_diagonal=True
++        )
++        vb = vi * bi[..., None]
++        u = jnp.einsum("hij,jhv->ihv", tmat, vb)
++        w = jnp.einsum("hij,jhk->ihk", tmat, kb * jnp.exp(gcs))
++        inter = jnp.einsum("ihk,hkv->ihv", qi * jnp.exp(gcs), state)
++        intra = jnp.einsum("ihk,jhk,ijhk->hij", qi, ki, decay)
++        intra = jnp.where(tri_incl[None], intra, 0.0)
++        v_new = u - jnp.einsum("ihk,hkv->ihv", w, state)
++        out = inter + jnp.einsum("hij,jhv->ihv", intra, v_new)
++        last = gcs[-1]  # [H, K]
++        state = state * jnp.exp(last)[..., None] + jnp.einsum(
++            "ihk,ihv->hkv", ki * jnp.exp(last[None] - gcs), v_new
++        )
++        finals = jnp.where(ci, finals.at[ri].set(state), finals)
++        return (state, finals), out
++
++    zero = jnp.zeros(init.shape[1:], jnp.float32)
++    (_, finals), outs = jax.lax.scan(
++        step, (zero, jnp.zeros_like(init, jnp.float32)), (qc, kc, vc, gc, bc, r, opens, closes)
++    )
++    out = jnp.zeros((num_tokens, h, v.shape[-1]), jnp.float32)
++    flat_rows = jnp.where(ok, rows, num_tokens).reshape(-1)
++    out = out.at[flat_rows].set(outs.reshape(-1, h, v.shape[-1]), mode="drop")
++    finals = jnp.where((meta.req_lens > 0)[:, None, None, None], finals, init)
++    return out, finals
++
++
++class Glm5NextLinearAttention(nnx.Module):
++    """`Glm5NextTextLinearAttention` (KDA)."""
++
++    def __init__(self, cfg, slot, dtype):
++        d = int(cfg.hidden_size)
++        self.h = int(cfg.linear_num_heads)
++        self.dk = int(cfg.linear_head_dim)
++        self.slot = slot
++        self.kernel = int(cfg.linear_conv_kernel_dim)
++        self.eps = float(cfg.rms_norm_eps)
++        lb = cfg.linear_lower_bound
++        self.lower_bound = None if lb is None else float(lb)
++        qkv = self.h * self.dk
++        self.q_proj = _param((d, qkv), dtype)
++        self.k_proj = _param((d, qkv), dtype)
++        self.v_proj = _param((d, qkv), dtype)
++        # the reference keeps conv1d, dt_bias and A_log in FP32 (`_keep_in_fp32_modules_strict`)
++        self.q_conv1d = _param((qkv, self.kernel), jnp.float32)
++        self.k_conv1d = _param((qkv, self.kernel), jnp.float32)
++        self.v_conv1d = _param((qkv, self.kernel), jnp.float32)
++        self.f_a_proj = _param((d, self.dk), dtype)
++        self.f_b_proj = _param((self.dk, qkv), dtype)
++        self.dt_bias = _param((qkv,), jnp.float32)
++        self.A_log = _param((self.h,), jnp.float32)
++        self.b_proj = _param((d, self.h), dtype)
++        self.g_a_proj = _param((d, self.dk), dtype)
++        self.g_b_proj = _param((self.dk, qkv), dtype)
++        self.o_norm = _param((self.dk,), jnp.float32)
++        self.o_proj = _param((qkv, d), dtype)
++
++    def _conv(self, x, meta, state):
++        """Causal depthwise convolution with SiLU over each request, the last `kernel - 1` inputs
++        of the pass before read from the pool. Returns the output and the new window."""
++        kw = self.kernel
++        win_buf = state["kda_conv"][self.slot]  # [S, kw-1, C]
++        win = win_buf[meta.slot]  # [T, kw-1, C]
++        win = jnp.where((meta.prefix > 0)[:, None, None], win, 0)
++        w = jnp.concatenate([self.q_conv1d.value, self.k_conv1d.value, self.v_conv1d.value], axis=0)
++        num_tokens = x.shape[0]
++        t = jnp.arange(num_tokens, dtype=jnp.int32)
++        acc = jnp.zeros(x.shape, jnp.float32)
++        for tap in range(kw):
++            shift = kw - 1 - tap  # this tap reads the input `shift` positions back
++            from_chunk = x[jnp.clip(t - shift, 0, num_tokens - 1)]
++            back = jnp.clip(shift - meta.idx - 1, 0, kw - 2)  # window row kw-2 is the newest
++            from_win = jnp.take_along_axis(win, (kw - 2 - back)[:, None, None], axis=1)[:, 0]
++            tok = jnp.where((shift <= meta.idx)[:, None], from_chunk, from_win)
++            acc = acc + tok.astype(jnp.float32) * w[:, tap][None, :]
++        y = jax.nn.silu(acc).astype(x.dtype)
++        # new window: the last kw-1 inputs of each request, oldest first
++        old = win_buf[meta.req_slot]  # [B, kw-1, C]
++        old = jnp.where((meta.req_prefix > 0)[:, None, None], old, 0)
++        end = meta.req_prefix + meta.req_lens
++        rows = []
++        for j in range(kw - 1):
++            q = end - (kw - 1) + j  # position held in window row j
++            in_chunk = q >= meta.req_prefix
++            src = jnp.clip(meta.req_start + q - meta.req_prefix, 0, num_tokens - 1)
++            back = jnp.clip(meta.req_prefix - q, 1, kw - 1)  # 1 = the newest old row
++            from_old = jnp.take_along_axis(old, (kw - 1 - back)[:, None, None], axis=1)[:, 0]
++            val = jnp.where(in_chunk[:, None], x[src], from_old)
++            rows.append(jnp.where((q >= 0)[:, None], val, 0))
++        new_win = jnp.stack(rows, axis=1)
++        slot = jnp.where(meta.req_lens > 0, meta.req_slot, 0)
++        keep = win_buf[slot]
++        new_win = jnp.where((meta.req_lens > 0)[:, None, None], new_win, keep)
++        state["kda_conv"][self.slot] = win_buf.at[slot].set(new_win.astype(win_buf.dtype))
++        return y
++
++    def gate(self, x):
++        """`Glm5NextTextForgetGate`: the per-channel log decay, `[T, H, K]` FP32."""
++        f = (x @ self.f_a_proj.value) @ self.f_b_proj.value
++        g = f.astype(jnp.float32) + self.dt_bias.value.astype(jnp.float32)[None, :]
++        g = g.reshape(-1, self.h, self.dk)
++        a = jnp.exp(self.A_log.value.astype(jnp.float32))[None, :, None]
++        if self.lower_bound is not None:
++            return self.lower_bound * jax.nn.sigmoid(a * g)
++        return -a * jax.nn.softplus(g)
++
++    def __call__(self, x, meta, state):
++        h, dk = self.h, self.dk
++        mixed = jnp.concatenate(
++            [x @ self.q_proj.value, x @ self.k_proj.value, x @ self.v_proj.value], axis=-1
++        )
++        mixed = self._conv(mixed, meta, state)
++        q, k, v = jnp.split(mixed, 3, axis=-1)
++        q = l2norm(q.reshape(-1, h, dk).astype(jnp.float32)) * (dk**-0.5)
++        k = l2norm(k.reshape(-1, h, dk).astype(jnp.float32))
++        v = v.reshape(-1, h, dk).astype(jnp.float32)
++        g = self.gate(x)
++        beta = jax.nn.sigmoid(x @ self.b_proj.value).astype(jnp.float32)
++        buf = state["kda_state"][self.slot]
++        init = buf[meta.req_slot]
++        init = jnp.where((meta.req_prefix > 0)[:, None, None, None], init, 0.0)
++        o, finals = kda_chunk_scan(q, k, v, g, beta, init, meta)
++        slot = jnp.where(meta.req_lens > 0, meta.req_slot, 0)
++        state["kda_state"][self.slot] = buf.at[slot].set(
++            jnp.where((meta.req_lens > 0)[:, None, None, None], finals, buf[slot])
++        )
++        o = o.astype(x.dtype)
++        gate = ((x @ self.g_a_proj.value) @ self.g_b_proj.value).reshape(-1, h, dk)
++        of = o.astype(jnp.float32)
++        of = of * jax.lax.rsqrt(jnp.mean(of * of, axis=-1, keepdims=True) + self.eps)
++        of = self.o_norm.value.astype(jnp.float32) * of * jax.nn.sigmoid(gate.astype(jnp.float32))
++        return of.astype(x.dtype).reshape(-1, h * dk) @ self.o_proj.value
++
++
++# --------------------------------------------------------------------------------------------
++# Sparse MLA with the k-pool indexer
++# --------------------------------------------------------------------------------------------
++
++
++class Glm5NextIndexer(nnx.Module):
++    def __init__(self, cfg, dtype):
++        d, qr = int(cfg.hidden_size), int(cfg.q_lora_rank)
++        self.n_heads, self.head_dim = int(cfg.index_n_heads), int(cfg.index_head_dim)
++        self.kpool = int(cfg.index_kpool)
++        self.topk = int(cfg.index_topk)
++        self.tail = bool(cfg.index_kpool_always_select_tail)
++        self.wq_b = _param((qr, self.n_heads * self.head_dim), dtype)
++        self.wk = _param((d, self.head_dim), dtype)
++        self.k_norm_weight = _param((self.head_dim,), jnp.float32)
++        self.k_norm_bias = _param((self.head_dim,), jnp.float32)
++        self.weights_proj = _param((d, self.n_heads), dtype)
++        self.compress_ape = _param((self.kpool, self.head_dim), jnp.float32)
++        self.compress_gate = _param((self.head_dim, d), dtype)
++
++    def packed(self, x):
++        """This pass's key and pool-gate score per token, `[T, 2 * head_dim]`, as the cache holds
++        them."""
++        k = layer_norm(x @ self.wk.value, self.k_norm_weight.value, self.k_norm_bias.value, 1e-6)
++        gate = x @ self.compress_gate.value.T
++        return jnp.concatenate([k, gate.astype(k.dtype)], axis=-1)
++
++    def select(self, x, q_resid, meta, cache, mesh):
++        """`Glm5NextTextIndexer.forward` as a mask: which cached tokens of the batch each query
++        attends to, `[T, B * ctx]`. `cache` is the batch's packed states `[B, ctx, 2 * hd]`."""
++        n_req, ctx, _ = cache.shape
++        kp, hd = self.kpool, self.head_dim
++        n_pools = ctx // kp
++        keys = cache[..., :hd].reshape(n_req, n_pools, kp, hd)
++        gates = cache[..., hd:].reshape(n_req, n_pools, kp, hd)
++        logits = gates.astype(jnp.float32) + self.compress_ape.value.astype(jnp.float32)[None, None]
++        prob = jax.nn.softmax(logits, axis=2).astype(keys.dtype)
++        pool_keys = jnp.sum(prob * keys, axis=2).reshape(n_req * n_pools, hd)
++        q = (q_resid @ self.wq_b.value).reshape(-1, self.n_heads, hd)
++        w = (x @ self.weights_proj.value).astype(jnp.float32) * (self.n_heads**-0.5)
++        scale = hd**-0.5
++
++        def score(q_, w_, pk):
++            s = jnp.einsum("thd,pd->thp", q_.astype(jnp.float32), pk.astype(jnp.float32))
++            return jnp.sum(jax.nn.relu(s * scale) * w_[..., None], axis=1)
++
++        ways = _tensor_ways()
++        if ways > 1 and self.n_heads % ways == 0 and mesh is not None:
++            def local(q_, w_, pk):
++                return jax.lax.psum(score(q_, w_, pk), "tensor")
++
++            scores = jax.shard_map(
++                local, mesh=mesh, in_specs=(P(None, "tensor", None), P(None, "tensor"), P()),
++                out_specs=P(), check_vma=False,
++            )(jax.sharding.reshard(q, P(None, "tensor", None)), jax.sharding.reshard(w, P(None, "tensor")),
++              jax.sharding.reshard(pool_keys, P()))
++        else:
++            scores = score(q, w, pool_keys)
++        # a pool is a candidate for query t when it belongs to t's request and its last token is
++        # at or before t
++        pool_req = jnp.arange(n_req * n_pools, dtype=jnp.int32) // n_pools
++        pool_last = (jnp.arange(n_req * n_pools, dtype=jnp.int32) % n_pools) * kp + kp - 1
++        cand = (pool_req[None, :] == meta.req[:, None]) & (pool_last[None, :] <= meta.pos[:, None])
++        cand = cand & meta.valid[:, None]
++        scores = jnp.where(cand, scores, -jnp.inf)
++        k_sel = min(self.topk // kp, n_req * n_pools)
++        vals, idx = jax.lax.top_k(scores, k_sel)
++        picked = jnp.zeros(scores.shape, bool)
++        picked = picked.at[jnp.arange(scores.shape[0])[:, None], idx].set(vals > -jnp.inf)
++        tok = jnp.repeat(picked.reshape(-1, n_req, n_pools), kp, axis=2).reshape(-1, n_req * ctx)
++        if self.tail:
++            key_req = jnp.arange(n_req * ctx, dtype=jnp.int32) // ctx
++            key_pos = jnp.arange(n_req * ctx, dtype=jnp.int32) % ctx
++            tail_start = (meta.pos + 1) - (meta.pos + 1) % kp
++            tail = (key_req[None, :] == meta.req[:, None]) & (key_pos[None, :] >= tail_start[:, None])
++            tail = tail & (key_pos[None, :] <= meta.pos[:, None]) & meta.valid[:, None]
++            tok = tok | tail
++        return tok
++
++
++class Glm5NextAttention(nnx.Module):
++    """`Glm5NextTextAttention`: MLA with no rotary part, run absorbed against the cached latent,
++    over the tokens the indexer picks."""
++
++    def __init__(self, cfg, slot, has_indexer, dtype):
++        d = int(cfg.hidden_size)
++        self.h = int(cfg.num_attention_heads)
++        self.qr = int(cfg.q_lora_rank)
++        self.lora = int(cfg.kv_lora_rank)
++        self.nope = int(cfg.qk_nope_head_dim)
++        self.vd = int(cfg.v_head_dim)
++        self.eps = float(cfg.rms_norm_eps)
++        self.scaling = (self.nope + int(cfg.qk_rope_head_dim)) ** -0.5
++        self.slot = slot
++        self.q_a_proj = _param((d, self.qr), dtype)
++        self.q_a_layernorm = _param((self.qr,), dtype)
++        self.q_b_proj = _param((self.qr, self.h * self.nope), dtype)
++        self.kv_a_proj_with_mqa = _param((d, self.lora), dtype)
++        self.kv_a_layernorm = _param((self.lora,), dtype)
++        # kv_b_proj as [heads, nope + v, lora], the checkpoint's rows grouped by head
++        self.kv_b_proj = _param((self.h, self.nope + self.vd, self.lora), dtype)
++        self.o_proj = _param((self.h * self.vd, d), dtype)
++        self.indexer = Glm5NextIndexer(cfg, dtype) if has_indexer else None
++
++    def __call__(self, x, meta, state, prev_mask, mesh):
++        h = self.h
++        q_resid = rms_norm(x @ self.q_a_proj.value, self.q_a_layernorm.value, self.eps)
++        q = (q_resid @ self.q_b_proj.value).reshape(-1, h, self.nope)
++        latent = rms_norm(x @ self.kv_a_proj_with_mqa.value, self.kv_a_layernorm.value, self.eps)
++        buf = state["mla_kv"][self.slot]
++        buf = _scatter_rows(buf, meta.slot, meta.pos, latent, meta.valid)
++        state["mla_kv"][self.slot] = buf
++        n_req = meta.req_slot.shape[0]
++        ctx = buf.shape[1]
++        keys = buf[meta.req_slot].reshape(n_req * ctx, self.lora)
++        if self.indexer is not None:
++            ibuf = state["idx_k"][self.slot]
++            ibuf = _scatter_rows(ibuf, meta.slot, meta.pos, self.indexer.packed(x), meta.valid)
++            state["idx_k"][self.slot] = ibuf
++            mask = self.indexer.select(x, q_resid, meta, ibuf[meta.req_slot], mesh)
++        else:
++            mask = prev_mask
++        w_uk = self.kv_b_proj.value[:, : self.nope, :]  # [H, nope, lora]
++        w_uv = self.kv_b_proj.value[:, self.nope :, :]  # [H, v, lora]
++        scaling = self.scaling
++
++        def attend(q_, uk, uv, keys_, mask_):
++            ql = jnp.einsum("thd,hdc->thc", q_, uk)
++            logits = jnp.einsum("thc,kc->thk", ql.astype(jnp.float32), keys_.astype(jnp.float32))
++            logits = jnp.where(mask_[:, None, :], logits * scaling, -jnp.inf)
++            m = jnp.max(logits, axis=-1, keepdims=True)
++            m = jnp.where(jnp.isfinite(m), m, 0.0)
++            p = jnp.exp(logits - m)
++            p = p / jnp.maximum(jnp.sum(p, axis=-1, keepdims=True), 1e-30)
++            ol = jnp.einsum("thk,kc->thc", p.astype(q_.dtype), keys_.astype(q_.dtype))
++            return jnp.einsum("thc,hvc->thv", ol, uv)
++
++        ways = _tensor_ways()
++        if ways > 1 and h % ways == 0 and mesh is not None:
++            o = jax.shard_map(
++                attend, mesh=mesh,
++                in_specs=(P(None, "tensor", None), P("tensor", None, None), P("tensor", None, None),
++                          P(), P()),
++                out_specs=P(None, "tensor", None), check_vma=False,
++            )(jax.sharding.reshard(q, P(None, "tensor", None)),
++              jax.sharding.reshard(w_uk, P("tensor", None, None)),
++              jax.sharding.reshard(w_uv, P("tensor", None, None)),
++              jax.sharding.reshard(keys, P()), jax.sharding.reshard(mask, P()))
++            o = jax.sharding.reshard(o, P())
++        else:
++            o = attend(q, w_uk, w_uv, keys, mask)
++        out = o.reshape(-1, h * self.vd) @ self.o_proj.value
++        return out, (mask if self.indexer is not None else None)
++
++
++# --------------------------------------------------------------------------------------------
++# Blocks and model
++# --------------------------------------------------------------------------------------------
++
++
++class Glm5NextDecoderLayer(nnx.Module):
++    def __init__(self, cfg, mesh, layer_id, kda_slot, mla_slot, dtype, ep_size):
++        dim, hc = int(cfg.hidden_size), int(cfg.hc_mult)
++        self.layer_id = layer_id
++        self.hc = hc
++        self.eps = float(cfg.rms_norm_eps)
++        self.hc_iters = int(cfg.hc_sinkhorn_iters)
++        self.hc_eps = float(cfg.hc_eps)
++        self.is_kda = cfg.attn_layer_types[layer_id] == "linear_attention"
++        if self.is_kda:
++            self.self_attn = Glm5NextLinearAttention(cfg, kda_slot, dtype)
++        else:
++            self.self_attn = Glm5NextAttention(
++                cfg, mla_slot, cfg.indexer_types[layer_id] != "shared", dtype)
++        if cfg.mlp_layer_types[layer_id] == "sparse":
++            self.mlp = Glm5NextMoE(cfg, mesh, layer_id, dtype, ep_size)
++        else:
++            self.mlp = Glm5NextMLP(dim, int(cfg.intermediate_size), dtype, cfg.swiglu_limit)
++        self.input_layernorm = _param((dim,), dtype)
++        self.post_attention_layernorm = _param((dim,), dtype)
++        mix = (2 + hc) * hc
++        self.hc_attn_fn = _param((mix, hc * dim), jnp.float32)
++        self.hc_attn_base = _param((mix,), jnp.float32)
++        self.hc_attn_scale = _param((3,), jnp.float32)
++        self.hc_ffn_fn = _param((mix, hc * dim), jnp.float32)
++        self.hc_ffn_base = _param((mix,), jnp.float32)
++        self.hc_ffn_scale = _param((3,), jnp.float32)
++
++    def _mix(self, x, part):
++        return hc_mix(x, getattr(self, f"hc_{part}_fn").value, getattr(self, f"hc_{part}_scale").value,
++                      getattr(self, f"hc_{part}_base").value, self.hc, self.hc_iters, self.hc_eps,
++                      self.eps)
++
++    def __call__(self, x, meta, state, prev_mask, mesh):
++        residual = x
++        post, comb, h = self._mix(x, "attn")
++        h = rms_norm(h, self.input_layernorm.value, self.eps)
++        mask = None
++        if self.is_kda:
++            h = self.self_attn(h, meta, state)
++        else:
++            h, mask = self.self_attn(h, meta, state, prev_mask, mesh)
++        x = hc_expand(h, residual, post, comb)
++        residual = x
++        post, comb, h = self._mix(x, "ffn")
++        h = rms_norm(h, self.post_attention_layernorm.value, self.eps)
++        h = self.mlp(h)
++        x = hc_expand(h, residual, post, comb)
++        return x, mask
++
++
++class Glm5NextModel(nnx.Module):
++    def __init__(self, cfg, mesh, dtype, ep_size=1):
++        check_layer_plan(cfg)
++        self.cfg = cfg
++        self.mesh = mesh
++        self.dtype = dtype
++        self.hc = int(cfg.hc_mult)
++        self.eps = float(cfg.rms_norm_eps)
++        self.embed = Embed(int(cfg.vocab_size), int(cfg.hidden_size), dtype=dtype, param_dtype=dtype,
++                           kernel_axes=(None, None), mesh=mesh)
++        kda, mla = kda_layer_ids(cfg), mla_layer_ids(cfg)
++        self.layers = nnx.List([
++            Glm5NextDecoderLayer(cfg, mesh, i, kda.index(i) if i in kda else -1,
++                                 mla.index(i) if i in mla else -1, dtype, ep_size)
++            for i in range(int(cfg.num_hidden_layers))
++        ])
++        self.norm = _param((int(cfg.hidden_size),), dtype)
++        self.layers_to_capture = []
++        self.return_streams = False
++
++    def __call__(self, input_ids, meta: TokenMeta, state):
++        """Returns the final normed hidden state `[T, D]`, the captured slots (each `[T, hc * D]`),
++        the new state and, when `return_streams`, the four copies entering every layer."""
++        state = {k: list(v) for k, v in state.items()}
++        h = self.embed(input_ids).astype(self.dtype)
++        # Every gather here crosses the token axis (the convolution window, the chunk grid, the
++        # per-request caches), so the stream stays replicated. Only the routed experts shard,
++        # inside EPMoE, and the attention cores split their heads inside shard_map.
++        h = jax.sharding.reshard(h, P(None, None))
++        x = jnp.repeat(h[:, None, :], self.hc, axis=1)
++        aux, streams = [], []
++        mask = None
++        for layer_id, layer in enumerate(self.layers):
++            if layer_id in self.layers_to_capture:
++                aux.append(x.reshape(x.shape[0], -1))
++            if self.return_streams:
++                streams.append(x)
++            x, mask = layer(x, meta, state, mask, self.mesh)
++        h = jnp.mean(x, axis=1)
++        h = rms_norm(h, self.norm.value, self.eps)
++        return h, aux, state, streams
++
++
++class Glm5NextForConditionalGeneration(nnx.Module):
++    """Text backbone of `zai-org/GLM-5.3-Flash`. The vision tower (`model.visual.*`) and the
++    multi-token-prediction layer (`model.language_model.layers.45.*`) load nothing."""
++
++    STATE_POOL = "glm5_next_state_pool"
++    # The runner still builds the paged KV pool and the scheduler still hands each token a slot in
++    # it, but nothing reads it. One layer keeps a slot small, and the token cap keeps the pool from
++    # taking the HBM the state pool needs.
++    paged_kv_layers = 1
++    PAGED_KV_TOKEN_CEILING = 1 << 20
++
++    @classmethod
++    def paged_kv_token_cap(cls, server_args, model_config, max_num_reqs):
++        return min(int(max_num_reqs) * int(model_config.context_len), cls.PAGED_KV_TOKEN_CEILING)
++
++    def __init__(self, config, mesh, dtype=jnp.bfloat16):
++        self.config = config
++        self.mesh = mesh
++        self.dtype = dtype
++        ep_size = int(getattr(config, "ep_size", 1) or 1)
++        if mesh is not None and int(dict(mesh.shape).get("data", 1)) > 1:
++            raise ValueError("Glm5NextForConditionalGeneration serves --dp-size 1 only")
++        self.model = Glm5NextModel(config, mesh, dtype, ep_size=ep_size)
++        self.lm_head = ParallelLMHead(int(config.vocab_size), int(config.hidden_size), dtype=dtype,
++                                      param_dtype=dtype, mesh=mesh)
++        self.logits_processor = LogitsProcessor(int(config.vocab_size), mesh=mesh)
++        self.capture_aux_hidden_states = False
++
++    def set_layers_to_capture(self, layers):
++        self.model.layers_to_capture = list(layers)
++
++    def forward_hidden(self, forward_batch, state):
++        meta = meta_from_forward_batch(forward_batch)
++        return self.model(_replicated(forward_batch.input_ids), meta, state)
++
++    @classmethod
++    def build_extra_memory_pools(cls, model_config, server_args, max_num_reqs, mesh, dtype):
++        """Pools the runner adds beside `token_to_kv_pool`: the per-request state. The model
++        reads none of the engine's paged KV pool."""
++        from sgl_jax.srt.mem_cache.glm5_next_state_pool import Glm5NextStatePool
++
++        if not getattr(server_args, "disable_radix_cache", False):
++            raise ValueError(
++                "Glm5NextForConditionalGeneration keeps its caches per request, not per token, so "
++                "no radix prefix can be shared; start the server with --disable-radix-cache"
++            )
++        pool = Glm5NextStatePool.create(
++            model_config.hf_config, max_num_reqs, model_config.context_len, dtype, mesh
++        )
++        logger.info("GLM-5.3-Flash state pool: %d slots, %.2f GiB", pool.num_slots,
++                    pool.size_bytes() / 2**30)
++        return {cls.STATE_POOL: pool}
++
++    def __call__(self, forward_batch, memory_pools, logits_metadata: LogitsMetadata):
++        pool = getattr(memory_pools, self.STATE_POOL)
++        hidden, aux, new_state, _ = self.forward_hidden(forward_batch, pool.state)
++        if not self.capture_aux_hidden_states:
++            aux = None
++        output = self.logits_processor(hidden, self.lm_head, logits_metadata, aux_hidden_states=aux)
++        updates = {self.STATE_POOL: new_state}
++        for name, other in memory_pools._pools.items():
++            if name != self.STATE_POOL:
++                # this model writes no paged KV; hand the buffers back as they came
++                updates[name] = other.kv_buffer
++        return output, updates, True, None
++
++    def load_weights(self, model_config):
++        load_checkpoint(self, model_config.model_path)
++
++
++# --------------------------------------------------------------------------------------------
++# Checkpoint reading
++# --------------------------------------------------------------------------------------------
++
++_ST_DTYPES = {
++    "F32": np.float32,
++    "F16": np.float16,
++    "BF16": np.uint16,
++    "F8_E4M3": np.uint8,
++    "I8": np.int8,
++    "U8": np.uint8,
++    "I32": np.int32,
++    "I64": np.int64,
++}
++
++
++def scan_safetensors(path) -> dict:
++    """Every tensor in `path/*.safetensors`: file, dtype tag, shape, byte range."""
++    index = {}
++    for file in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
++        with open(file, "rb") as fp:
++            n = struct.unpack("<Q", fp.read(8))[0]
++            header = json.loads(fp.read(n))
++        base = 8 + n
++        for name, info in header.items():
++            if name == "__metadata__":
++                continue
++            start, stop = info["data_offsets"]
++            index[name] = (file, info["dtype"], tuple(info["shape"]), base + start, base + stop)
++    return index
++
++
++def read_tensor(entry) -> np.ndarray:
++    """Raw read through a memory map. BF16 comes back as float32, F8_E4M3 as
++    `ml_dtypes.float8_e4m3fn`."""
++    import ml_dtypes
++
++    file, tag, shape, start, stop = entry
++    arr = np.memmap(file, dtype=_ST_DTYPES[tag], mode="r", offset=start, shape=tuple(shape))
++    if tag == "BF16":
++        return (arr.astype(np.uint32) << 16).view(np.float32)
++    if tag == "F8_E4M3":
++        return arr.view(ml_dtypes.float8_e4m3fn)
++    return arr
++
++
++def dequant_fp8_block(weight: np.ndarray, scale_inv: np.ndarray, block=(128, 128)) -> np.ndarray:
++    """E4M3 `[out, in]` times one FP32 `weight_scale_inv` per `block` tile. The last tile in
++    either axis may be partial."""
++    out, inn = weight.shape
++    bo, bi = block
++    s = np.asarray(scale_inv, np.float32)
++    if s.shape != (-(-out // bo), -(-inn // bi)):
++        raise ValueError(f"scale {s.shape} doesn't tile weight {weight.shape} at {block}")
++    s = np.repeat(np.repeat(s, bo, 0), bi, 1)[:out, :inn]
++    return weight.astype(np.float32) * s
++
++
++PREFIX = "model.language_model."
++SKIPPED_PREFIXES = ("model.visual.",)
++
++
++def load_checkpoint(model: Glm5NextForConditionalGeneration, path: str) -> dict:
++    """Read every text-backbone tensor, widen FP8 to the parameter dtype, and place each on its
++    parameter's sharding. Returns the key -> read map. Raises on a checkpoint key it neither reads
++    nor skips, and on a parameter nothing wrote. Layers at or past `num_hidden_layers` (the
++    multi-token-prediction layer, or a cut stack) and the vision tower are skipped."""
++    index = scan_safetensors(path)
++    cfg = model.config
++    qcfg = getattr(cfg, "checkpoint_quantization_config", None) or {}
++    block = tuple(qcfg.get("weight_block_size") or (128, 128))
++    n_layers = int(cfg.num_hidden_layers)
++    used, written = {}, set()
++
++    def get(name):
++        if name not in index:
++            raise KeyError(f"checkpoint has no {name}")
++        used[name] = True
++        return read_tensor(index[name])
++
++    def dense(name):
++        """[out, in] float32 of a linear, dequantized when it ships FP8."""
++        w = get(name + ".weight")
++        if index[name + ".weight"][1] == "F8_E4M3":
++            return dequant_fp8_block(w, get(name + ".weight_scale_inv"), block)
++        return np.asarray(w, np.float32)
++
++    def put(param, value, label, mesh=None, shape=None):
++        """Place a value on the parameter's partition spec over a concrete mesh. `value` is an
++        array, or a function of one device's index that returns that device's block, so a host
++        dequantizes only the experts its own devices hold."""
++        v = param.value
++        want = tuple(v.shape)
++        spec = getattr(getattr(v, "sharding", None), "spec", None) or P()
++        sharding = NamedSharding(mesh if mesh is not None else model.mesh, spec)
++        if callable(value):
++            if tuple(shape) != want:
++                raise ValueError(f"{label}: checkpoint gives {tuple(shape)}, parameter is {want}")
++
++            def blk(idx):
++                out = np.asarray(value(idx))
++                return out.astype(v.dtype) if out.dtype != v.dtype else out
++
++            param.value = jax.make_array_from_callback(want, sharding, blk)
++        else:
++            arr = np.asarray(value)
++            if tuple(arr.shape) != want:
++                raise ValueError(f"{label}: checkpoint gives {arr.shape}, parameter is {want}")
++            param.value = jax.device_put(arr.astype(v.dtype) if arr.dtype != v.dtype else arr, sharding)
++        written.add(id(param))
++
++    def expert_block(fp, w, n_exp, tshape):
++        """One device's slice of an `[experts, in, out]` stack, dequantizing only its experts."""
++
++        def blk(idx):
++            e = idx[0]
++            lo, hi = e.start or 0, n_exp if e.stop is None else e.stop
++            mats = [dense(f"{fp}experts.{i}.{w}").T for i in range(lo, hi)]
++            return np.stack(mats)[(slice(None), *idx[1:])]
++
++        return blk, (n_exp, *tshape)
++
++    m = model.model
++    put(m.embed.embedding, get(PREFIX + "embed_tokens.weight"), "embed_tokens")
++    put(model.lm_head.embedding, get("lm_head.weight"), "lm_head")
++    put(m.norm, get(PREFIX + "norm.weight"), "norm")
++    dim = int(cfg.hidden_size)
++    for i, layer in enumerate(m.layers):
++        pre = f"{PREFIX}layers.{i}."
++        put(layer.input_layernorm, get(pre + "input_layernorm.weight"), pre + "input_layernorm")
++        put(layer.post_attention_layernorm, get(pre + "post_attention_layernorm.weight"),
++            pre + "post_attention_layernorm")
++        for part in ("attn", "ffn"):
++            for kind in ("fn", "base", "scale"):
++                name = f"hc_{part}_{kind}"
++                put(getattr(layer, name), get(pre + name), pre + name)
++        a = layer.self_attn
++        ap = pre + "self_attn."
++        if layer.is_kda:
++            for name in ("q_proj", "k_proj", "v_proj", "f_a_proj", "f_b_proj", "b_proj", "g_a_proj",
++                         "g_b_proj", "o_proj"):
++                put(getattr(a, name), dense(ap + name).T, ap + name)
++            for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
++                w = get(ap + name + ".weight")
++                put(getattr(a, name), np.asarray(w, np.float32).reshape(w.shape[0], -1), ap + name)
++            put(a.dt_bias, get(ap + "dt_bias"), ap + "dt_bias")
++            put(a.A_log, get(ap + "A_log"), ap + "A_log")
++            put(a.o_norm, get(ap + "o_norm.weight"), ap + "o_norm")
++        else:
++            put(a.q_a_proj, dense(ap + "q_a_proj").T, ap + "q_a_proj")
++            put(a.q_a_layernorm, get(ap + "q_a_layernorm.weight"), ap + "q_a_layernorm")
++            put(a.q_b_proj, dense(ap + "q_b_proj").T, ap + "q_b_proj")
++            put(a.kv_a_proj_with_mqa, dense(ap + "kv_a_proj_with_mqa").T, ap + "kv_a_proj_with_mqa")
++            put(a.kv_a_layernorm, get(ap + "kv_a_layernorm.weight"), ap + "kv_a_layernorm")
++            put(a.kv_b_proj, dense(ap + "kv_b_proj").reshape(a.kv_b_proj.value.shape), ap + "kv_b_proj")
++            put(a.o_proj, dense(ap + "o_proj").T, ap + "o_proj")
++            if a.indexer is not None:
++                ix, ip = a.indexer, ap + "indexer."
++                put(ix.wq_b, dense(ip + "wq_b").T, ip + "wq_b")
++                put(ix.wk, dense(ip + "wk").T, ip + "wk")
++                put(ix.k_norm_weight, get(ip + "k_norm.weight"), ip + "k_norm.weight")
++                put(ix.k_norm_bias, get(ip + "k_norm.bias"), ip + "k_norm.bias")
++                put(ix.weights_proj, dense(ip + "weights_proj").T, ip + "weights_proj")
++                put(ix.compress_ape, get(ip + "index_kpool_compress_ape"), ip + "index_kpool_compress_ape")
++                put(ix.compress_gate, get(ip + "index_kpool_compress_gate"), ip + "index_kpool_compress_gate")
++        f = layer.mlp
++        fp = pre + "mlp."
++        if isinstance(f, Glm5NextMoE):
++            put(f.gate_weight, get(fp + "gate.weight"), fp + "gate.weight")
++            put(f.gate_bias, get(fp + "gate.e_score_correction_bias"), fp + "gate.e_score_correction_bias")
++            for name in ("gate_proj", "up_proj", "down_proj"):
++                put(getattr(f.shared, name), dense(fp + "shared_experts." + name).T, fp + "shared_experts." + name)
++            n_exp = int(cfg.n_routed_experts)
++            inter = int(cfg.moe_intermediate_size)
++            for w, target, tshape in (("gate_proj", f.experts.wi_0, (dim, inter)),
++                                      ("up_proj", f.experts.wi_1, (dim, inter)),
++                                      ("down_proj", f.experts.wo, (inter, dim))):
++                for e in range(n_exp):  # every expert counts as read, whichever host reads it
++                    for suffix in (".weight", ".weight_scale_inv"):
++                        if f"{fp}experts.{e}.{w}{suffix}" in index:
++                            used[f"{fp}experts.{e}.{w}{suffix}"] = True
++                blk, shape = expert_block(fp, w, n_exp, tshape)
++                put(target, blk, fp + f"experts.{w}", f.experts.moe_mesh, shape=shape)
++        else:
++            for name in ("gate_proj", "up_proj", "down_proj"):
++                put(getattr(f, name), dense(fp + name).T, fp + name)
++
++    def skipped(name):
++        if name.startswith(SKIPPED_PREFIXES):
++            return True
++        if name.startswith(PREFIX + "layers."):
++            return int(name[len(PREFIX + "layers."):].split(".")[0]) >= n_layers
++        return False
++
++    unread = sorted(k for k in index if k not in used and not skipped(k))
++    if unread:
++        raise ValueError(f"{len(unread)} checkpoint tensors have no parameter, first: {unread[:5]}")
++    missing = [
++        path for path, var in nnx.iter_graph(model)
++        if isinstance(var, nnx.Param) and id(var) not in written
++    ]
++    if missing:
++        raise ValueError(f"{len(missing)} parameters got no checkpoint tensor, first: {missing[:5]}")
++    logger.info("GLM-5.3-Flash loaded %d tensors from %s", len(used), path)
++    return used
++
++
++EntryClass = [Glm5NextForConditionalGeneration]

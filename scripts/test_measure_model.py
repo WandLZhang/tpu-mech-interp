@@ -37,9 +37,10 @@ directory and a shard directory laid out as a run leaves them. Run 2 has to move
 beside run 1. Control: the two lines the script ran before, which delete run 1's results and shard.
 
 The DOWNLOAD line comes from `fetch_weights.py`, which fetches
-`hf-internal-testing/tiny-random-gpt2` into a fresh `HF_HOME` three times: cold, warm, and after a killed fetch that took the weights'
-blob and left a tagged `.incomplete` partial of it. Each has to count the bytes that run wrote,
-and the third has to delete the partial. This part needs network access to the Hugging Face Hub.
+`hf-internal-testing/tiny-random-gpt2` into a fresh `HF_HOME` three times: cold, warm, and after
+a killed fetch that took the weights' blob and left a tagged `.incomplete` partial of it. Each has
+to count the bytes that run wrote, and the third has to delete the partial. This part needs
+network access to the Hugging Face Hub.
 
 Every check carries a control. A control that passes fails the run.
 """

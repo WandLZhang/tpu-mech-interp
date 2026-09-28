@@ -1,0 +1,136 @@
+Subject: [PATCH] fix(quant): accumulate block-wise FP8 matmuls in float32
+
+The block-wise FP8 matmul kept its accumulator in BF16. Each 128-wide
+input block's float32 dot rounded to BF16, the block's float32 scale
+rounded to BF16, and the running sum rounded after every block.
+xla_quantized_matmul_local then rounded each shard's partial sum to
+BF16 before a row-parallel layer's all-reduce. A BF16 forward rounds
+the product once.
+
+On a v5p-64 at --tp-size 32 (2026-09-27) GLM-5.3's capture check
+failed layers 10 to 13 at 2.16 to 2.75 times a BF16 forward's error.
+Its q_a_proj and kv_a_proj_with_mqa sum 48 input blocks each.
+
+The kernel now keeps each block's dot, its scales and the running sum
+in float32, and takes an out_dtype. xla_quantized_matmul_local asks it
+for float32 when a reduction follows, reduces in float32 and rounds
+once.
+
+Checked on CPU against GLM-5.3's published weights, one decoder layer
+at a time, with the float32 reference's hidden states as input and
+this kernel's arithmetic written out in torch (layers 8 to 13 and 20,
+2026-09-27): each layer's own error sat at 1.39 to 2.27 times a BF16
+forward's before, 1.06 to 1.11 with the float32 accumulator and scale,
+and 1.00 to 1.08 with the float32 reduction too. The kernel itself,
+run in the Pallas TPU interpreter on a 64 x 6,144 by 6,144 x 512
+product, went from 3.96 to 0.71 times a BF16 matmul's error.
+---
+ .../srt/kernels/quantized_matmul/kernel.py       | 10 +++++++---
+ .../quantized_matmul_kernels/blockwise_kernel.py | 16 ++++++++++++----
+ 2 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/python/sgl_jax/srt/kernels/quantized_matmul/kernel.py b/python/sgl_jax/srt/kernels/quantized_matmul/kernel.py
+index c589216a..36b73378 100644
+--- a/python/sgl_jax/srt/kernels/quantized_matmul/kernel.py
++++ b/python/sgl_jax/srt/kernels/quantized_matmul/kernel.py
+@@ -102,6 +102,8 @@ def xla_quantized_matmul_local(
+             block_size=block_size_in,
+             x_q_dtype=x_q_dtype,
+             tuned_value=tuned_value,
++            # A row-parallel layer sums the shards' outputs next; keep them in float32 until then.
++            out_dtype=jnp.float32 if reduce_axis is not None else None,
+         )
+ 
+     else:
+@@ -128,11 +130,12 @@ def xla_quantized_matmul_local(
+             )
+             out = out.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
+ 
+-    out = out.astype(out_dtype)
+-    # Reduce across the contracted (input) axis. Caller passes
+-    # ``output_scatter_dimension`` only when it has already decided that a
++    # Reduce across the contracted (input) axis in float32 and round once. Rounding each
++    # shard's partial sum to BF16 first adds one rounding per shard, 32 at --tp-size 32.
++    # Caller passes ``output_scatter_dimension`` only when it has already decided that a
+     # reduce-scatter on that dim is appropriate AND wired ``out_specs``
+     # accordingly; otherwise we do a plain all-reduce.
++    out = out.astype(out_dtype if reduce_axis is None else jnp.float32)
+     if reduce_axis is not None:
+         if output_scatter_dimension is not None:
+             out = lax.psum_scatter(
+@@ -140,5 +143,6 @@ def xla_quantized_matmul_local(
+             )
+         else:
+             out = lax.psum(out, axis_name=reduce_axis)
++        out = out.astype(out_dtype)
+ 
+     return out
+diff --git a/python/sgl_jax/srt/kernels/quantized_matmul/quantized_matmul_kernels/blockwise_kernel.py b/python/sgl_jax/srt/kernels/quantized_matmul/quantized_matmul_kernels/blockwise_kernel.py
+index b03cfcae..41a21262 100644
+--- a/python/sgl_jax/srt/kernels/quantized_matmul/quantized_matmul_kernels/blockwise_kernel.py
++++ b/python/sgl_jax/srt/kernels/quantized_matmul/quantized_matmul_kernels/blockwise_kernel.py
+@@ -20,6 +20,7 @@ MXU_SIZE = 256
+         "block_size",
+         "x_q_dtype",
+         "tuned_value",
++        "out_dtype",
+     ]
+ )
+ def quantized_matmul_kernel(
+@@ -31,6 +32,7 @@ def quantized_matmul_kernel(
+     x_q_dtype: jnp.dtype | None = None,
+     *,
+     tuned_value: TunedValue | None = None,
++    out_dtype: jnp.dtype | None = None,
+ ) -> jax.Array:
+     """Quantized matmul kernel with blockwise support.
+ 
+@@ -43,6 +45,8 @@ def quantized_matmul_kernel(
+       x_q_dtype: Quantization type of the input. If None or if the value is the
+         same as x.dtype, then no quantization is applied.
+       tuned_value: Kernel tuned values for optimal performance.
++      out_dtype: Output dtype, x.dtype by default. A caller that sums the output across
++        shards asks for float32 so the partial sums aren't rounded before the reduction.
+ 
+     Returns:
+       Quantized matmul result.
+@@ -55,6 +59,7 @@ def quantized_matmul_kernel(
+ 
+     if x_q_dtype is None:
+         x_q_dtype = x.dtype
++    out_dtype = x.dtype if out_dtype is None else jnp.dtype(out_dtype)
+     quantize_activation = x_q_dtype != x.dtype
+ 
+     orig_n_batch, orig_n_in = x.shape
+@@ -106,8 +111,11 @@ def quantized_matmul_kernel(
+     # used per batch.
+     save_x_q = quantize_activation and n_in == 1 and n_out > 1
+ 
+-    # TODO(amandaliang): Make this configurable.
+-    acc_dtype = jnp.bfloat16
++    # Each block's float32 dot, its scales and the running sum stay in float32. A BF16
++    # accumulator rounds the running sum after every block, which drops the low bits of every
++    # block that follows a large one, and a BF16 copy of a block scale moves the whole block's
++    # weights by up to 2^-9 together.
++    acc_dtype = jnp.float32
+     if (
+         quantize_activation
+         and jnp.issubdtype(w_q.dtype, jnp.integer)
+@@ -126,7 +134,7 @@ def quantized_matmul_kernel(
+         x_q_dtype=x_q_dtype,
+         w_q_dtype=w_q.dtype,
+         scale_dtype=jnp.float32,
+-        out_dtype=x.dtype,
++        out_dtype=out_dtype,
+         acc_dtype=acc_dtype,
+         save_acc=save_acc,
+         save_x_q=save_x_q,
+@@ -222,7 +230,7 @@ def quantized_matmul_kernel(
+             scratch_shapes=[pltpu.VMEM((batch_block_size, out_block_size), acc_dtype)],
+             grid=(n_batch, n_out, n_in),
+         ),
+-        out_shape=jax.ShapeDtypeStruct((padded_n_batch, padded_n_out), x.dtype),
++        out_shape=jax.ShapeDtypeStruct((padded_n_batch, padded_n_out), out_dtype),
+         compiler_params=pltpu.CompilerParams(
+             dimension_semantics=("parallel", "parallel", "arbitrary"),
+             vmem_limit_bytes=vmem_limit_bytes,

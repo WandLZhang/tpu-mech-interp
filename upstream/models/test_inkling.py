@@ -1219,6 +1219,213 @@ def check_replication(scratch, failures):
     retire()
 
 
+# --- the published structure at the v5p-64's ratios -------------------------
+
+# Every field of the published `text_config`, sizes shrunk. At --tp-size 8 it
+# runs 2 query heads a device, 4 copies of each global KV head and 2 of each
+# local one, the counts Inkling runs at --tp-size 32. The layer plan is the
+# published one cut to 6 layers: 5 local then 1 global, the first 2 dense.
+# `head_dim`, `d_rel`, the conv kernel, `log_scaling_*`, `route_scale`, the
+# top-k and the logit multiplier keep their published values. The vocabulary pads 6 rows,
+# as the published one pads 966.
+PUBLISHED_TINY_CONFIG = dict(
+    CONFIG,
+    vocab_size=64,
+    unpadded_vocab_size=58,
+    hidden_size=64,
+    num_hidden_layers=6,
+    num_attention_heads=16,
+    num_key_value_heads=2,
+    head_dim=128,
+    swa_num_attention_heads=16,
+    swa_num_key_value_heads=4,
+    swa_head_dim=128,
+    sliding_window_size=8,
+    d_rel=16,
+    rel_extent=16,
+    log_scaling_n_floor=128000,
+    log_scaling_alpha=0.1,
+    local_layer_ids=[i for i in range(6) if i % 6 != 5],
+    dense_mlp_idx=2,
+    dense_intermediate_size=96,
+    intermediate_size=96,
+    moe_intermediate_size=32,
+    n_routed_experts=16,
+    num_experts_per_tok=6,
+    n_shared_experts=2,
+    route_scale=8.0,
+    logits_mup_width_multiplier=24.0,
+    model_max_length=128,
+)
+PUBLISHED_TINY_TP = 8
+# Past the 16-token bias extent and the 8-token window, in one prefill pass.
+PUBLISHED_TINY_PROMPT = 24
+
+
+def check_capture_reference(model_path: str, ids, workdir: str, *, single_norm: bool):
+    """`check_capture.reference_forward` on `ids`, float32, run in a process of its own.
+
+    The capture check on the slice gates against this function's output. It runs
+    apart from the engine because importing `sgl_jax` registers its own Inkling
+    config with `AutoConfig`, which `transformers` can't build a model from.
+    `single_norm=False` drops the embed-norm fix, which rebuilds the reference the
+    v5p-64 check of 2026-09-27 read.
+    """
+    import json
+
+    import numpy as np
+
+    out = os.path.join(workdir, f"check-capture-reference-{int(single_norm)}.npz")
+    script = (
+        "import json, sys, numpy as np\n"
+        f"sys.path.insert(0, {os.path.join(HERE, os.pardir, os.pardir, 'scripts')!r})\n"
+        "import check_capture\n"
+        + (
+            ""
+            if single_norm
+            else "check_capture.norm_embeddings_once = lambda model: {'modules': 0}\n"
+        )
+        + f"states = check_capture.reference_forward({model_path!r}, [{json.dumps(list(ids))}],"
+        " 'float32')[0]\n"
+        f"np.savez({out!r}, *states)\n"
+    )
+    env = dict(os.environ, JAX_PLATFORMS="cpu")
+    run = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, env=env, timeout=900
+    )
+    if run.returncode != 0:
+        raise RuntimeError(f"check_capture.reference_forward exited {run.returncode}: {run.stderr}")
+    for line in run.stdout.splitlines():
+        if "embed_norm ran" in line:
+            print("      " + line)
+    data = np.load(out)
+    return [data[f"arr_{index}"] for index in range(len(data.files))]
+
+
+def check_published_structure(scratch, tree, failures):
+    """The published structure at --tp-size 8, in one process and in two, against transformers.
+
+    One process serves a prompt past the bias extent and the window and captures
+    every layer input. Each has to match `transformers.InklingForCausalLM` and
+    `check_capture.reference_forward`, the reference the v5p-64 check gates
+    against. That reference's control drops its embed-norm fix and has to miss at
+    layer 0 by more than CONTROL_FLOOR. Then two processes of 4 devices each load
+    the same checkpoint over one 8-device mesh, and every block of every weight
+    each process holds has to equal the one-process load's. Its control repeats
+    the KV heads in the tiled order, `h0 h1 h0 h1`, in place of `h0 h0 h1 h1`.
+    """
+    import json
+
+    import jax
+    import numpy as np
+    from flax import nnx
+
+    cfg = PUBLISHED_TINY_CONFIG
+    model_path = os.path.join(scratch, "published-tiny")
+    reference = write_checkpoint(cfg, model_path)
+    serving = Serving(
+        model_path,
+        PUBLISHED_TINY_TP,
+        precompile=False,
+        # 64 padded tokens times the top 6 is 384 rows, three of the grouped
+        # matmul's 128-row tiles.
+        chunked_prefill_size=64,
+        max_prefill_tokens=64,
+        max_total_tokens=256,
+        precompile_token_paddings=[64],
+    )
+    for index, layer in enumerate(serving.model.model.layers):
+        attention = layer.self_attn
+        kind = "local" if attention.is_local else "global"
+        heads = attention.q_head_num // PUBLISHED_TINY_TP
+        stored = cfg["swa_num_key_value_heads"] if attention.is_local else cfg["num_key_value_heads"]
+        copies = attention.k_proj.weight.value.shape[1] // (stored * attention.head_dim)
+        note(
+            f"layer {index} ({kind}) runs the v5p-64's head counts",
+            heads == 2 and copies == (2 if attention.is_local else 4),
+            f"{heads} query heads a device, {copies} copies of each of {stored} KV heads",
+            failures,
+        )
+
+    keep = cfg["unpadded_vocab_size"]
+    prompt = np.random.default_rng(17).integers(0, keep, size=PUBLISHED_TINY_PROMPT).tolist()
+    req = serving.request("published", prompt, hidden=True)
+    _, step = serving.extend([req])
+    report("prefill logits", step.logits[0, :keep], reference_logits(reference, prompt)[-1], failures)
+    captured = (
+        np.asarray(step.output.hidden_states)[: len(prompt)]
+        .reshape(len(prompt), cfg["num_hidden_layers"], cfg["hidden_size"])
+        .transpose(1, 0, 2)
+    )
+    serving.release(req)
+    for index, (got, want) in enumerate(zip(captured, reference_layer_inputs(reference, prompt))):
+        kind = "local" if index in cfg["local_layer_ids"] else "global"
+        mlp = "dense" if index < cfg["dense_mlp_idx"] else "routed"
+        report(f"layer {index} input ({kind}/{mlp})", got, want, failures)
+
+    workdir = os.path.join(scratch, "published-tiny-logs")
+    os.makedirs(workdir, exist_ok=True)
+    print("  against check_capture.reference_forward, what the capture check gates on")
+    fixed = check_capture_reference(model_path, prompt, workdir, single_norm=True)
+    for index, got in enumerate(captured):
+        report(f"slot {index} against check_capture", got, fixed[index], failures)
+    unfixed = check_capture_reference(model_path, prompt, workdir, single_norm=False)
+    control(
+        "check_capture's reference with embed_norm twice",
+        float(np.max(np.abs(captured[0] - unfixed[0]))),
+        failures,
+    )
+
+    one_process = {}
+    for path, leaf in jax.tree_util.tree_leaves_with_path(nnx.state(serving.model)):
+        array = getattr(leaf, "value", leaf)
+        if isinstance(array, jax.Array):
+            one_process[jax.tree_util.keystr(path)] = np.asarray(jax.device_get(array))
+    del serving
+    retire()
+
+    def compare(mode):
+        results = host_reads(tree, model_path, workdir, mode)
+        if results is None:
+            return None, None
+        blocks = mismatched = 0
+        first = None
+        for pid in sorted(results):
+            dump = np.load(os.path.join(workdir, f"blocks-{mode}-{pid}.npz"))
+            for key in dump.files:
+                name, bounds = key.split("|", 1)
+                index = tuple(slice(start, stop) for start, stop in json.loads(bounds))
+                blocks += 1
+                want = one_process.get(name)
+                if want is None or not np.array_equal(dump[key], want[index]):
+                    mismatched += 1
+                    first = first or f"{name} {bounds} on process {pid}"
+        return blocks, (mismatched, first)
+
+    blocks, outcome = compare("dump")
+    if blocks is None:
+        failures.append("the two-process load of the published structure didn't report")
+        return
+    mismatched, first = outcome
+    names = {key.split("|", 1)[0] for key in one_process}
+    note(
+        f"{HOST_READS_PROCESSES} processes x {HOST_READS_DEVICES} devices load what one process loads",
+        blocks > 0 and mismatched == 0,
+        f"{blocks} blocks of {len(names)} weights, {mismatched} differ"
+        + (f", the first {first}" if first else ""),
+        failures,
+    )
+    control_blocks, control_outcome = compare("tiled-heads")
+    caught = control_blocks is not None and control_outcome[0] > 0
+    print(
+        f"      control (KV heads repeated in the tiled order): "
+        f"{control_outcome[0] if control_outcome else 'no'} blocks differ"
+        f"  -> {'detected' if caught else 'NOT DETECTED'}"
+    )
+    if not caught:
+        failures.append("the tiled-heads control loaded what one process loads, so the check proves nothing")
+
+
 # --- the runner's own fields ------------------------------------------------
 
 
@@ -1432,6 +1639,495 @@ def check_dummy_placement(scratch, failures):
     if not whole:
         failures.append("the dummy load without the expert fill left nothing whole")
     retire()
+
+
+# --- the attention's temporaries -------------------------------------------
+
+
+def attention_temporaries(bucket: int, *, bias: bool) -> int:
+    """Temporary bytes XLA plans for one extend `forward_attention` over a `bucket`-slot cache_loc.
+
+    Four requests of 16 tokens, 8 query heads on 2 KV heads, a 4,096-slot pool.
+    The bucket is the engine's `cache_loc` length: `max_running_requests` times
+    the page-aligned `max_req_len`. `bias=False` runs the whole-bucket pass the
+    other models take, `bias=True` the blockwise one Inkling's position bias
+    takes.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    from sgl_jax.srt.layers.attention.native_backend import forward_attention
+    from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+    from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+
+    mesh = create_device_mesh(ici_parallelism=[1, 1], dcn_parallelism=[1, 1], device_indexes=[0])
+    tokens, heads, kv_heads, dim, pool, extent = 64, 8, 2, 128, 4096, 16
+
+    def spec(*shape, dtype=jnp.float32, axes=None):
+        axes = axes if axes is not None else P()
+        return jax.ShapeDtypeStruct(shape, dtype, sharding=NamedSharding(mesh, axes))
+
+    def run(q, k, v, seq_lens, loc, prefix, extend, position_bias):
+        return forward_attention(
+            q,
+            k,
+            v,
+            seq_lens,
+            loc,
+            prefix,
+            extend,
+            heads,
+            kv_heads,
+            page_size=16,
+            scale=1.0 / dim,
+            mode=ForwardMode.EXTEND,
+            kv_sharding=NamedSharding(mesh, P(None, "tensor", None)),
+            mesh=mesh,
+            sliding_window_size=None,
+            softmax_dtype=jnp.float32,
+            position_bias=position_bias,
+        )
+
+    ints = jnp.int32
+    args = (
+        spec(tokens, heads, dim, axes=P(None, "tensor", None)),
+        spec(pool, kv_heads, dim, axes=P(None, "tensor", None)),
+        spec(pool, kv_heads, dim, axes=P(None, "tensor", None)),
+        spec(4, dtype=ints),
+        spec(bucket, dtype=ints),
+        spec(4, dtype=ints),
+        spec(4, dtype=ints),
+        spec(tokens, heads, extent, axes=P(None, "tensor", None)) if bias else None,
+    )
+    with jax.set_mesh(mesh):
+        compiled = jax.jit(run).lower(*args).compile()
+    return int(compiled.memory_analysis().temp_size_in_bytes)
+
+
+def check_attention_memory(failures):
+    """The position-bias pass holds the same temporaries whatever the cache_loc bucket.
+
+    Inkling's check launch on a v5p-64 hands the native backend a 5,329,408-slot
+    bucket. An AOT compile of a pass that spans it asks for 1.43 TB of temporaries
+    per chip, and the chip's own compile asked for 1.71 TB.
+    Control: the whole-bucket pass, which grows with the bucket.
+    """
+    small, large = 8192, 65536
+    bias_small = attention_temporaries(small, bias=True)
+    bias_large = attention_temporaries(large, bias=True)
+    note(
+        "position-bias temporaries don't grow with the bucket",
+        bias_large <= 1.05 * bias_small + (large - small) * 16,
+        f"{bias_small:,} bytes at {small:,} slots, {bias_large:,} at {large:,}",
+        failures,
+    )
+    whole_small = attention_temporaries(small, bias=False)
+    whole_large = attention_temporaries(large, bias=False)
+    grew = whole_large >= 4 * whole_small
+    print(
+        f"      control (the whole-bucket pass): {whole_small:,} bytes at {small:,} slots,"
+        f" {whole_large:,} at {large:,}  -> {'detected' if grew else 'NOT DETECTED'}"
+    )
+    if not grew:
+        failures.append(
+            "the whole-bucket pass didn't grow with the bucket, so the check proves nothing"
+        )
+
+
+# --- what each host reads ---------------------------------------------------
+
+HOST_READS_PROCESSES = 2
+HOST_READS_DEVICES = 4  # per process, so the mesh spans 8 devices like REPLICATION_TP
+
+
+def host_reads_child(argv) -> int:
+    """One of two processes loading one checkpoint over an 8-device mesh, 4 devices each.
+
+    Counts the bytes each checkpoint key gives up to this process, through
+    `safetensors` and through plain file reads of a `.safetensors` file. The
+    checkpoint directory reads as a gcsfuse mount, so the loader's warm-up
+    decides on the process count alone. `mode` is `fixed`, or a control:
+    `warm-up` forces the single-process warm-up, `whole` reads every block out
+    of its whole tensor.
+    """
+    import io
+    import json
+    import types
+
+    import jax
+
+    pid, port, tree, model_path, mode = int(argv[1]), argv[2], argv[3], argv[4], argv[5]
+    jax.distributed.initialize(
+        coordinator_address=f"127.0.0.1:{port}",
+        num_processes=HOST_READS_PROCESSES,
+        process_id=pid,
+        initialization_timeout=120,
+    )
+    install(tree)
+    import builtins
+
+    import numpy as np
+    import safetensors
+    from jax.sharding import Mesh
+    from jax.sharding import PartitionSpec as P
+
+    from sgl_jax.srt.configs.load_config import LoadConfig
+    from sgl_jax.srt.configs.model_config import ModelConfig
+    from sgl_jax.srt.model_loader import loader as loader_module
+    from sgl_jax.srt.model_loader.loader import JAXModelLoader, get_model_loader
+    from sgl_jax.srt.models import inkling
+    from sgl_jax.srt.utils import weight_utils
+
+    reads: dict[str, int] = {}
+
+    def count(key, nbytes):
+        reads[key] = reads.get(key, 0) + int(nbytes)
+
+    real_safe_open = safetensors.safe_open
+
+    class CountedSlice:
+        def __init__(self, inner, key):
+            self.inner, self.key = inner, key
+
+        def __getitem__(self, index):
+            block = self.inner[index]
+            count(self.key, np.asarray(block).nbytes)
+            return block
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    class CountedHandle:
+        def __init__(self, *args, **kwargs):
+            self.inner = real_safe_open(*args, **kwargs)
+
+        def __enter__(self):
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self.inner.__exit__(*exc)
+
+        def get_slice(self, key):
+            return CountedSlice(self.inner.get_slice(key), key)
+
+        def get_tensor(self, key):
+            tensor = self.inner.get_tensor(key)
+            count(key, np.asarray(tensor).nbytes)
+            return tensor
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    safetensors.safe_open = CountedHandle
+    if hasattr(weight_utils, "safe_open"):
+        weight_utils.safe_open = CountedHandle
+    loader_module.safe_open = CountedHandle
+
+    class CountedFile:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.inner.close()
+
+        def readinto(self, buffer):
+            size = self.inner.readinto(buffer)
+            count("whole-file reads", size or 0)
+            return size
+
+        def read(self, *args):
+            data = self.inner.read(*args)
+            count("whole-file reads", len(data))
+            return data
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    def mounted_open(path, *args, **kwargs):
+        if str(path) == "/proc/mounts":
+            return io.StringIO(f"gcsfuse {model_path} fuse.gcsfuse ro,nosuid 0 0\n")
+        handle = builtins.open(path, *args, **kwargs)
+        return CountedFile(handle) if str(path).endswith(".safetensors") else handle
+
+    loader_module.open = mounted_open
+
+    if mode == "warm-up":
+        warm_up = JAXModelLoader._warmup_safetensors_cache
+
+        def single_process_warm_up(model_config):
+            saved = loader_module.jax
+            loader_module.jax = types.SimpleNamespace(process_count=lambda: 1)
+            try:
+                return warm_up(model_config)
+            finally:
+                loader_module.jax = saved
+
+        JAXModelLoader._warmup_safetensors_cache = staticmethod(single_process_warm_up)
+    elif mode == "tiled-heads":
+        # The control for `dump`: each device reads the KV head its columns
+        # would hold if the copies went h0 h1 h0 h1 rather than h0 h0 h1 h1.
+        def tiled_kv_array(self, weight_info, key, param, attention):
+            rows, hidden = self.tensor_shape(weight_info, key)
+            width = param.shape[1]
+            head_dim = attention.head_dim
+            stored_heads = rows // head_dim
+
+            def fetch(start, stop):
+                columns = np.arange(start[1], stop[1])
+                source = (columns // head_dim) % stored_heads * head_dim + columns % head_dim
+                block = self.read_block(weight_info, key, (slice(0, rows), slice(start[0], stop[0])))
+                return block[source].T
+
+            return self.sharded_array((hidden, width), P(None, "tensor"), fetch)
+
+        inkling.InklingForCausalLM.replicated_kv_array = tiled_kv_array
+    elif mode == "whole":
+
+        def whole_block(self, weight_info, key, index):
+            path = self.tensor_file(weight_info, key)
+            with safetensors.safe_open(path, framework="np", device="cpu") as handle:
+                return handle.get_tensor(key)[index]
+
+        inkling.InklingForCausalLM.read_block = whole_block
+
+    devices = HOST_READS_PROCESSES * HOST_READS_DEVICES
+    mesh = Mesh(
+        np.array(jax.devices()).reshape(1, devices),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+    model_config = ModelConfig(model_path=model_path, trust_remote_code=False, dtype="float32")
+    model_config.validate_tensor_parallel_config(devices)
+    model_config.configure_for_tensor_parallel(devices)
+    with jax.set_mesh(mesh):
+        model = get_model_loader(LoadConfig(load_format="auto"), mesh).load_model(
+            model_config=model_config
+        )
+    mappings = model.create_weight_mappings()
+    replicated = sorted(
+        key
+        for key, mapping in mappings.items()
+        if mapping.sharding is not None and all(axis is None for axis in mapping.sharding)
+    )
+    # The loaded k of the first layer, this process's shards, against the checkpoint.
+    attention = model.model.layers[0].self_attn
+    with real_safe_open(os.path.join(model_path, "model.safetensors"), framework="np") as handle:
+        stored = handle.get_tensor(f"{model.source_root}.layers.0.attn.wk_dv.weight")
+    heads = stored.reshape(-1, attention.head_dim, stored.shape[-1])
+    copies = attention.k_proj.weight.value.shape[1] // stored.shape[0]
+    want = np.repeat(heads, copies, axis=0).reshape(-1, stored.shape[-1]).T
+    k_matches = all(
+        np.array_equal(np.asarray(shard.data), want[shard.index])
+        for shard in attention.k_proj.weight.value.addressable_shards
+    )
+    if mode in ("dump", "tiled-heads"):
+        # Every block of every weight this process holds, keyed by the weight's
+        # path and the block's bounds, for the parent to hold against a
+        # one-process load of the same checkpoint.
+        from flax import nnx
+
+        blocks = {}
+        for path, leaf in jax.tree_util.tree_leaves_with_path(nnx.state(model)):
+            array = getattr(leaf, "value", leaf)
+            if not isinstance(array, jax.Array):
+                continue
+            name = jax.tree_util.keystr(path)
+            for shard in array.addressable_shards:
+                bounds = [list(part.indices(size)[:2]) for part, size in zip(shard.index, array.shape)]
+                blocks[f"{name}|{json.dumps(bounds)}"] = np.asarray(shard.data)
+        np.savez(os.path.join(os.environ["INKLING_BLOCKS_DIR"], f"blocks-{mode}-{pid}.npz"), **blocks)
+    print(
+        "RESULT "
+        + json.dumps(
+            {
+                "pid": pid,
+                "mode": mode,
+                "reads": reads,
+                "replicated": replicated,
+                "mapped": sorted(mappings),
+                "k_matches": bool(k_matches),
+            }
+        ),
+        flush=True,
+    )
+    jax.distributed.shutdown()
+    return 0
+
+
+def free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def host_reads(tree, model_path, workdir, mode, timeout=900) -> dict | None:
+    """Both processes' RESULT lines for one mode, keyed by process index."""
+    import json
+
+    port = free_port()
+    env = dict(os.environ)
+    env.update(
+        JAX_PLATFORMS="cpu",
+        XLA_FLAGS=f"--xla_force_host_platform_device_count={HOST_READS_DEVICES}",
+        INKLING_BLOCKS_DIR=workdir,
+    )
+    logs = []
+    procs = []
+    files = [
+        open(os.path.join(workdir, f"host-reads-{mode}-{pid}.log"), "w+")
+        for pid in range(HOST_READS_PROCESSES)
+    ]
+    try:
+        for pid, fh in enumerate(files):
+            argv = [
+                sys.executable,
+                os.path.abspath(__file__),
+                "--host-reads-child",
+                str(pid),
+                str(port),
+                tree,
+                model_path,
+                mode,
+            ]
+            procs.append(subprocess.Popen(argv, stdout=fh, stderr=subprocess.STDOUT, env=env))
+        deadline = time.monotonic() + timeout
+        for proc in procs:
+            proc.wait(timeout=max(deadline - time.monotonic(), 0.1))
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+        for proc in procs:
+            proc.wait()
+        for fh in files:
+            fh.seek(0)
+            logs.append(fh.read())
+            fh.close()
+    results = {}
+    for log in logs:
+        for line in log.splitlines():
+            if line.startswith("RESULT "):
+                result = json.loads(line[len("RESULT ") :])
+                results[result["pid"]] = result
+    if len(results) != HOST_READS_PROCESSES:
+        print(f"  [FAIL] {len(results)} of {HOST_READS_PROCESSES} processes reported ({mode}):")
+        for log in logs:
+            print(log)
+        return None
+    return results
+
+
+def over_share(results, sizes) -> list[str]:
+    """Each process's reads beyond its share of the sharded tensors plus every replicated one.
+
+    A sharded tensor's share is its bytes times the process's fraction of the
+    devices. A replicated tensor may be read whole once. A key the model never
+    maps or stacks may not be read at all.
+    """
+    fraction = HOST_READS_DEVICES / (HOST_READS_PROCESSES * HOST_READS_DEVICES)
+    problems = []
+    for pid, result in sorted(results.items()):
+        replicated = set(result["replicated"])
+        mapped = set(result["mapped"])
+        allowed = sum(
+            size if key in replicated else size * fraction
+            for key, size in sizes.items()
+            if key in mapped or is_stacked_key(key)
+        )
+        total = sum(result["reads"].values())
+        over = [
+            f"{key} {read:,} of {sizes.get(key, 0):,}"
+            for key, read in sorted(result["reads"].items())
+            if read > (sizes.get(key, 0) if key in replicated else sizes.get(key, 0) * fraction)
+        ]
+        if total > allowed or over:
+            problems.append(
+                f"process {pid} read {total:,} bytes against a share of {allowed:,.0f}"
+                + (f"; over on {len(over)} key(s), the first {over[0]}" if over else "")
+            )
+    return problems
+
+
+def is_stacked_key(key: str) -> bool:
+    """The tensors `load_stacked_weights` reads beside the mapping table."""
+    return key.endswith(
+        (
+            ".mlp.w13_dn.weight",
+            ".mlp.w2_md.weight",
+            ".experts.w13_weight",
+            ".experts.w2_weight",
+            ".shared_experts.shared_w13_weight",
+            ".shared_experts.shared_w2_weight",
+        )
+    ) and ".mtp." not in key
+
+
+def check_host_reads(scratch, tree, failures):
+    """Two processes of 4 devices each load one checkpoint, and each reads only its share.
+
+    Its share is its half of every sharded tensor plus each replicated tensor
+    whole, once, and nothing the model doesn't load. On the v5p-64 every host
+    read the whole 1,773.9 GiB checkpoint through the loader's GCSFuse warm-up
+    before it read its own slices. Controls: the single-process warm-up, and
+    every block read out of its whole tensor. Both have to go over.
+    """
+    import safetensors
+
+    model_path = os.path.join(scratch, "host-reads")
+    write_checkpoint(REPLICATION_CONFIG, model_path)
+    with safetensors.safe_open(os.path.join(model_path, "model.safetensors"), framework="np") as fh:
+        sizes = {key: fh.get_tensor(key).nbytes for key in fh.keys()}
+    workdir = os.path.join(scratch, "host-reads-logs")
+    os.makedirs(workdir, exist_ok=True)
+
+    results = host_reads(tree, model_path, workdir, "fixed")
+    if results is None:
+        failures.append("the two-process load didn't report")
+        return
+    for pid, result in sorted(results.items()):
+        total = sum(result["reads"].values())
+        print(
+            f"      process {pid} read {total:,} of the checkpoint's {sum(sizes.values()):,} bytes"
+        )
+    problems = over_share(results, sizes)
+    note(
+        "each process reads its share once",
+        not problems,
+        "; ".join(problems) or f"{len(sizes)} keys, {sum(sizes.values()):,} bytes, two processes",
+        failures,
+    )
+    note(
+        "the k each process loaded matches the checkpoint",
+        all(result["k_matches"] for result in results.values()),
+        f"layer 0 k_proj shards on {len(results)} processes",
+        failures,
+    )
+    for mode in ("warm-up", "whole"):
+        control_results = host_reads(tree, model_path, workdir, mode)
+        caught = control_results is not None and bool(over_share(control_results, sizes))
+        totals = (
+            [sum(r["reads"].values()) for _, r in sorted(control_results.items())]
+            if control_results
+            else []
+        )
+        print(
+            f"      control ({mode}): processes read {totals} bytes"
+            f"  -> {'detected' if caught else 'NOT DETECTED'}"
+        )
+        if not caught:
+            failures.append(
+                f"the {mode} control stayed within the share, so the check proves nothing"
+            )
 
 
 # --- the three entry classes ------------------------------------------------
@@ -1960,7 +2656,7 @@ def missing_engine_packages() -> list[str]:
     return missing
 
 
-def run_engine(scratch, model_path, reference, failures) -> None:
+def run_engine(scratch, model_path, reference, failures, tree) -> None:
     """Every section that builds a `ModelWorker`."""
     serving = section(
         f"engine at --tp-size {TP}, checkpoint written by save_pretrained",
@@ -2022,6 +2718,14 @@ def run_engine(scratch, model_path, reference, failures) -> None:
         failures,
     )
     section(
+        f"the published structure at --tp-size {PUBLISHED_TINY_TP}, one process and two",
+        failures,
+        check_published_structure,
+        scratch,
+        tree,
+        failures,
+    )
+    section(
         "expert parallel", failures, check_expert_parallel, model_path, reference, failures
     )
     section("the runner's own fields", failures, check_runtime_fields, model_path, failures)
@@ -2031,6 +2735,15 @@ def run_engine(scratch, model_path, reference, failures) -> None:
         failures,
         check_dummy_placement,
         scratch,
+        failures,
+    )
+    section("the position-bias pass's temporaries", failures, check_attention_memory, failures)
+    section(
+        f"what each of {HOST_READS_PROCESSES} processes reads",
+        failures,
+        check_host_reads,
+        scratch,
+        tree,
         failures,
     )
 
@@ -2061,7 +2774,7 @@ def run_all(scratch: str) -> int:
     else:
         model_path = os.path.join(scratch, "inkling-tiny")
         reference = write_checkpoint(CONFIG, model_path)
-        run_engine(scratch, model_path, reference, failures)
+        run_engine(scratch, model_path, reference, failures, tree)
 
     section("published expert width", failures, check_expert_width, failures)
     section("an older transformers", failures, check_old_transformers, tree, failures)
@@ -2077,4 +2790,6 @@ def run_all(scratch: str) -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--host-reads-child"]:
+        raise SystemExit(host_reads_child(sys.argv[1:]))
     raise SystemExit(main())

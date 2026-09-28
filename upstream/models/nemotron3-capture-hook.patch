@@ -17,10 +17,10 @@ for the file.
  1 file changed, 32 insertions(+), 7 deletions(-)
 
 diff --git a/python/sgl_jax/srt/models/nemotron_h.py b/python/sgl_jax/srt/models/nemotron_h.py
-index 253fe621..d87ec5a8 100644
+index 1dcaf33c..7055db89 100644
 --- a/python/sgl_jax/srt/models/nemotron_h.py
 +++ b/python/sgl_jax/srt/models/nemotron_h.py
-@@ -603,6 +603,7 @@ class NemotronHModel(nnx.Module):
+@@ -630,6 +630,7 @@ class NemotronHModel(nnx.Module):
              param_dtype=dtype,
              scope_name="norm",
          )
@@ -28,7 +28,7 @@ index 253fe621..d87ec5a8 100644
  
      def __call__(self, forward_batch: ForwardBatch, memory_pools):
          hidden_states = (
-@@ -615,8 +616,15 @@ class NemotronHModel(nnx.Module):
+@@ -642,8 +643,15 @@ class NemotronHModel(nnx.Module):
          layers_recurrent = []
          layers_conv = []
          layers_topk_ids = []
@@ -46,7 +46,7 @@ index 253fe621..d87ec5a8 100644
              hidden_states, residual, state, topk_ids = layer(
                  hidden_states,
                  forward_batch,
-@@ -639,6 +647,7 @@ class NemotronHModel(nnx.Module):
+@@ -666,6 +674,7 @@ class NemotronHModel(nnx.Module):
          hidden_states = self.norm(hidden_states)
          return (
              hidden_states,
@@ -54,7 +54,7 @@ index 253fe621..d87ec5a8 100644
              layers_kv_fused,
              (layers_recurrent, layers_conv),
              layers_topk_ids,
-@@ -716,6 +725,7 @@ class NemotronHForCausalLM(nnx.Module):
+@@ -743,6 +752,7 @@ class NemotronHForCausalLM(nnx.Module):
              mesh=mesh,
              enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
          )
@@ -62,7 +62,7 @@ index 253fe621..d87ec5a8 100644
  
      def __call__(
          self,
-@@ -723,14 +733,29 @@ class NemotronHForCausalLM(nnx.Module):
+@@ -750,14 +760,29 @@ class NemotronHForCausalLM(nnx.Module):
          memory_pools,
          logits_metadata: LogitsMetadata,
      ):

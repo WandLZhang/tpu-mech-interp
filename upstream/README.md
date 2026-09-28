@@ -9,7 +9,7 @@ Check before trusting any of them:
 bash scripts/verify_patches.sh
 ```
 
-It applies all 14 patches to a clean checkout at `eb061d8`, in 12 checks, in the order each is
+It applies all 21 patches to a clean checkout at `eb061d8`, in 17 checks, in the order each is
 meant to be used, and names whatever fails. `SGL_COMMIT=main` runs the same check against upstream
 main. The clone takes full history, because a `--depth 1` clone holds only the tip of `main` and
 has no `eb061d8` to check out. Set `SGLANG_JAX_REPO` to a local checkout that holds `eb061d8` to
@@ -127,7 +127,8 @@ git -c user.name=you -c user.email=you@example.com am < "$REPO/upstream/sglang-j
 
 `sglang-jax-877.patch` is a `git format-patch` export and carries its original author, so apply
 it with `git am`. The rest carry the diff and the rationale without commit metadata, so apply
-those with `git apply` and write your own message.
+those with `git apply` and write your own message. No recorded run typed the block above. The
+measured runs built their trees through `scripts/bootstrap_tpu_vm.sh`, which runs the same `git am`.
 
 Tests: `test_return_hidden_states.py` checks shape and content.
 `test_hidden_states_alignment.py` and `_tp.py` compare every layer against a HuggingFace CPU
@@ -170,10 +171,11 @@ is BF16.
 
 ## The capture-mode gap
 
-`LogitsProcessor` only stores hidden states when `logits_metadata.capture_hidden_mode.need_capture()`
-is true, and `ScheduleBatch` derives that from `self.return_hidden_states`. Nothing set that flag
-from the requests in the batch, so it kept its `False` default, the mode stayed `NULL`, and
-`meta_info["hidden_states"]` came back empty with every line of plumbing present.
+`LogitsProcessor` only stores hidden states when
+`logits_metadata.capture_hidden_mode.need_capture()` is true, and `ScheduleBatch` derives that from
+`self.return_hidden_states`. Nothing set that flag from the requests in the batch, so it kept its
+`False` default, the mode stayed `NULL`, and `meta_info["hidden_states"]` came back empty with every
+line of plumbing present.
 
 `init_new` aggregates `return_logprob`, `return_output_logprob_only` and `return_routed_experts`
 from `all_reqs`. `return_hidden_states` was the one missing from that list. The patch adds it.
@@ -197,6 +199,83 @@ Adds the `layers_to_capture` hook to `Glm5Model`, matching `gemma4.py`, `llama.p
 `GlmMoeDsaForCausalLM` inherits it. Depends on `sglang-jax-877.patch` for the flag and the
 reshape.
 
+## `glm5-tp-sharding.patch`
+
+GLM-5.3 in its FP8 layout at a TP size its shared expert doesn't tile. It goes on top of
+`multihost-hidden-states.patch` and `glm5-capture-hook.patch`, the order the `glm5.3` row of
+[`scripts/multihost_run.sh`](../scripts/multihost_run.sh) applies them in.
+
+On a v5p-64 at `--tp-size 32` (2026-09-27) the first extend precompile died in the shared
+expert's `down_proj`:
+
+```
+ValueError: in_specs passed to shard_map: P('data', None) does not match the specs of the input:
+P('data', 'tensor') for arg: bfloat16[1024@data,2048@tensor].
+```
+
+`QuantizedLinear.from_linear` drops a row-parallel FP8 layer to a replicated reduce axis when its
+128-wide input blocks don't tile across TP. GLM-5.3's shared expert has 2048 / 128 = 16 blocks
+against 32 chips. Its producer, the col-parallel gate and up projections, leaves the activation
+sharded on `tensor`, and the loader places `weight_q` row-parallel too. The mesh runs Explicit
+axes, so `shard_map` refuses both. The patch reshards the activation and `weight_q` to the
+layer's specs in `QuantizedLinear.__call__`, a no-op where they match, and
+`Glm5MLP.post_load_weights` places each FP8 `weight_q` where its `kernel_axes` say at load, so the
+fallback layer doesn't gather its weight every step. With the model serving at TP above 1 on one
+host, capture failed next, since a host slice of the mesh-wide hidden states lowers to a gather
+jax can't place. `_hidden_rows` copies them to the host once per batch there.
+
+`upstream/test_glm5_tp_sharding.py` is its gate. A tiny checkpoint in the published layout, with
+a 256-wide shared expert (2 blocks), serves on the real engine at `--tp-size` 1, 4 and 8, each at
+an equal `--ep-size`, with `attention_backend=dsa_sparse`. Without the patch tp 4 and 8 die with
+the chip's ValueError. With it tp 8 matches tp 1, and tp 4 matches tp 1 with the routed experts
+zeroed, in greedy ids, the log-softmax over the whole vocabulary and every captured layer. A copy
+with one shared-expert block scale at 1.5x has to differ.
+
+The GLM-5.3 row serves at `--ep-size 32`, so each routed expert sits whole on one chip. At
+`--ep-size 1` EPMoE passes `wo_scale` whole to each shard of a 64-row `wo` slice.
+
+Notes: the gate runs three Pallas TPU kernels, the block-wise FP8 matmul, the MLA paged attention
+and the grouped matmul, as XLA stand-ins with float32 sums, inside the engine's own `shard_map`s.
+On CPU the routed experts at `--ep-size 4` move some of the second prompt's tokens by up to 9%.
+Zeroing them removes it and zeroing the shared expert doesn't, so the gate prints tp 4 with
+them on as a note.
+
+## `glm5-fp8-accumulate.patch`
+
+Float32 sums in every FP8 linear of the GLM-5.3 tree. It goes on top of
+`glm5-tp-sharding.patch`, last in the `glm5.3` row of
+[`scripts/multihost_run.sh`](../scripts/multihost_run.sh).
+
+The second capture check of GLM-5.3 on the v5p-64 at `--tp-size 32` (2026-09-27 08:48Z) passed
+74 of 78 layers and failed layers 10 to 13 at 2.16 to 2.75 times the BF16 floor. The block-wise FP8
+matmul, the Pallas TPU kernel behind every `QuantizedLinear`, kept its accumulator in BF16 at
+`eb061d8`. Each 128-wide input block's float32 dot rounded to BF16, the block's float32 scale
+rounded to BF16, and the running sum rounded after every block. `xla_quantized_matmul_local` then
+rounded each shard's partial sum to BF16 before a row-parallel layer's all-reduce. A BF16 forward
+rounds the product once.
+
+The patch keeps each block's dot, its scales and the running sum in float32. The kernel takes an
+`out_dtype`, and `xla_quantized_matmul_local` asks for float32 when a reduction follows, reduces
+in float32 and rounds once.
+
+Each real layer alone, on CPU, with the float32 reference's hidden states as input and the
+kernel's arithmetic written out in torch (layers 8 to 13 and 20, 2026-09-27): the layer's own
+error sat at 1.39 to 2.27 times a BF16 forward's before the patch and at 1.00 to 1.08 with it.
+With the kernel's arithmetic on `kv_a_proj_with_mqa` alone, which sums 48 input blocks, layer 11
+sat at 1.80 of its 2.13.
+
+`upstream/test_glm5_fp8_accumulate.py` is its gate. It runs the kernel from each tree in jax's TPU
+interpret mode, reads the reduction dtype off the traced program, and serves a tiny GLM-5.3 at
+`--tp-size 4 --ep-size 4` with non-power-of-two scales and outlier channels, against
+transformers' float32 and BF16 forwards, under TPU default-precision rounding. A copy with one
+`o_proj`'s scales 5% high has to fail the same gate.
+
+The passing capture check and the measure on the
+[GLM-5.3 page](../models/glm5.3.md#measured-on-a-v5p-64) ran with the patch, on a `v5p-64` in
+us-east5-a on 2026-09-27 and 28.
+
+Notes: the scratch accumulator doubles to 4 bytes an element, which `get_vmem_limit` counts.
+
 ## `steering-hook.patch`
 
 Causal activation steering in the `gemma4` forward pass. Adds `--enable-steering`,
@@ -208,6 +287,9 @@ layer.
 python -m sgl_jax.launch_server --model-path google/gemma-4-31B-it \
     --enable-steering --steering-bank steer_l20.npz --steering-layer 19
 ```
+
+Untested as written: no recorded run has started this server line. The README's Run-it chain
+drives the same hook through the Engine in [`../steering/compare.py`](../steering/compare.py).
 
 The hook fires after `layer(...)` returns, so it writes the stream leaving the layer you name.
 Capture appends before `layer(...)` runs, so its slot `k` is the stream entering block `k`. A
@@ -374,10 +456,10 @@ checkout that holds `eb061d8` to skip the fetch.
    the bank doesn't hold and tokens nobody steers, plus a bank written by `from_sae.py`'s
    `save_bank` and read back by the server at the site it was fit on. That bank holds a dead
    latent, and `load` names it in a warning. `load` refuses a short thresholds array, an empty
-   bank, a NaN or `-inf` threshold and a NaN in a vector. Control: six mutants, among them the
-   steering branch swapped with the branch that only widens, a malformed bank, the same bank at
-   three other sites, a bank of live latents that loads with no warning, and the same read at
-   bfloat16.
+   bank, a NaN or `-inf` threshold and a NaN in a vector. Controls: six mutants, the steering
+   branch swapped with the branch that only widens among them, plus a malformed bank, the same
+   bank at three other sites, a bank of live latents that loads with no warning, and the same
+   read at bfloat16.
 5. The scheduler's per-token rules: positions map through the prefix, a position in another chunk
    drops, a repeat steers once, and the three ways a threshold is chosen.
 6. Every key `_merge_steering` returns is a field of `ModelWorkerBatch`, against the field list
@@ -468,6 +550,12 @@ the 8 RMS groups the gated norm runs on a 32-way tensor axis.
 `openai/gpt-oss-20b`, with the per-head attention sink, the clamped SwiGLU and per-expert biases
 in `EPMoE`, the untruncated YaRN correction range the config asks for, and a loader that decodes
 the MXFP4 expert GEMMs. It carries the hook already, so it needs no second patch.
+
+`deepseek-v41-model.patch` adds `models/deepseek_v41.py` for `deepseek-ai/DeepSeek-V4.1-Flash`,
+and `glm5-next-model.patch` adds `models/glm5_next.py` for `zai-org/GLM-5.3-Flash`, text only in
+both. Each carries the hook already, keeps its caches in a per-request pool of its own, and adds
+the runner hooks that build that pool. `nemotron3-probe.patch` and `glm5-next-probe.patch` add
+switches, off by default, that swap one MoE piece for a plain JAX version, for diagnosis.
 
 See [`models/README.md`](models/README.md).
 
