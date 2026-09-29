@@ -16,8 +16,8 @@
 # Take one model through a READY multi-host slice: setup, capture check, measure. Run it from a
 # machine that can ssh to the slice, in the repo root.
 #
-#   BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE MODEL STEP...
-#   BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh my-v5p-64 us-east5-a \
+#   PROJECT=your-project BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE MODEL STEP...
+#   PROJECT=your-project BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh my-v5p-64 us-east5-a \
 #       nemotron3-ultra setup check measure
 #
 # MODEL is a row of the table below. STEP is any of:
@@ -30,6 +30,13 @@
 # results folder back. The runner never books or deletes a slice. The rows fit a 32-chip v5p-64:
 # check runs at --tp-size 32, and measure at TP=32 MEM_FRAC=0.8 PROMPTS=1000.
 #
+# While measure runs, its log holds only measure_model.sh's own lines. The engine writes to host 0,
+# ~/results/<model>/capture_off.out and capture_on.out, and every rank's log to ~/multihost-logs/.
+# Reach host 0 with `gcloud compute tpus tpu-vm ssh NODE --zone=ZONE --project=PROJECT --worker=0`.
+# A large model's routed experts load in a pass that prints nothing: Inkling's took about 2 hours
+# on a v5p-64 (2026-09-29), and the fastest hosts then wait on the slowest. Every ssh the runner
+# opens shares a ControlMaster socket in ~/.ssh/cm, kept open for 60 minutes.
+#
 # The references come from a CPU VM beforehand, with the same prompt file, and sit in
 # $BUCKET/refs/ as ref-<model>.npz and prompts-<model>.jsonl:
 #   python3 scripts/check_capture.py --model-path <local copy> --offload-folder /mnt/data/off \
@@ -38,7 +45,7 @@
 #
 #   BUCKET    gs:// folder that holds each checkpoint as <model>/ and the references as refs/
 #             (required)
-#   PROJECT   GCP project (default: gcloud's)
+#   PROJECT   the slice's GCP project (default: gcloud's)
 #   SSH_USER  login name on the hosts (default: your OS Login user)
 #   OUT       local folder for logs and results (default ~/tpu-runs/<NODE>)
 #   EXTRA_EARGS       engine keywords for one run, such as disable_overlap_schedule=True
@@ -49,10 +56,13 @@
 # scripts/spray_tpu_spot.sh. The hosts also reach each other on their internal IPs, which the
 # VPC has to allow; scripts/multihost_setup.sh says how.
 set -uo pipefail
-(($# >= 4)) || { sed -n '16,50p' "$0"; exit 2; }
+(($# >= 4)) || { sed -n '16,57p' "$0"; exit 2; }
 NODE=$1; ZONE=$2; MODEL=$3; shift 3
 PROJECT=${PROJECT:-$(gcloud config get-value project 2>/dev/null)}
 [[ -n "$PROJECT" ]] || { echo "set PROJECT= or run: gcloud config set project YOUR_PROJECT" >&2; exit 1; }
+# gcloud answers a TPU call in a project without the TPU API by offering to turn it on there. A
+# stranger's run hit that offer in gcloud's default project, not the slice's (2026-09-29).
+export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 BUCKET=${BUCKET:-}
 [[ -n "$BUCKET" ]] || { echo "set BUCKET= to the gs:// folder that holds <model>/ and refs/" >&2; exit 1; }
 BUCKET=${BUCKET%/}
@@ -140,7 +150,7 @@ host0() {
   gcloud compute tpus tpu-vm describe "$NODE" --zone="$ZONE" --project="$PROJECT" \
     --format='value(networkEndpoints[0].accessConfig.externalIp)'
 }
-H0=$(host0) || { say "can't describe $NODE"; exit 1; }
+H0=$(host0) || { say "can't describe $NODE in $ZONE, project $PROJECT; set PROJECT= to the slice's project"; exit 1; }
 on0() { ssh "${SSHO[@]}" "$U@$H0" "$@"; }
 
 for step in "$@"; do

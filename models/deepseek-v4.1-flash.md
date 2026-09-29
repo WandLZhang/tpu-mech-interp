@@ -55,7 +55,7 @@ breaks down.
 The [measured `v5p-8` runs](nemotron3-super.md#measured) keep weights in `/dev/shm`, which
 defaults to half the host's RAM. That host has 440 GB of RAM, less than this 475 GiB checkpoint,
 so the weights can't live there. Each of the 8 hosts in a `v5p-64` reads it from a GCS bucket
-through gcsfuse, as [Across hosts](../README.md#across-hosts) sets up.
+through gcsfuse, as [Larger models](../README.md#larger-models) sets up.
 
 Confirm the chip count first, on all 8 hosts at once, as
 [gpt-oss-120b](gpt-oss-120b.md#scaling-out-to-v5p-64) describes. It reported 32 on every host on
@@ -470,12 +470,12 @@ Engine capture shapes `(441, 40, 5120)` and `(1323, 40, 5120)`.
 Capture costs 1.33x (3,414.5 over 2,570.2), and the wire carries 10,240 bytes a token (one
 5,120-wide BF16 slot) at 26.3 MB/s.
 
-To reproduce, stage the checkpoint and its reference as [Across hosts](../README.md#across-hosts)
+To reproduce, stage the checkpoint and its reference as [Larger models](../README.md#larger-models)
 describes, with the checkpoint under `deepseek-v4.1-flash/` in the bucket, then run from the repo
 root:
 
 ```bash
-BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE deepseek-v41 setup check measure
+PROJECT=your-project BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE deepseek-v41 setup check measure
 ```
 
 Notes: nobody has replayed that block as written from a clean start. The runs above came from the

@@ -105,6 +105,8 @@ __all__ = [
     "decode_sparse",
     "decode_dense",
     "jump_relu",
+    "auxk_loss",
+    "training_loss",
     "forward_batchtopk",
     "forward_jumprelu",
     "reconstruction_loss",
@@ -532,6 +534,82 @@ def reconstruction_loss(
         "live_fraction": jnp.mean(live.astype(jnp.float32)),
     }
     return mse, metrics
+
+
+def auxk_loss(
+    compute: SAEParams,
+    cfg: SAEConfig,
+    pre: jnp.ndarray,
+    err: jnp.ndarray,
+    dead: jnp.ndarray,
+    k_aux: int,
+    mesh=None,
+) -> jnp.ndarray:
+    """The AuxK term: how far the dead latents leave the main residual unexplained.
+
+    From Gao et al. (2024), as the BatchTopK reference trains it. Among the latents `dead` marks,
+    the `k_aux * batch` largest positive pre-activations decode, without `b_dec`, toward `err`,
+    so the gradient reaches the dead latents and no others. With no dead latent every kept value
+    is zero, and the term is `mean ||err||^2`, a constant with no gradient.
+
+    Args:
+      compute: parameters already cast to `cfg.dtype`.
+      cfg: model shape.
+      pre: `[batch, d_sae]` pre-activations from the training forward.
+      err: `[batch, d_model]` float32 residual `x - recon`, its gradient stopped.
+      dead: `[d_sae]` bool.
+      k_aux: dead latents kept per token, on average over the batch.
+      mesh: the mesh the parameters shard over, for the shard-local decode.
+    """
+    batch = pre.shape[0]
+    masked = jnp.where(dead[None, :], pre, jnp.asarray(-jnp.inf, pre.dtype))
+    count = batch_topk_count(k_aux, batch, cfg.d_sae)
+    values, indices = batch_topk(masked, count, cfg.recall_target)
+    recon = decode_sparse(compute, values, indices, batch, add_bias=False, mesh=mesh)
+    diff = err - recon.astype(jnp.float32)
+    return jnp.mean(jnp.sum(diff * diff, axis=-1))
+
+
+def training_loss(
+    params: SAEParams,
+    cfg: SAEConfig,
+    x: jnp.ndarray,
+    dead: jnp.ndarray,
+    k_aux: int,
+    auxk_coef: float,
+    mesh=None,
+) -> tuple[jnp.ndarray, tuple[dict, jnp.ndarray]]:
+    """Reconstruction error plus `auxk_coef` times the AuxK term, and which latents fired.
+
+    The forward is `forward_batchtopk`'s, with the pre-encoder subtraction. The AuxK term reads the
+    same pre-activations and the residual the main reconstruction leaves.
+
+    Returns:
+      `(loss, (metrics, fired))`. `metrics` holds `reconstruction_loss`'s plus `auxk` and
+      `dead_fraction`; `fired` is the `[d_sae]` bool mask of latents the main selection kept.
+    """
+    batch = x.shape[0]
+    compute = cast_params(params, cfg.dtype)
+    pre = encode_pre(compute, x.astype(cfg.dtype), subtract_pre_bias=True)
+    count = batch_topk_count(cfg.k, batch, cfg.d_sae)
+    values, indices = batch_topk(pre, count, cfg.recall_target)
+    recon = decode_sparse(compute, values, indices, batch, mesh=mesh)
+    x = x.astype(jnp.float32)
+    err = x - recon.astype(jnp.float32)
+    mse = jnp.mean(jnp.sum(err * err, axis=-1))
+    aux = auxk_loss(compute, cfg, pre, lax.stop_gradient(err), dead, k_aux, mesh=mesh)
+
+    variance = jnp.mean(jnp.sum((x - jnp.mean(x, axis=0)) ** 2, axis=-1))
+    fired = jnp.zeros((cfg.d_sae,), jnp.bool_).at[indices % cfg.d_sae].max(values > 0)
+    metrics = {
+        "mse": mse,
+        "fvu": mse / jnp.maximum(variance, 1e-8),
+        "l0": jnp.sum(values > 0) / batch,
+        "live_fraction": jnp.mean(fired.astype(jnp.float32)),
+        "auxk": aux,
+        "dead_fraction": jnp.mean(dead.astype(jnp.float32)),
+    }
+    return mse + auxk_coef * aux, (metrics, fired)
 
 
 # --- Constraints on the decoder ---------------------------------------------------------------

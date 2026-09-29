@@ -91,13 +91,15 @@ so read `swa_layer_tokens` out of the startup log and check it against
 ### Scaling out to `v5p-64`
 
 `v5p-64` is 32 chips on 8 hosts. gpt-oss-120b hasn't run on one; six other models have, through
-[Across hosts](../README.md#across-hosts). Run the `launch_server` command on all 8 hosts with
+[Larger models](../README.md#larger-models). Run the `launch_server` command on all 8 hosts with
 `--tp-size 32`, `--dp-size 4`, `--nnodes 8`, `--node-rank $RANK` and
 `--dist-init-addr $HOST0:$PORT`. `$RANK` is the host's index, 0 to 7. `$HOST0:$PORT` is host 0's
 internal IP and a free port. The engine calls `jax.distributed.initialize` only when `--nnodes` is
 above 1. For this repo's scripts, `scripts/multihost_exec.sh` sets the same three settings on
-every host, and `scripts/multihost_run.sh` has no gpt-oss row yet. Capture needs `--dp-size 1`,
-so a captured run there takes `--tp-size 32` alone and stores every KV head four times.
+every host, and `scripts/multihost_run.sh` has no gpt-oss row yet. The capture patch handles
+`--dp-size` above 1, tested on CPU and in Qwen3-8B's capture check at 2 on a `v5litepod-8`
+([the capture guide](../docs/activation-capture.md)), so a captured run could take `--dp-size 4`
+and keep one copy of each KV head. No gpt-oss run has captured that way yet.
 `sglang-jax` keeps its launch templates in
 [`docs/deployment/`](https://github.com/sgl-project/sglang-jax/tree/eb061d8/docs/deployment).
 

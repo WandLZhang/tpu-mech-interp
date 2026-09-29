@@ -73,6 +73,23 @@ size of the decoded stack, 1,176 MiB a chip at --ep-size 32. The first extend
 precompile on the v5p-64 then asked for 196.32 GB of HLO temporaries a chip.
 Rows that start on a 32-element group now read one E8M0 factor per group and
 broadcast it, so the lookup is 1/32 of the stack.
+The device decode builds each E2M1 value and each E8M0 scale from its bit
+fields. A table lookup gives the same numbers, but on TPU XLA compiles the
+16-entry E2M1 lookup into a compare and a select per entry, each the size of
+the decoded stack, and the 256-entry E8M0 lookup into a gather. A
+cross-compile of four layers for a v5p-8 at --ep-size 4 asks for 53.49 GiB
+of temporaries a chip through the lookups and 24.21 GiB through the bit
+fields. dequantize_mxfp4 and E8M0_SCALES take their scales from ldexp, which
+makes every power of two exactly; numpy's float32 exp2 gives 2 ** 127 one
+step high.
+A device block whose packed rows fill whole scale groups holds its codes in
+pack_planar's order, byte j carrying element j and element j + rows. The
+decode joins the two nibble planes along the rows and scales them in one
+bfloat16 multiply, which gives the float32 products' bits. Joining elements
+2j and 2j + 1, the checkpoint's order, took a relayout of an f32 array the
+size of the stack. On a v5p-8 at --ep-size 4 the bit-field decode in that
+order took 95% of the device time. The four-layer cross-compile asks for
+12.44 GiB of temporaries a chip in the planar order.
 A TPU cross-compile of the full published config for a 32-chip v5p:2x4x4 at
 the check's extend shape asks for 201.83 GB of temporaries before and 5.63 GiB
 after, beside 48.35 GiB of weights and 28.25 GiB of pools.
@@ -170,18 +187,20 @@ language tower is the whole of what this file serves, so the two names run the
 same code. Neither joins InModelMultimodalContract, which is what marks a model
 multimodal, so a text request runs untouched.
 ---
- python/sgl_jax/srt/configs/kimi_linear.py          |   78 +-
- python/sgl_jax/srt/eplb/expert_location.py         |   19 +-
- python/sgl_jax/srt/hf_transformers_utils.py        |    6 +-
- python/sgl_jax/srt/layers/activation.py            |   44 +
- .../sgl_jax/srt/layers/attention/native_backend.py |  104 +-
- python/sgl_jax/srt/layers/moe.py                   |  191 ++-
- python/sgl_jax/srt/mem_cache/memory_pool.py        |   21 +
- python/sgl_jax/srt/models/deepseek_v3.py           |    6 +-
- python/sgl_jax/srt/models/kimi_k3.py               | 1552 ++++++++++++++++++++
- python/sgl_jax/srt/utils/quantization/mxfp4.py     |  168 +++
- python/sgl_jax/srt/utils/weight_utils.py           |   34 +
- 11 files changed, 2166 insertions(+), 57 deletions(-)
+ python/sgl_jax/srt/configs/kimi_linear.py     |   78 +-
+ python/sgl_jax/srt/eplb/expert_location.py    |   19 +-
+ python/sgl_jax/srt/hf_transformers_utils.py   |    6 +-
+ python/sgl_jax/srt/layers/activation.py       |   44 +
+ .../srt/layers/attention/native_backend.py    |  104 +-
+ python/sgl_jax/srt/layers/moe.py              |  201 ++-
+ python/sgl_jax/srt/mem_cache/memory_pool.py   |   21 +
+ python/sgl_jax/srt/models/deepseek_v3.py      |    6 +-
+ python/sgl_jax/srt/models/kimi_k3.py          | 1563 +++++++++++++++++
+ .../sgl_jax/srt/utils/quantization/mxfp4.py   |  270 +++
+ python/sgl_jax/srt/utils/weight_utils.py      |   34 +
+ 11 files changed, 2289 insertions(+), 57 deletions(-)
+ create mode 100644 python/sgl_jax/srt/models/kimi_k3.py
+ create mode 100644 python/sgl_jax/srt/utils/quantization/mxfp4.py
 
 diff --git a/python/sgl_jax/srt/configs/kimi_linear.py b/python/sgl_jax/srt/configs/kimi_linear.py
 index 37650f62..03fcd71a 100644
@@ -576,7 +595,7 @@ index d5ae17e9..cd3eb6ec 100644
          # Flatten 5D -> 3D: [pages, page_size, heads_x2_per_pack, pack, hdim] -> [tokens, heads_x2, hdim]
          num_pages, page_size, heads_x2_per_pack, packing, head_dim = fused_5d.shape
 diff --git a/python/sgl_jax/srt/layers/moe.py b/python/sgl_jax/srt/layers/moe.py
-index 18b2a09b..4b56b253 100644
+index 18b2a09b..7bf10a17 100644
 --- a/python/sgl_jax/srt/layers/moe.py
 +++ b/python/sgl_jax/srt/layers/moe.py
 @@ -20,9 +20,11 @@ from sgl_jax.srt.kernels.sparse_core.moe_permute import (
@@ -640,7 +659,7 @@ index 18b2a09b..4b56b253 100644
          with jax.sharding.use_abstract_mesh(self.updated_mesh):
              # MOE weights' shape is (num_experts, k, n)
              self.wi_0 = nnx.Param(
-@@ -171,6 +188,101 @@ class EPMoE(nnx.Module):
+@@ -171,6 +188,111 @@ class EPMoE(nnx.Module):
              self.wi_1_scale = None
              self.wo_scale = None
  
@@ -664,6 +683,10 @@ index 18b2a09b..4b56b253 100644
 +        `wo` splits its packed axis over "tensor", and a device's share of it
 +        needn't end on a 32-element group, so every device keeps all of
 +        `wo`'s groups for its experts. They cost 1/16 of the packed bytes.
++
++        A device's codes follow `mxfp4.pack_planar` when its packed rows fill
++        whole scale groups, and the checkpoint's own order when they don't.
++        `mxfp4.planar_rows` decides both here and at load.
 +        """
 +        if self.replicate_experts:
 +            raise NotImplementedError(
@@ -725,6 +748,11 @@ index 18b2a09b..4b56b253 100644
 +        extend precompile on the v5p-64 asked for 196 GB of temporaries. The
 +        second barrier keeps the decode out of the gmm's fusion, so gmm reads
 +        the same operand the decode-at-load path hands it.
++
++        A local shard whose packed rows fill whole scale groups holds the
++        planar order `_load_routed_experts` writes, and decodes as two planes.
++        On a v5p-8 at --ep-size 4 the interleaved order spent 37 ms a stack,
++        most of it relaying out f32 arrays the size of the stack.
 +        """
 +        (packed, scale), _ = jax.lax.optimization_barrier(((packed, scale), anchor))
 +        offset = 0
@@ -736,13 +764,14 @@ index 18b2a09b..4b56b253 100644
 +            dtype=self.dtype,
 +            group_size=self.mxfp4_group_size,
 +            element_offset=offset,
++            planar=mxfp4.planar_rows(packed.shape[1], self.mxfp4_group_size),
 +        )
 +        return jax.lax.optimization_barrier(decoded)
 +
      def _detect_device_capabilities(self):
          try:
              devices = jax.devices()
-@@ -507,22 +619,39 @@ class EPMoE(nnx.Module):
+@@ -507,22 +629,39 @@ class EPMoE(nnx.Module):
              topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
              topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
  
@@ -798,7 +827,7 @@ index 18b2a09b..4b56b253 100644
  
              result = shard_map(
                  partial(self._forward, scatter_on_tensor=scatter_on_tensor),
-@@ -535,10 +664,8 @@ class EPMoE(nnx.Module):
+@@ -535,10 +674,8 @@ class EPMoE(nnx.Module):
                      P("expert", None, "tensor"),
                      P("expert", None, "tensor"),
                      P("expert", "tensor", None),
@@ -811,7 +840,7 @@ index 18b2a09b..4b56b253 100644
                      # biases [g, 1, n] (unused)
                      P("expert", None, "tensor"),
                      P("expert", None, "tensor"),
-@@ -736,6 +863,12 @@ class EPMoE(nnx.Module):
+@@ -736,6 +873,12 @@ class EPMoE(nnx.Module):
          else:
              x = inputs_2d[token_indices].astype(self.dtype)
  
@@ -824,7 +853,7 @@ index 18b2a09b..4b56b253 100644
          # NOTE: do NOT pad LHS / bump group_sizes here. The megablox backend
          # ``gmm`` (sgl_jax/srt/kernels/gmm/megablox_gmm_backend.py:67-73)
          # already pads ``lhs`` to its required alignment (32 for v2, 128 for
-@@ -766,6 +899,9 @@ class EPMoE(nnx.Module):
+@@ -766,6 +909,9 @@ class EPMoE(nnx.Module):
              activation_quantized_dtype=act_q_dtype,
              **gmm_kwargs,
          )
@@ -834,7 +863,7 @@ index 18b2a09b..4b56b253 100644
          layer_w1 = gmm(
              lhs=x,
              rhs=w1_kernel,
-@@ -777,15 +913,22 @@ class EPMoE(nnx.Module):
+@@ -777,15 +923,22 @@ class EPMoE(nnx.Module):
          )
  
          # === Activation ===
@@ -912,10 +941,10 @@ index 9be090d0..70c3b71d 100644
          )
 diff --git a/python/sgl_jax/srt/models/kimi_k3.py b/python/sgl_jax/srt/models/kimi_k3.py
 new file mode 100644
-index 00000000..0640a91a
+index 00000000..911ea271
 --- /dev/null
 +++ b/python/sgl_jax/srt/models/kimi_k3.py
-@@ -0,0 +1,1552 @@
+@@ -0,0 +1,1563 @@
 +"""Kimi K3, `moonshotai/Kimi-K3`.
 +
 +93 decoder layers. 69 carry Kimi Delta Attention and 24 carry gated MLA with
@@ -972,7 +1001,9 @@ index 00000000..0640a91a
 +  `[experts, in, out]` and sharded over the expert axis. `EPMoE` decodes one
 +  stack at a time to the serving dtype inside the MoE forward, just before its
 +  `gmm`, with `mxfp4.dequantize_mxfp4_jax`. Only one layer's decoded experts
-+  exist at a time.
++  exist at a time. A device block whose packed rows fill whole scale groups
++  holds its codes in `mxfp4.pack_planar`'s order, which decodes without moving
++  elements between rows.
 +* **Decode at load** (`--json-model-override-args
 +  '{"mxfp4_resident_experts": false}'`). `read_mxfp4_block` cuts both edges of
 +  the rectangle off the file, `dequantize_mxfp4` decodes it on the host, and
@@ -1019,7 +1050,7 @@ index 00000000..0640a91a
 +from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 +from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention
 +from sgl_jax.srt.models.kimi_linear import KimiMLP
-+from sgl_jax.srt.utils.quantization.mxfp4 import dequantize_mxfp4
++from sgl_jax.srt.utils.quantization.mxfp4 import dequantize_mxfp4, pack_planar, planar_rows
 +from sgl_jax.srt.utils.weight_utils import (
 +    SequentialSafetensorManager,
 +    WeightLoader,
@@ -2197,7 +2228,9 @@ index 00000000..0640a91a
 +        Each of the six arrays is `[experts, in // k, out]` uint8, the file's
 +        `[out, in // k]` per expert transposed, with `k` 2 for the codes and 32
 +        for the scales. The callback reads one device shard's rectangle and
-+        nothing is decoded.
++        nothing is decoded. A block of codes whose rows fill whole scale groups
++        goes to the device in `pack_planar`'s order, the order
++        `EPMoE._decode_mxfp4` decodes it in.
 +        """
 +        for hf_name, param_name in EXPERT_MATRICES:
 +            for suffix, name in (
@@ -2217,6 +2250,7 @@ index 00000000..0640a91a
 +                            target,
 +                            expert_sharding(experts, target),
 +                            layer_map,
++                            planar=suffix == "weight_packed",
 +                        )
 +                    ),
 +                )
@@ -2230,11 +2264,14 @@ index 00000000..0640a91a
 +        target: jax.Array,
 +        sharding: NamedSharding,
 +        physical_to_logical: np.ndarray | None = None,
++        planar: bool = False,
 +    ) -> jax.Array:
 +        """One uint8 `[experts, rows, cols]` array, the file's `[cols, rows]` per expert.
 +
 +        The callback cuts the rectangle off the file for each expert its device
-+        shard owns, so a host holds one device shard of one layer at most.
++        shard owns, so a host holds one device shard of one layer at most. With
++        `planar`, a block whose rows fill whole scale groups is reordered by
++        `pack_planar`; the codes stay the file's.
 +        """
 +
 +        def read(index):
@@ -2245,7 +2282,10 @@ index 00000000..0640a91a
 +                key = f"{source}.{expert_id}.{tensor_name}"
 +                handle = files.get_handle(weight_info[key][0]["file"])
 +                shards.append(np.asarray(handle.get_slice(key)[col_slice, row_slice]).T)
-+            return np.ascontiguousarray(np.stack(shards).astype(np.uint8))
++            block = np.stack(shards).astype(np.uint8)
++            if planar and planar_rows(block.shape[1]):
++                block = pack_planar(block)
++            return np.ascontiguousarray(block)
 +
 +        return jax.make_array_from_callback(target.shape, sharding, read)
 +
@@ -2470,10 +2510,10 @@ index 00000000..0640a91a
 +EntryClass = [KimiK3ForCausalLM, KimiK3ForConditionalGeneration]
 diff --git a/python/sgl_jax/srt/utils/quantization/mxfp4.py b/python/sgl_jax/srt/utils/quantization/mxfp4.py
 new file mode 100644
-index 00000000..e3b69df2
+index 00000000..fee85d49
 --- /dev/null
 +++ b/python/sgl_jax/srt/utils/quantization/mxfp4.py
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,270 @@
 +"""MXFP4 (OCP microscaling FP4) unpacking for compressed-tensors checkpoints.
 +
 +A `mxfp4-pack-quantized` tensor ships as two arrays:
@@ -2497,10 +2537,23 @@ index 00000000..e3b69df2
 +bit for bit wherever the device keeps float32 subnormals. Only E8M0 codes 0
 +and 1 reach them: code 0's scale is 2 ** -127, and code 1 makes products below
 +2 ** -126. A device that flushes subnormals decodes those to zero.
++
++The device decode builds each value and each scale from its bit fields. A table
++lookup gives the same numbers, but on TPU XLA compiles the 16-entry E2M1 lookup
++into a compare and a select per entry, each an array the size of the decoded
++stack, and the 256-entry E8M0 lookup into a gather.
++
++`pack_planar` reorders one device's block so byte `j` holds element `j` in its
++low nibble and element `j + rows` in its high nibble. `dequantize_mxfp4_jax`
++with `planar=True` then joins the two nibble planes along the packed axis,
++which puts every code in its element's row. The interleaved order puts elements
++`2j` and `2j + 1` in one byte, and on TPU joining those two planes takes a
++relayout of an f32 array the size of the decoded stack.
 +"""
 +
 +from __future__ import annotations
 +
++import jax
 +import jax.numpy as jnp
 +import numpy as np
 +
@@ -2510,6 +2563,8 @@ index 00000000..e3b69df2
 +    "MXFP4_EXPONENT_BIAS",
 +    "dequantize_mxfp4",
 +    "dequantize_mxfp4_jax",
++    "pack_planar",
++    "planar_rows",
 +    "unpack_nibbles",
 +]
 +
@@ -2523,10 +2578,11 @@ index 00000000..e3b69df2
 +MXFP4_EXPONENT_BIAS = 127
 +
 +# The scale for each of the 256 E8M0 codes, computed the way `dequantize_mxfp4`
-+# computes it: numpy's float32 `exp2` of the unbiased exponent. Code 255 is
-+# 2 ** 128, which float32 holds as infinity, and that's what `exp2` returns.
++# computes it: `ldexp`, which makes every power of two exactly. numpy's float32
++# `exp2` gives 2 ** 127 one step too high. Code 255 is 2 ** 128, which float32
++# holds as infinity.
 +E8M0_SCALES = np.append(
-+    np.exp2((np.arange(255, dtype=np.int32) - MXFP4_EXPONENT_BIAS).astype(np.float32)),
++    np.ldexp(np.float32(1.0), np.arange(255, dtype=np.int32) - MXFP4_EXPONENT_BIAS),
 +    np.float32(np.inf),
 +)
 +
@@ -2546,6 +2602,34 @@ index 00000000..e3b69df2
 +    high = (packed >> 4) & 0x0F
 +    interleaved = np.stack((low, high), axis=-1)
 +    return interleaved.reshape(*packed.shape[:-1], 2 * packed.shape[-1])
++
++
++def planar_rows(rows: int, group_size: int = 32) -> bool:
++    """Whether a device block of `rows` packed rows takes the planar order.
++
++    The high plane starts at element `rows`, so its first element has to open a
++    scale group: `rows` has to be a multiple of `group_size`.
++    """
++    return rows % group_size == 0
++
++
++def pack_planar(packed: np.ndarray) -> np.ndarray:
++    """One device's block, reordered so both nibble planes run in element order.
++
++    Args:
++      packed: uint8 `[..., rows, cols]`, packed along axis -2 the way the
++        checkpoint packs it: byte `j` holds element `2 * j` in its low nibble
++        and element `2 * j + 1` in its high nibble.
++
++    Returns:
++      uint8 `[..., rows, cols]` whose byte `j` holds element `j` in its low
++      nibble and element `j + rows` in its high nibble.
++    """
++    packed = np.asarray(packed, dtype=np.uint8)
++    rows = packed.shape[-2]
++    codes = np.stack((packed & 0x0F, packed >> 4), axis=-2)
++    codes = codes.reshape(*packed.shape[:-2], 2 * rows, packed.shape[-1])
++    return (codes[..., :rows, :] | (codes[..., rows:, :] << 4)).astype(np.uint8)
 +
 +
 +def dequantize_mxfp4(
@@ -2583,10 +2667,41 @@ index 00000000..e3b69df2
 +
 +    values = E2M1_VALUES[codes]
 +    exponent = scale.astype(np.int32) - MXFP4_EXPONENT_BIAS
-+    factor = np.exp2(exponent.astype(np.float32))
++    factor = np.ldexp(np.float32(1.0), exponent)
 +    grouped = values.reshape(*values.shape[:-1], groups, group_size)
 +    scaled = grouped * factor[..., None]
 +    return scaled.reshape(values.shape).astype(dtype)
++
++
++def _e2m1_float32(codes: jnp.ndarray) -> jnp.ndarray:
++    """E2M1 codes to float32, `E2M1_VALUES[codes]` bit for bit, from the bit fields.
++
++    Bit 3 is the sign, bits 2-1 the exponent and bit 0 the mantissa. Exponent 0
++    holds 0 and 0.5. Exponents 1 to 3 hold 1.m times 2 ** (exponent - 1), which
++    is a float32 with exponent field `exponent + 126` and the mantissa bit as the
++    top fraction bit.
++    """
++    c = codes.astype(jnp.uint32)
++    exponent = (c >> 1) & 3
++    mantissa = c & 1
++    magnitude = jnp.where(
++        exponent == 0,
++        mantissa * jnp.uint32(126 << 23),
++        ((exponent + 126) << 23) | (mantissa << 22),
++    )
++    return jax.lax.bitcast_convert_type(((c & 8) << 28) | magnitude, jnp.float32)
++
++
++def _e8m0_float32(codes: jnp.ndarray) -> jnp.ndarray:
++    """E8M0 codes to their float32 scales, `E8M0_SCALES[codes]` bit for bit.
++
++    A code is its scale's float32 exponent field. Code 0 is 2 ** -127, below the
++    normal range, so it takes that subnormal's bits instead. Code 255 writes the
++    all-ones field, infinity, as `E8M0_SCALES` holds it.
++    """
++    c = codes.astype(jnp.uint32)
++    bits = jnp.where(c == 0, jnp.uint32(1 << 22), c << 23)
++    return jax.lax.bitcast_convert_type(bits, jnp.float32)
 +
 +
 +def dequantize_mxfp4_jax(
@@ -2596,17 +2711,21 @@ index 00000000..e3b69df2
 +    dtype: jnp.dtype,
 +    group_size: int = 32,
 +    element_offset: int | jnp.ndarray = 0,
++    planar: bool = False,
 +) -> jnp.ndarray:
 +    """Decode MXFP4 on the device, packed along axis 1.
 +
 +    The layout is the one `EPMoE` holds, `[experts, in, out]`, with the input
 +    axis packed. Byte `j` of axis 1 holds element `2 * j` in its low nibble and
-+    element `2 * j + 1` in its high nibble, as in `unpack_nibbles`.
++    element `2 * j + 1` in its high nibble, as in `unpack_nibbles`. With
++    `planar`, byte `j` holds element `j` and element `j + n // 2`, the order
++    `pack_planar` writes, and each plane decodes into its own half of the rows.
 +
 +    `packed` can be one device's rows of a larger tensor. `element_offset` is
 +    the index of its first element in the whole tensor, and `scale` holds every
 +    group those rows touch, so a cut that splits a scale group still reads the
-+    right exponent.
++    right exponent. The planar order needs `n // 2` and `element_offset` to
++    fall on group boundaries.
 +
 +    Args:
 +      packed: uint8 `[e, n // 2, m]`.
@@ -2616,15 +2735,38 @@ index 00000000..e3b69df2
 +      group_size: elements per scale.
 +      element_offset: where row 0 of `packed` sits in the whole tensor, in
 +        elements. It can be traced.
++      planar: `packed` holds the planar order.
 +
 +    Returns:
 +      `[e, n, m]` in `dtype`.
 +    """
 +    low = packed & 0x0F
 +    high = packed >> 4
++    if planar:
++        rows = packed.shape[1]
++        if not planar_rows(rows, group_size):
++            raise ValueError(
++                f"the planar order needs the {rows} packed rows to be a multiple of {group_size}"
++            )
++        count = 2 * rows // group_size
++        first = element_offset // group_size
++        if isinstance(first, int):
++            groups = scale[:, first : first + count]
++        else:
++            groups = jax.lax.dynamic_slice_in_dim(scale, first, count, axis=1)
++        # The low plane then the high plane is element order, so row r reads group
++        # r // group_size, as in the checkpoint's own grouping.
++        codes = jnp.concatenate((low, high), axis=1)
++        # Every E2M1 value and every E8M0 scale is exact in bfloat16, and so is
++        # each product, so a bfloat16 multiply gives the float32 products' bits
++        # and moves half the bytes.
++        values = _e2m1_float32(codes).astype(jnp.bfloat16)
++        grouped = values.reshape(values.shape[0], count, group_size, *values.shape[2:])
++        factor = _e8m0_float32(groups).astype(jnp.bfloat16)
++        return (grouped * factor[:, :, None]).reshape(values.shape).astype(dtype)
 +    codes = jnp.stack((low, high), axis=2)
 +    codes = codes.reshape(packed.shape[0], 2 * packed.shape[1], *packed.shape[2:])
-+    values = jnp.asarray(E2M1_VALUES)[codes]
++    values = _e2m1_float32(codes)
 +    elements = codes.shape[1]
 +    if isinstance(element_offset, int) and element_offset % group_size == 0 and (
 +        elements % group_size == 0
@@ -2635,12 +2777,12 @@ index 00000000..e3b69df2
 +        # array the size of the decoded stack.
 +        first = element_offset // group_size
 +        count = elements // group_size
-+        factor = jnp.asarray(E8M0_SCALES)[scale[:, first : first + count]]
++        factor = _e8m0_float32(scale[:, first : first + count])
 +        grouped = values.reshape(values.shape[0], count, group_size, *values.shape[2:])
 +        return (grouped * factor[:, :, None]).reshape(values.shape).astype(dtype)
 +    groups = (element_offset + jnp.arange(elements, dtype=jnp.int32)) // group_size
 +    exponents = jnp.take(scale, groups, axis=1)
-+    factor = jnp.asarray(E8M0_SCALES)[exponents]
++    factor = _e8m0_float32(exponents)
 +    return (values * factor).astype(dtype)
 diff --git a/python/sgl_jax/srt/utils/weight_utils.py b/python/sgl_jax/srt/utils/weight_utils.py
 index be2dbfa0..e603320a 100644

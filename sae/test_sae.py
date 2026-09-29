@@ -22,7 +22,7 @@ The data is synthetic with a known answer: a fixed dictionary of unit-norm atoms
 coefficients per token, and a little noise. Check 3 measures the learned dictionary against that
 generating dictionary, so every claim here has a number attached to it.
 
-Thirteen checks, each with a negative control that has to fail:
+Fourteen checks, each with a negative control that has to fail:
 
 0. The identities the module documents hold. Sparse decode equals dense decode, the `shard_map`
    decode on the 8-device mesh equals the one-device decode, folding the pre-encoder bias leaves
@@ -56,6 +56,11 @@ Thirteen checks, each with a negative control that has to fail:
 12. `train.py` counts the 16 batches the scale fit reads. At `--steps 4` it refuses a capture of
     68 batches, which the steps plus 64 calibration batches would cover, and one of 80 calibrates
     on all 64. Control: the 80-batch capture trains.
+13. AuxK trains the dead latents and no others: its gradient stays off the live half, a first
+    step with nothing dead matches the plain step bit for bit, and the dead count restarts on
+    every latent that fired. 32 latents of a trained SAE shrunk until they stop firing come back
+    under AuxK, at least 8 in 500 steps, at a lower fvu than plain steps reach. Controls: the
+    gradient with every latent marked dead, and the plain continuation, which revives at most 2.
 
 If a control passes, this file fails itself.
 """
@@ -851,6 +856,112 @@ def check_batch_count(root):
     return failures + (not calibrated)
 
 
+def check_auxk(pool, held_out):
+    """13. AuxK trains the dead latents and no others, and brings them back.
+
+    The AuxK gradient has to reach the encoder columns, encoder biases and decoder rows of the
+    latents marked dead and none of the rest. With no latent dead the AuxK step has to update the
+    parameters the plain step does, bit for bit, and the dead count has to restart at zero on
+    every latent the main selection kept and count one on every other. Then 32 latents of a
+    trained SAE are shrunk until they stop firing, and 500 more steps with AuxK have to bring at
+    least 8 back at a lower fvu than 500 plain steps. Controls: the AuxK gradient with every
+    latent marked dead reaches the live half, and the plain continuation revives at most 2.
+    """
+    failures = 0
+    cfg = SAEConfig(d_model=D_MODEL, expansion_factor=EXPANSION, k=K_TRUE)
+    batch = jnp.asarray(pool[:256])
+    params = sae_lib.init_params(jax.random.key(7), cfg)
+    half = cfg.d_sae // 2
+
+    def aux_grads(dead):
+        def aux(p):
+            compute = sae_lib.cast_params(p, cfg.dtype)
+            pre = sae_lib.encode_pre(compute, batch, subtract_pre_bias=True)
+            recon, _, _ = sae_lib.forward_batchtopk(p, cfg, batch)
+            err = jax.lax.stop_gradient(batch - recon)
+            return sae_lib.auxk_loss(compute, cfg, pre, err, dead, 16)
+        return jax.grad(aux)(params)
+
+    def touched(grads):
+        per_latent = (np.abs(np.asarray(grads.w_enc)).sum(0) + np.abs(np.asarray(grads.b_enc))
+                      + np.abs(np.asarray(grads.w_dec)).sum(1))
+        return int(np.count_nonzero(per_latent[:half])), int(np.count_nonzero(per_latent[half:]))
+
+    dead_first, live_first = touched(aux_grads(jnp.arange(cfg.d_sae) < half))
+    ok = dead_first > 0 and live_first == 0
+    print(f"  [{'PASS' if ok else 'FAIL'}] {'auxk gradient':<24} first {half} latents dead: the AuxK "
+          f"gradient reaches {dead_first} of them and {live_first} of the other {half}")
+    failures += not ok
+    _, live_all = touched(aux_grads(jnp.ones((cfg.d_sae,), bool)))
+    detected = live_all > 0
+    print(f"      control (every latent marked dead): {live_all} of the second {half} reached"
+          f" -> {'detected' if detected else 'NOT DETECTED'}")
+    failures += not detected
+
+    # Nothing is dead on the first step, so the AuxK term is a constant with no gradient.
+    optimizer = train_lib.build_optimizer(TrainConfig(auxk_coef=1 / 32))
+    on = train_lib.make_step(cfg, optimizer, train_cfg=TrainConfig(auxk_coef=1 / 32))
+    plain = train_lib.make_step(cfg, optimizer)
+    p_on, s_on, _ = on(jax.tree.map(jnp.copy, params), optimizer.init(params), batch)
+    p_plain, _, _ = plain(jax.tree.map(jnp.copy, params), optimizer.init(params), batch)
+    same = all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(p_on, p_plain))
+    _, values, indices = sae_lib.forward_batchtopk(params, cfg, batch)
+    fired = np.zeros(cfg.d_sae, bool)
+    fired[np.asarray(indices % cfg.d_sae)[np.asarray(values) > 0]] = True
+    counted = np.array_equal(np.asarray(s_on[0].stale), np.where(fired, 0, 1))
+    ok = same and counted
+    print(f"  [{'PASS' if ok else 'FAIL'}] {'auxk first step':<24} parameters "
+          f"{'equal the plain step bit for bit' if same else 'DIFFER from the plain step'}; dead "
+          f"count 0 on the {int(fired.sum())} latents that fired and 1 on the rest: {counted}")
+    failures += not ok
+
+    def run(start, train_cfg, steps, seed):
+        opt = train_lib.build_optimizer(train_cfg)
+        state = opt.init(start)
+        step = train_lib.make_step(cfg, opt, train_cfg=train_cfg)
+        stream = batch_stream(pool, 256, seed=seed)
+        p = jax.tree.map(jnp.copy, start)
+        for _ in range(steps):
+            p, state, _ = step(p, state, jnp.asarray(next(stream)))
+        return p
+
+    def firing(p):
+        _, v, idx = sae_lib.forward_batchtopk(p, cfg, held_out)
+        mask = np.zeros(cfg.d_sae, bool)
+        mask[np.asarray(idx % cfg.d_sae)[np.asarray(v) > 0]] = True
+        return mask
+
+    def fvu_train(p):
+        recon, _, _ = sae_lib.forward_batchtopk(p, cfg, held_out)
+        return float(jnp.sum((held_out - recon) ** 2)
+                     / jnp.sum((held_out - jnp.mean(held_out, axis=0)) ** 2))
+
+    base = TrainConfig(batch_size=256, learning_rate=3e-3, warmup_steps=100, auxk_coef=0.0)
+    trained = run(sae_lib.init_params(jax.random.key(0), cfg), base, 1_500, seed=3)
+    kill = np.flatnonzero(firing(trained))[:32]
+    w_enc = np.asarray(trained.w_enc).copy()
+    b_enc = np.asarray(trained.b_enc).copy()
+    w_enc[:, kill] *= 0.05
+    b_enc[kill] = 0.0
+    killed = trained._replace(w_enc=jnp.asarray(w_enc), b_enc=jnp.asarray(b_enc))
+    after = {}
+    for name, coef in (("plain", 0.0), ("auxk", 1 / 32)):
+        cont = TrainConfig(batch_size=256, learning_rate=3e-3, warmup_steps=0, auxk_coef=coef)
+        p = run(killed, cont, 500, seed=4)
+        after[name] = (int(firing(p)[kill].sum()), fvu_train(p))
+    ok = after["auxk"][0] >= 8 and after["auxk"][1] < after["plain"][1]
+    print(f"  [{'PASS' if ok else 'FAIL'}] {'auxk revival':<24} 32 latents shrunk to "
+          f"{int(firing(killed)[kill].sum())} firing (fvu {fvu_train(killed):.4f}, "
+          f"{fvu_train(trained):.4f} before); 500 steps with AuxK: {after['auxk'][0]} of 32 fire, "
+          f"fvu {after['auxk'][1]:.4f}")
+    failures += not ok
+    detected = after["plain"][0] <= 2
+    print(f"      control (500 plain steps): {after['plain'][0]} of 32 fire, fvu "
+          f"{after['plain'][1]:.4f} -> {'detected' if detected else 'NOT DETECTED'}")
+    failures += not detected
+    return failures
+
+
 def main() -> int:
     devices = jax.devices()
     if len(devices) < 8:
@@ -1006,6 +1117,8 @@ def main() -> int:
         failures += check_nonfinite()
         # 12. The batches train.py counts before it trains.
         failures += check_batch_count(root)
+    # 13. AuxK trains the dead latents and brings them back.
+    failures += check_auxk(pool, held_out)
 
     print()
     if failures:

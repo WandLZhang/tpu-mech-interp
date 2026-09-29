@@ -703,10 +703,12 @@ def m_scale_not_exponential(nodes):
     """The stored byte used as the scale instead of two to its power."""
     fn = _node_named(nodes, "dequantize_mxfp4")
     for node in ast.walk(fn):
-        if isinstance(node, ast.Call) and ast.unparse(node).startswith("np.exp2"):
-            node.func = ast.parse("np.asarray", mode="eval").body
+        if isinstance(node, ast.Call) and ast.unparse(node).startswith("np.ldexp"):
+            node.func = ast.parse(
+                "(lambda one, exponent: np.asarray(exponent, dtype=np.float32))", mode="eval"
+            ).body
             return
-    raise LookupError("no np.exp2 in dequantize_mxfp4")
+    raise LookupError("no np.ldexp in dequantize_mxfp4")
 
 
 MXFP4_MUTANTS = {
@@ -777,48 +779,73 @@ def mxfp4_jax_nodes(src):
         find_assign(src, "E2M1_VALUES"),
         find_assign(src, "MXFP4_EXPONENT_BIAS"),
         find_assign(src, "E8M0_SCALES"),
+        find_function(src, "_e2m1_float32"),
+        find_function(src, "_e8m0_float32"),
+        find_function(src, "planar_rows"),
+        find_function(src, "pack_planar"),
         find_function(src, "dequantize_mxfp4_jax"),
     ]
 
 
 def mxfp4_jax_namespace(sources, mutate=None):
+    """The device decode and the bit-field helpers it calls, with a mutant applied to any of them."""
     nodes = mxfp4_jax_nodes(sources[MXFP4_FILE])
     if mutate is not None:
-        mutate(_node_named(nodes, "dequantize_mxfp4_jax"))
+        mutate(ast.Module(body=nodes, type_ignores=[]))
     return compile_nodes(nodes)
 
 
 def m_jax_nibble_order(fn):
-    """The high nibble read first, so every pair of elements swaps."""
+    """The two nibbles swapped: interleaved pairs trade places, and so do the two planes."""
+    assigns = {}
     for node in ast.walk(fn):
-        if isinstance(node, ast.Call) and ast.unparse(node).startswith("jnp.stack"):
-            node.args[0].elts = list(reversed(node.args[0].elts))
-            return
-    raise LookupError("no jnp.stack of the two nibbles in dequantize_mxfp4_jax")
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id in ("low", "high")):
+            assigns[node.targets[0].id] = node
+    if set(assigns) != {"low", "high"}:
+        raise LookupError("no `low = ...` and `high = ...` in dequantize_mxfp4_jax")
+    assigns["low"].value, assigns["high"].value = assigns["high"].value, assigns["low"].value
 
 
 def m_jax_scale_step(fn):
-    """Every E8M0 code read one step high, so every scale doubles."""
+    """Every E8M0 code read one step high, so every scale doubles, in every branch."""
+    found = False
     for node in ast.walk(fn):
-        if isinstance(node, ast.Subscript) and ast.unparse(node.value) == "jnp.asarray(E8M0_SCALES)":
-            node.slice = ast.BinOp(left=node.slice, op=ast.Add(), right=ast.Constant(value=1))
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_e8m0_float32"):
+            node.args[0] = ast.BinOp(left=node.args[0], op=ast.Add(), right=ast.Constant(value=1))
+            found = True
+    if not found:
+        raise LookupError("no _e8m0_float32 call in dequantize_mxfp4_jax")
+
+
+def m_jax_e2m1_exponent(fn):
+    """The E2M1 exponent field written one step high, so every normal value doubles."""
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)
+                and isinstance(node.right, ast.Constant) and node.right.value == 126
+                and ast.unparse(node.left) == "exponent"):
+            node.right = ast.Constant(value=127)
             return
-    raise LookupError("no E8M0_SCALES lookup in dequantize_mxfp4_jax")
+    raise LookupError("no `exponent + 126` in _e2m1_float32")
 
 
 def m_jax_offset_ignored(fn):
-    """A device's rows read the scale groups at the top of the tensor."""
+    """A device's rows read the scale groups at the top of the tensor, in every branch."""
+    found = False
     for node in ast.walk(fn):
-        if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)
-                and isinstance(node.left, ast.Name) and node.left.id == "element_offset"):
+        if (isinstance(node, ast.BinOp) and isinstance(node.left, ast.Name)
+                and node.left.id == "element_offset"):
             node.left = ast.Constant(value=0)
-            return
-    raise LookupError("no `element_offset + ...` in dequantize_mxfp4_jax")
+            found = True
+    if not found:
+        raise LookupError("no arithmetic on element_offset in dequantize_mxfp4_jax")
 
 
 MXFP4_JAX_MUTANTS = {
     "device decode reads the high nibble first": m_jax_nibble_order,
     "device decode reads each scale one exponent step high": m_jax_scale_step,
+    "device decode writes each E2M1 exponent one step high": m_jax_e2m1_exponent,
     "device decode ignores element_offset": m_jax_offset_ignored,
 }
 
@@ -843,11 +870,18 @@ def check_mxfp4_jax(sources):
     `wo` start partway into the packed axis, so a slice read at an
     `element_offset` that splits a scale group has to match the same rows of
     the whole tensor.
+
+    The planar order has to give the same bits: `pack_planar`'s block through
+    `planar=True`, for the same table and for a device's block at a traced
+    offset on a group boundary. `pack_planar` itself has to put element `j` in
+    byte `j`'s low nibble and element `j + rows` in its high nibble, read
+    against the checkpoint's order unpacked here.
     """
     import ml_dtypes
 
     host = mxfp4_namespace(sources)["dequantize_mxfp4"]
-    device = mxfp4_jax_namespace(sources)["dequantize_mxfp4_jax"]
+    namespace = mxfp4_jax_namespace(sources)
+    device, pack = namespace["dequantize_mxfp4_jax"], namespace["pack_planar"]
     failures = 0
     group = 32
     # Row r of the file carries E8M0 code r in every group, and every row holds
@@ -855,22 +889,43 @@ def check_mxfp4_jax(sources):
     rows, columns = 256, 1024
     packed = np.tile(np.arange(256, dtype=np.uint8), (rows, columns // 512))
     scale = np.repeat(np.arange(256, dtype=np.uint8)[:, None], columns // group, axis=1)
-    for name, dtype in (("float32", np.float32), ("bfloat16", ml_dtypes.bfloat16)):
-        with np.errstate(over="ignore", invalid="ignore"):
-            want = host(packed, scale, group_size=group, dtype=dtype).T
-        got = np.asarray(jax.jit(lambda p, s, d=dtype: device(p, s, dtype=d, group_size=group))(
-            packed.T[None], scale.T[None]))[0]
-        differ = bit_differences(got, want)
-        normal = int(differ[:, 2:].sum())
-        low = differ[:, :2]
-        flushed = bool(np.all(got[:, :2][low].astype(np.float32) == 0)) and bool(
-            np.all(np.abs(want[:, :2][low].astype(np.float64)) < 2.0**-124))
-        print(f"      dequantize_mxfp4_jax {name}, 256 byte values x 256 E8M0 codes: "
-              f"{normal} of {differ[:, 2:].size} bits differ at codes 2 to 255; "
-              f"{int(low.sum())} differ at codes 0 and 1, "
-              f"{'each a zero where numpy kept a value below 2 ** -124' if flushed else 'NOT ALL FLUSHED'}")
-        if normal or not flushed:
-            failures += 1
+
+    block = packed.T[None]
+    half = block.shape[1]
+    element_order = np.stack((block & 0x0F, block >> 4), axis=2).reshape(1, 2 * half, -1)
+    for label, fn in (("pack_planar", pack), ("control (the block left in the checkpoint's order)",
+                                              lambda b: b)):
+        planar = fn(block)
+        wrong = int(np.count_nonzero((planar & 0x0F) != element_order[:, :half])
+                    + np.count_nonzero((planar >> 4) != element_order[:, half:]))
+        if fn is pack:
+            print(f"      pack_planar, {half} packed rows: {wrong} of {2 * planar.size} codes "
+                  f"out of place")
+            failures += 1 if wrong else 0
+        else:
+            print(f"      {label}: {'caught' if wrong else 'NOT DETECTED'}, {wrong} codes out "
+                  f"of place")
+            failures += 0 if wrong else 1
+
+    for order, planar in (("", False), (" planar", True)):
+        operand = pack(block) if planar else block
+        for name, dtype in (("float32", np.float32), ("bfloat16", ml_dtypes.bfloat16)):
+            with np.errstate(over="ignore", invalid="ignore"):
+                want = host(packed, scale, group_size=group, dtype=dtype).T
+            got = np.asarray(jax.jit(
+                lambda p, s, d=dtype, q=planar: device(p, s, dtype=d, group_size=group, planar=q)
+            )(operand, scale.T[None]))[0]
+            differ = bit_differences(got, want)
+            normal = int(differ[:, 2:].sum())
+            low = differ[:, :2]
+            flushed = bool(np.all(got[:, :2][low].astype(np.float32) == 0)) and bool(
+                np.all(np.abs(want[:, :2][low].astype(np.float64)) < 2.0**-124))
+            print(f"      dequantize_mxfp4_jax{order} {name}, 256 byte values x 256 E8M0 codes: "
+                  f"{normal} of {differ[:, 2:].size} bits differ at codes 2 to 255; "
+                  f"{int(low.sum())} differ at codes 0 and 1, "
+                  f"{'each a zero where numpy kept a value below 2 ** -124' if flushed else 'NOT ALL FLUSHED'}")
+            if normal or not flushed:
+                failures += 1
 
     # One device's rows of a larger tensor, starting mid-group.
     rng = np.random.default_rng(23)
@@ -886,23 +941,40 @@ def check_mxfp4_jax(sources):
     if wrong:
         failures += 1
 
-    # Every mutant runs on scales around the bias and on the offset slice.
+    # Every mutant runs on scales around the bias, on the offset slice and on a planar block.
     check_scale = rng.integers(120, 135, size=(6, 5)).astype(np.uint8)
     check_packed = rng.integers(0, 256, size=(6, 80), dtype=np.uint8)
     want_check = host(check_packed, check_scale, group_size=group).T
+
+    # One device's planar block: packed rows 32 to 63 of 96, elements 64 to 127, read at a
+    # traced offset on a group boundary.
+    tensor_packed = rng.integers(0, 256, size=(5, 96), dtype=np.uint8)
+    tensor_scale = rng.integers(118, 135, size=(5, 6), dtype=np.uint8)
+    tensor = host(tensor_packed, tensor_scale, group_size=group).T
+    planar_block = pack(tensor_packed.T[None, 32:64])
+    planar_fn = jax.jit(lambda p, s, o: device(p, s, dtype=jnp.float32, group_size=group,
+                                               element_offset=o, planar=True))
+    part = np.asarray(planar_fn(planar_block, tensor_scale.T[None], 64))[0]
+    wrong = int(bit_differences(part, tensor[64:128]).sum())
+    print(f"      planar rows 64 to 127 of 192 at a traced element_offset 64: "
+          f"{wrong} of {part.size} bits differ")
+    if wrong:
+        failures += 1
 
     def run(fn):
         whole_rows = np.asarray(fn(check_packed.T[None], check_scale.T[None],
                                    dtype=jnp.float32, group_size=group))[0]
         rows_at = np.asarray(fn(file_packed.T[None, 12:24], file_scale.T[None],
                                 dtype=jnp.float32, group_size=group, element_offset=24))[0]
-        return np.concatenate([whole_rows.ravel(), rows_at.ravel()])
+        planar_at = np.asarray(fn(planar_block, tensor_scale.T[None], dtype=jnp.float32,
+                                  group_size=group, element_offset=64, planar=True))[0]
+        return np.concatenate([whole_rows.ravel(), rows_at.ravel(), planar_at.ravel()])
 
     failures += report_mutants(
         MXFP4_JAX_MUTANTS,
         lambda mutate: mxfp4_jax_namespace(sources, mutate=mutate)["dequantize_mxfp4_jax"],
         run,
-        np.concatenate([want_check.ravel(), whole[24:48].ravel()]),
+        np.concatenate([want_check.ravel(), whole[24:48].ravel(), tensor[64:128].ravel()]),
     )
     print(f"  [{'FAIL' if failures else 'PASS'}] dequantize_mxfp4_jax matches dequantize_mxfp4")
     return failures
@@ -919,8 +991,10 @@ def decode_method(sources, mutate_decode=None, mutate_dequant=None):
     fn = find_method(sources[MOE_FILE], "EPMoE", "_decode_mxfp4")
     if mutate_decode is not None:
         mutate_decode(fn)
-    dequant = mxfp4_jax_namespace(sources, mutate=mutate_dequant)["dequantize_mxfp4_jax"]
-    return compile_nodes([fn], extra={"mxfp4": Stub(dequantize_mxfp4_jax=dequant)})["_decode_mxfp4"]
+    namespace = mxfp4_jax_namespace(sources, mutate=mutate_dequant)
+    stub = Stub(dequantize_mxfp4_jax=namespace["dequantize_mxfp4_jax"],
+                planar_rows=namespace["planar_rows"])
+    return compile_nodes([fn], extra={"mxfp4": stub})["_decode_mxfp4"]
 
 
 def m_scales_unbarriered(fn):
@@ -932,13 +1006,26 @@ def m_scales_unbarriered(fn):
     fn.body = ast.parse(text).body[0].body
 
 
+PLANAR_FACTOR = "_e8m0_float32(groups)"
+
+
 def m_factor_per_element(fn):
-    """Every row takes the per-element factor, an f32 array the size of the decoded stack."""
-    for node in ast.walk(fn):
-        if isinstance(node, ast.If) and "isinstance(element_offset, int)" in ast.unparse(node.test):
-            node.test = ast.Constant(value=False)
-            return
-    raise LookupError("no aligned-rows branch in dequantize_mxfp4_jax")
+    """Every row takes a per-element factor, an f32 array the size of the decoded stack.
+
+    The interleaved branch skips its aligned-rows path. The planar branch decodes
+    one factor per element and keeps every `group_size`-th, the same numbers.
+    """
+    aligned = [node for node in ast.walk(fn) if isinstance(node, ast.If)
+               and "isinstance(element_offset, int)" in ast.unparse(node.test)]
+    decode = [node for node in ast.walk(fn) if isinstance(node, ast.FunctionDef)
+              and node.name == "dequantize_mxfp4_jax"]
+    if not aligned or not decode or PLANAR_FACTOR not in ast.unparse(decode[0]):
+        raise LookupError("no aligned-rows branch or planar factor in dequantize_mxfp4_jax")
+    for node in aligned:
+        node.test = ast.Constant(value=False)
+    text = ast.unparse(decode[0]).replace(
+        PLANAR_FACTOR, "_e8m0_float32(jnp.repeat(groups, group_size, axis=1))[:, ::group_size]")
+    decode[0].body = ast.parse(text).body[0].body
 
 
 def _all_eqns(jaxpr):
@@ -951,14 +1038,18 @@ def _all_eqns(jaxpr):
                     yield from _all_eqns(inner)
 
 
-def decode_structure(fn):
+def decode_structure(fn, rows=128):
     """What the traced decode does with the scales, from its jaxpr.
 
     Returns whether the first equation that reads the scale argument is an
     optimization barrier that also takes the anchor, and the element count of
-    the largest array the E8M0 table lookup makes, beside the decoded count.
+    the E8M0 factor, beside the decoded count. The decode writes values and
+    factors through float32 bitcasts, so the factor is the smallest float32
+    bitcast: the values are the decoded count, and an aligned factor is 1/32
+    of it. At 128 rows the 64 packed rows fill two scale groups and take the
+    planar order; at 96 the 48 don't, and take the checkpoint's.
     """
-    experts, rows, groups, columns = 4, 128, 4, 48
+    experts, groups, columns = 4, rows // 32, 48
     packed = jax.ShapeDtypeStruct((experts, rows // 2, columns), jnp.uint8)
     scale = jax.ShapeDtypeStruct((experts, groups, columns), jnp.uint8)
     anchor = jax.ShapeDtypeStruct((16, rows), jnp.bfloat16)
@@ -971,14 +1062,13 @@ def decode_structure(fn):
             waits = eqn.primitive.name == "optimization_barrier" and any(
                 v is a_var for v in eqn.invars)
             break
-    factor = 0
-    for eqn in _all_eqns(closed.jaxpr):
-        if eqn.primitive.name != "gather":
-            continue
-        table = eqn.invars[0].aval
-        if tuple(table.shape) == (256,) and table.dtype == jnp.float32:
-            factor = max(factor, int(np.prod(eqn.outvars[0].aval.shape)))
-    return waits, factor, experts * rows * columns
+    sizes = [
+        int(np.prod(eqn.outvars[0].aval.shape))
+        for eqn in _all_eqns(closed.jaxpr)
+        if eqn.primitive.name == "bitcast_convert_type"
+        and eqn.outvars[0].aval.dtype == jnp.float32
+    ]
+    return waits, min(sizes) if sizes else 0, experts * rows * columns
 
 
 def check_resident_decode_order(sources):
@@ -989,30 +1079,32 @@ def check_resident_decode_order(sources):
     a decode to its layer, and the scale expansion reads nothing else, so XLA
     ran all 92 layers' expansions early and held them, each a per-element index
     and factor the size of its decoded stack. The first reader of the scale argument
-    has to be that barrier, and the E8M0 lookup has to make one value per
+    has to be that barrier, and the E8M0 decode has to make one value per
     32-element group. A TPU cross-compile of the full published config asks for
     201.83 GB of temporaries a chip before the fix and 5.63 GiB after.
     """
     failures = 0
-    waits, factor, decoded = decode_structure(decode_method(sources))
-    print(f"      _decode_mxfp4: first reader of the scales is the barrier with the anchor: "
-          f"{waits}; E8M0 lookup makes {factor} values for {decoded} decoded")
-    if not waits or factor * 32 != decoded:
-        failures += 1
-    for label, kwargs in (
-        ("scales outside the barrier", {"mutate_decode": m_scales_unbarriered}),
-        ("factor per element", {"mutate_dequant": m_factor_per_element}),
-    ):
-        try:
-            got = decode_structure(decode_method(sources, **kwargs))
-        except LookupError as exc:
-            print(f"      control ({label}): MUTATION OPERATOR FOUND NO TARGET: {exc}")
+    for rows, order in ((128, "planar"), (96, "checkpoint order")):
+        waits, factor, decoded = decode_structure(decode_method(sources), rows)
+        print(f"      _decode_mxfp4, {rows // 2} packed rows, {order}: first reader of the scales "
+              f"is the barrier with the anchor: {waits}; E8M0 decode makes {factor} values for "
+              f"{decoded} decoded")
+        if not waits or factor * 32 != decoded:
             failures += 1
-            continue
-        caught = not got[0] or got[1] * 32 != got[2]
-        print(f"      control ({label}): {'caught' if caught else 'NOT DETECTED'} "
-              f"barrier={got[0]} factor={got[1]}")
-        failures += 0 if caught else 1
+        for label, kwargs in (
+            ("scales outside the barrier", {"mutate_decode": m_scales_unbarriered}),
+            ("factor per element", {"mutate_dequant": m_factor_per_element}),
+        ):
+            try:
+                got = decode_structure(decode_method(sources, **kwargs), rows)
+            except LookupError as exc:
+                print(f"      control ({label}): MUTATION OPERATOR FOUND NO TARGET: {exc}")
+                failures += 1
+                continue
+            caught = not got[0] or got[1] * 32 != got[2]
+            print(f"      control ({label}, {order}): {'caught' if caught else 'NOT DETECTED'} "
+                  f"barrier={got[0]} factor={got[1]}")
+            failures += 0 if caught else 1
     print(f"  [{'FAIL' if failures else 'PASS'}] the resident decode waits for its layer, "
           f"scales included")
     return failures
@@ -3065,9 +3157,23 @@ def check_expert_stack(kimi_k3, workdir):
     return failures
 
 
+def device_blocks(array, block_rows):
+    """`[experts, rows, cols]` cut along the rows into each tensor shard's block."""
+    return [array[:, start:start + block_rows] for start in range(0, array.shape[1], block_rows)]
+
+
 def check_resident_stacks(kimi_k3, build, mesh, tensors, text, decoded_at_load):
-    """The resident expert arrays at three expert-parallel widths."""
-    from sgl_jax.srt.utils.quantization.mxfp4 import dequantize_mxfp4_jax
+    """The resident expert arrays at three expert-parallel widths.
+
+    A device block of codes that fills whole scale groups holds `pack_planar`'s
+    order, so the file's codes go through `pack_planar` block by block before
+    they're compared, and the device decode reads each block at its own offset.
+    """
+    from sgl_jax.srt.utils.quantization.mxfp4 import (
+        dequantize_mxfp4_jax,
+        pack_planar,
+        planar_rows,
+    )
     from sgl_jax.srt.utils.weight_utils import WeightLoader
 
     failures = 0
@@ -3110,6 +3216,7 @@ def check_resident_stacks(kimi_k3, build, mesh, tensors, text, decoded_at_load):
         finally:
             jax.make_array_from_callback = real_callback
         wrong_codes, wrong_layout, differ, compared = [], [], 0, 0
+        orders = set()
         for layer_idx, layer in enumerate(model.model.layers):
             if not layer.is_moe_layer:
                 continue
@@ -3123,14 +3230,24 @@ def check_resident_stacks(kimi_k3, build, mesh, tensors, text, decoded_at_load):
                 suffix = "weight_scale" if "mxfp4_scale" in name else "weight_packed"
                 file = np.stack([tensors[f"{source}.{e}.{hf_of[matrix]}.{suffix}"].T
                                  for e in range(text["num_experts"])])
+                if suffix == "weight_packed":
+                    block_rows = got.sharding.shard_shape(got.shape)[1]
+                    if planar_rows(block_rows):
+                        file = np.concatenate(
+                            [pack_planar(b) for b in device_blocks(file, block_rows)], axis=1)
+                    orders.add(f"{name} {'planar' if planar_rows(block_rows) else 'checkpoint'}")
                 if not np.array_equal(np.asarray(got), file):
                     wrong_codes.append(name)
             for _, name in kimi_k3.EXPERT_MATRICES:
-                decoded = dequantize_mxfp4_jax(
-                    np.asarray(getattr(experts, name).get_value()),
-                    np.asarray(getattr(experts, f"{name}_mxfp4_scale").get_value()),
-                    dtype=jnp.float32,
-                )
+                codes = getattr(experts, name).get_value()
+                block_rows = codes.sharding.shard_shape(codes.shape)[1]
+                scale = np.asarray(getattr(experts, f"{name}_mxfp4_scale").get_value())
+                decoded = np.concatenate([
+                    np.asarray(dequantize_mxfp4_jax(
+                        block, scale, dtype=jnp.float32, element_offset=2 * k * block_rows,
+                        planar=planar_rows(block_rows)))
+                    for k, block in enumerate(device_blocks(np.asarray(codes), block_rows))
+                ], axis=1)
                 reference = decoded_at_load.get((ep_size, layer_idx, name))
                 if reference is None:
                     differ += 1
@@ -3141,7 +3258,8 @@ def check_resident_stacks(kimi_k3, build, mesh, tensors, text, decoded_at_load):
         layout = "layouts as declared" if not wrong_layout else f"WRONG {wrong_layout[:2]}"
         print(f"      ep_size={ep_size}, resident: six uint8 arrays a layer, {codes}, {layout}; "
               f"device decode against decoded at load: {differ} of {compared} values differ; "
-              f"{len(oversized)} callback blocks larger than one device shard")
+              f"{len(oversized)} callback blocks larger than one device shard; "
+              f"{', '.join(sorted(orders))}")
         if wrong_codes or wrong_layout or differ or oversized or not compared:
             failures += 1
     return failures
@@ -3155,11 +3273,14 @@ def check_resident_stacks(kimi_k3, build, mesh, tensors, text, decoded_at_load):
 # KDA layer, a routed MLA layer and a routed KDA layer after it, with a block
 # boundary every two layers, so the stash, both mixtures, the closing mixture
 # and the MLA cache all run. Every field not named here is the published one.
+# The expert widths are 64, two scale groups, so a device block of `wi_0` and
+# `wi_1` fills whole groups and takes the planar order at every `--ep-size`,
+# while `wo` split over 4 or 8 tensor shards doesn't and keeps the checkpoint's.
 TINY_TEXT = {
     "hidden_size": 64,
     "intermediate_size": 96,
-    "moe_intermediate_size": 32,
-    "routed_expert_hidden_size": 32,
+    "moe_intermediate_size": 64,
+    "routed_expert_hidden_size": 64,
     "num_experts": 8,
     "num_experts_per_token": 2,
     "num_shared_experts": 1,
@@ -4585,7 +4706,7 @@ def full_size_memory_main(repo) -> int:
     devices: `EPMoE` lays them out as `ep_size x (32 / ep_size)`.
     """
     import_patched(repo)
-    from sgl_jax.srt.utils.quantization.mxfp4 import dequantize_mxfp4_jax
+    from sgl_jax.srt.utils.quantization.mxfp4 import dequantize_mxfp4_jax, planar_rows
 
     if jax.device_count() != V5P64_CHIPS:
         print(f"      need {V5P64_CHIPS} simulated devices, got {jax.device_count()}")
@@ -4619,7 +4740,9 @@ def full_size_memory_main(repo) -> int:
             local = jax.ShapeDtypeStruct(shard_shape(packed), jnp.uint8)
             local_scale = jax.ShapeDtypeStruct(shard_shape(scale), jnp.uint8)
             out = jax.eval_shape(
-                lambda p, q: dequantize_mxfp4_jax(p, q, dtype=jnp.bfloat16), local, local_scale)
+                lambda p, q: dequantize_mxfp4_jax(p, q, dtype=jnp.bfloat16,
+                                                  planar=planar_rows(p.shape[1])),
+                local, local_scale)
             stacks.append(out.size * jnp.dtype(out.dtype).itemsize)
         one, three = max(stacks) / GIB, sum(stacks) / GIB
         left = budget - total / GIB

@@ -1,64 +1,64 @@
 # Roadmap
 
-What's open after 2026-09-28, in the order it gets worked. Each item says what's known, what comes
+What's open after 2026-09-29, in the order it gets worked. Each item says what's known, what comes
 next and when it's done. The model pages hold the measured runs behind each one.
 
-## 1. Kimi K3 prefill
+## 1. Kimi K3: fewer expert decodes
 
-Kimi K3 serves and passes the capture check on one `v5p-64`, but prefill runs at 0.6 tokens/s: 880
-tokens in 1,507.55 s at batch 1
-([model page](../models/kimi-k3.md#throughput-on-the-v5p-64-06-tokens-a-second)). `tpu-info` read
-100% duty cycle and 8.23% TensorCore use on every chip. GLM-5.3 prefills 2,685.8 tokens/s on the
-same slice.
+Kimi K3 prefills 1,010 tokens/s with capture off and on, on one `v5p-64` with the routed experts in
+MXFP4 ([model page](../models/kimi-k3.md#measured-on-a-v5p-64)). GLM-5.3 prefills 2,685.8 on the
+same slice. Every forward decodes each chip's whole expert stack to BF16 before its grouped
+matmul. The scripts prefill in 1,024-token passes (`engine_settings` in
+`scripts/capture_activations.py`), so a batch of eight 440-token prompts decodes every stack four
+times.
 
-Two suspects, neither profiled:
+Three changes cut the decode. None has run on the model yet:
 
-- The routed experts stay packed MXFP4 in HBM, and every forward decodes each chip's whole stack to
-  BF16 through a 16-entry table gather just before its grouped matmul.
-- KDA prefill runs the engine's `mega` Pallas kernel by default.
-  `SGLANG_JAX_KDA_PREFILL_KERNEL=chunked` picks the other one, and nobody has timed the two apart.
+- Longer passes: `--token-padding 4096 --engine-arg chunked_prefill_size=4096` decodes once a
+  batch. The chips peak at 80.48 of 95.73 GiB, and a longer pass needs more activation memory.
+- A Pallas decode that writes BF16 straight from the packed codes. A prototype decodes one chip's
+  28-expert `wi_0` stack in 0.786 ms, against 1.123 ms for XLA's planar decode, with every value
+  bit-exact (host 0 of the `v5p-64`, 2026-09-29).
+- A grouped matmul that reads the MXFP4 codes and E8M0 scales directly and never writes a BF16
+  stack. [Inferact/tpu-megakernels](https://github.com/Inferact/tpu-megakernels) decodes MXFP4
+  tile by tile inside its Kimi K3 kernel, a design reference.
 
-A 4-layer cut of the model fits a `v5p-8`, so the next step traces a single 440-token prefill there
-with `scripts/serve_throughput.py --profile-dir`, in four arms: packed or decoded-at-load experts,
-each with `mega` or `chunked`. The trace splits by layer type, projects to 93 layers, and has to
-land near the 753.8 s per prompt the `v5p-64` read before it names a fix. The fix is then a kernel
-default, a bit-op decode in place of the gather, or a grouped matmul that reads the MXFP4 codes and
-E8M0 scales directly. [Inferact/tpu-megakernels](https://github.com/Inferact/tpu-megakernels)
-decodes MXFP4 tile by tile inside its Kimi K3 kernel, which is a design reference for the last.
+Done when the model page shows a faster prefill on a `v5p-64` with the capture check passing.
 
-Done when the model page carries capture-off and capture-on throughput and peak HBM on a `v5p-64`,
-with the capture check still passing.
+Notes: the Pallas timing averages 20 calls after a warm call.
 
-## 2. Inkling
+## 2. Inkling: load in minutes, not hours
 
-Inkling serves on one `v5p-64`, and every captured layer sits within the BF16 floor on both
-prompts. The capture check still exits FAILED, because on the 1,321-token prompt its control reads
-2.82x at layer 61, under the 3.0x bar ([model page](../models/inkling.md#measured-on-a-v5p-64)).
-At that layer the stream entering layer 62 is close to the stream entering layer 61, so a one-layer
-shift can't separate them by 3x. The bar stays at 3.0x.
+Inkling's engine takes about 2 hours to load on a `v5p-64`
+([model page](../models/inkling.md#measured-on-a-v5p-64)). Its loader asks each host only for the
+blocks its chips hold, but every host took in 1.94 to 1.99 TB, the whole checkpoint, in the first
+27 minutes of a load, and 6.4 to 7.4 TB over the two loads of one measure (2026-09-29). The mount
+keeps range reads out of the gcsfuse file cache, yet a read at byte 0 still pulls a whole file, and
+the loader reads every file's header: each host's cache held six whole 19.5 GB files.
 
-Throughput and HBM need one `measure` run, about 4.5 hours for two engine loads.
+The next run mounts Inkling with no file cache, so each read fetches only its range.
 
-Done when the model page carries capture-off and capture-on throughput and peak HBM.
+Done when an Inkling load on a `v5p-64` takes under 30 minutes and the measure reads the same
+throughput.
 
-Notes: the 4.5 hours is projected from the Inkling page's loads of about 2 hours each.
+Notes: the byte counts are each host's received bytes in `/proc/net/dev`, read by the clean-context
+run that took the page's throughput. The 30 minutes is a target, not a projection.
 
-## 3. Capture under data parallelism
+## 3. Keep SAE latents alive
 
-With `--dp-size` above 1 the engine lays out each rank's rows in their own padded block, and the
-capture patch reads the hidden states as one packed run. A request on rank 1 would get other
-requests' rows, so the patch refuses the pairing. That keeps capture at one data-parallel rank,
-which holds Kimi K3 to 32 chips: attention splits its 96 heads `tp / dp` ways, and 64 chips at one
-rank split them 64 ways. With the fix, Kimi K3 can hold its experts decoded to BF16 on a
-`v5p-128` at tp 64 and dp 2, or on a `v6e-256` at dp 8, and gpt-oss-120b stops paying 4x KV on a
-`v5p-64`.
+The README chain's SAE on Gemma 4 26B-A4B keeps 2,111 of 45,056 latents live at fvu 0.4670
+(v5litepod-8, 2026-09-29), because BatchTopK gives a latent that stops firing no gradient.
+`sae/train.py` carries the AuxK term (Gao et al., 2024), which trains the dead latents on what the
+live ones leave unexplained. At the BatchTopK reference settings, `--auxk-coef 0.03125 --k-aux 512
+--dead-batches 5`, the same activations kept 455 live at fvu 0.4657, and training took 876 s
+against 337 s. The term stays off by default. In the CPU test it brings 17 of 32 shrunk latents
+back in 500 steps.
 
-The fix starts each rank's rows at `dp_rank * (rows // dp_size)`, the way `tp_worker.py` walks
-logprobs, in prefill and in decode.
+The next run logs the dead count and the AuxK term's gradient norm every step on those
+activations, with the term on and off, to find where the live set shrinks.
 
-Done when a CPU test at `dp_size=2` shows every request gets its own rows, across decode steps,
-uneven rank batches, a prompt split across prefill passes and two processes, and the refusal comes
-out.
+Done when the README chain keeps most latents live at the same fvu, with the before and after on
+the [model page](../models/gemma4-26b-a4b.md).
 
 ## 4. Packed FP4 experts
 
@@ -72,24 +72,26 @@ and throughput beside the widened run.
 
 Notes: the 8.4 GiB is projected at 4.25 bits a weight.
 
-## 5. Replay the `v5p-64` pages from a clean start
-
-Every `v5p-64` result came from `scripts/multihost_run.sh`, run by the people who wrote it. Each
-single-host page passed a clean-context replay that followed it as written.
-
-Done when one `v5p-64` page passes that replay too.
-
-## 6. Move the `sglang-jax` pin
+## 5. Move the `sglang-jax` pin
 
 Every patch here applies to `eb061d8`. Upstream fixed a bug after it, where batched requests with
 the same grammar shared one llguidance matcher (sgl-project/sglang-jax#1704, fixed by #1710 as
 294611c). `steering/compare.py`'s judge reads label log probabilities, so nothing here depends on
 the fix. Moving the pin means reapplying 21 patches.
 
+At 294611c, `SGL_COMMIT=294611c bash scripts/verify_patches.sh` fails 9 of its 17 checks
+(2026-09-28): the capture patch itself, in `engine.py`, `schedule_batch.py`,
+`scheduler_output_processor_mixin.py`, `tokenizer_manager.py` and `server_args.py`; the steering
+hook; the `qwen3_5` and `deepseek_v3` capture hooks; the multi-host patch; and the Inkling, Kimi K3
+and Nemotron 3 model patches. Upstream's 302b081a (#1708) aligns hidden states under data
+parallelism with the layout the capture patch uses, a host copy per batch and each rank starting at
+`rank * (rows // dp_size)`, so the capture patch can keep upstream's version and carry its own
+fixes on top.
+
 Done when `scripts/verify_patches.sh` and `scripts/test_all.sh` pass at a commit at or after
 294611c.
 
-## 7. Capture in vLLM on TPU
+## 6. Capture in vLLM on TPU
 
 `tpu-inference`, which vLLM's TPU platform delegates to, has no per-layer hook. Its
 `aux_hidden_states` path belongs to speculative decoding, with fixed layer indices and no route to
@@ -98,13 +100,3 @@ parts to copy: a `layers_to_capture` list read at trace time, one append per lay
 at the output.
 
 Done when a vLLM TPU server returns per-layer hidden states that pass `scripts/check_capture.py`.
-
-## 8. Keep SAE latents alive
-
-Every SAE run loses most of its latents. The Gemma 4 26B-A4B chain on 2026-09-25 kept 2,023 of
-45,056 live. `sae/train.py` has no auxiliary loss and no resampling, so a latent that stops firing
-early never comes back. The standard fix is an AuxK loss, which reconstructs the residual error from
-the top dead latents at a small weight.
-
-Done when a run of the README chain keeps most latents live at the same fvu, with the before and
-after on the model page.

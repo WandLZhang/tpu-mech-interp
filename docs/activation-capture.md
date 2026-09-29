@@ -80,7 +80,7 @@ A fetch you kill leaves `.incomplete` files in the cache. `huggingface_hub` resu
 connection inside one process, but a new process fetches those files from zero, so
 `fetch_weights.py` deletes the partials first and says how many bytes they held.
 
-Six messages look alarming and aren't.
+Seven messages look alarming and aren't.
 
 - Every JAX start prints
   `E... hugepage_text.cc:344] RAW: File offset incorrectly aligned for file-backed THP`, and every
@@ -91,13 +91,18 @@ Six messages look alarming and aren't.
 - `huggingface_hub` can name its download bars "Downloading bytes" and "Reconstructing", Xet's
   words, with Xet off too. A fetch whose output goes to a file may show only its `Fetching N files`
   bar. `fetch_weights.py` prints an `XET off` line first when `HF_HUB_DISABLE_XET=1` holds.
-- On Gemma 4 the engine prints `Loading MoE Weights: 0it`. `gemma4.py` reads each layer's fused
-  expert tensors in a pass of its own, after the loader's.
+- On Gemma 4, Kimi K3 and Inkling the engine prints `Loading MoE Weights: 0it`. Each reads its
+  routed experts in a pass of its own, after the loader's, and that pass prints nothing. On a
+  `v5p-64` Kimi K3's took up to 34 minutes and Inkling's about 2 hours.
 - On a model with an image processor, `transformers` warns that `use_fast` is deprecated. The
   engine builds that processor, and a text prompt never reaches it.
 - `peak_hbm.py` prints `libtpu metrics unavailable` until the engine holds the TPU, because
   libtpu serves its metrics only then. It says so once, then counts the empty rounds when the
   chips come back.
+- At the end of a multi-host run every other host logs `Terminating process because the JAX
+  distributed service detected fatal errors`, `Fatal Python error: Aborted` and a thread dump.
+  Rank 0 shut its engine down, and the other ranks go with it. Rank 0's exit status and its RESULT
+  lines tell whether the run passed.
 
 ## Capture
 
@@ -136,10 +141,18 @@ appends in layer order, so the list has to run in ascending order. The server re
 of order, an empty list, a slot listed twice, a negative slot, and the flag without
 `--enable-return-hidden-states`. The model runner refuses a slot at or past the layer count.
 
-Capture needs `--dp-size 1`. With data parallelism each rank's rows sit in their own padded
-block, and the patch reads the hidden states as one packed run, so a request on rank 1 or later
-would get other requests' rows. The server refuses the flag with `--dp-size` above 1, and the
-scheduler aborts a request for hidden states under data parallelism.
+With data parallelism each rank's rows sit in their own padded block, in prefill and in decode.
+The patch starts each rank at its block, and above one rank it reads the batch's rows to the host
+once, because JAX won't slice rows sharded over the data axis per request. The CPU test pins three
+requests to two ranks at `--tp-size 2 --dp-size 2`, one of them split across prefill passes, and
+holds slot 0 of every row, the embedding output, to the embedding of the token at its position.
+`scripts/test_multihost_exec.py` sends the same three requests with each rank in a process of its
+own, where `multihost-hidden-states.patch` gathers rank 1's rows from the other process's device.
+
+On a chip, `check_capture.py` on Qwen3-8B at `--tp-size 8 --engine-arg dp_size=2` put five
+requests in one engine call, four of 440 tokens and one of 1,322 split across passes, and the
+scheduler spreads them over both ranks. Every one of the 36 layers passed on all five: worst ratio
+to the BF16 floor 1.11, controls 26.7x to 29.0x (v5litepod-8, 2026-09-29).
 
 The flag also refuses to start on a model without the hook, with `--speculative-algorithm`,
 whose draft reads the capture layers the flag overwrites, with `--pd-disaggregation`, and with
@@ -495,10 +508,17 @@ client `extra_key` that holds `steering:`. The request validator refuses a key o
 ## The whole chain, measured
 
 Capture, SAE and steering run end to end on `Qwen/Qwen3-8B`, 36 layers at 4,096 dim. Slice
-`v5litepod-8`, 8 chips, `tp_size=8`, us-south1-a, BF16 engine. The capture figures come from
-[the README's `measure_model.sh` line for Qwen3-8B](../README.md#run-it), run on 2026-09-25 with
-the layer filter. The SAE and steering figures come from a chain on 2026-09-23, before the
-chunked-prefill fix and the layer filter.
+`v5litepod-8`, 8 chips, `tp_size=8`, us-south1-a, BF16 engine. The capture figures come from this
+line, run on 2026-09-25 with the layer filter, after the README's bootstrap and inside `tmux`:
+
+```bash
+PROMPTS=1000 bash scripts/measure_model.sh Qwen/Qwen3-8B 18 ~/results/qwen3-8b
+```
+
+At the default of 400 prompts, Qwen3-8B finishes its capture before the four progress lines the
+script reads its steady window from, and the script exits 1 with "no steady window". The SAE and
+steering figures come from a chain on 2026-09-23, before the chunked-prefill fix and the layer
+filter.
 
 **Capture**, `PROMPTS=1000` on a `v5litepod-8` Spot slice, 2026-09-25, with the layer filter.
 1,000 wikitext passages re-encoded to 440 tokens, 8 to a call. Capture keeps slot 18 of 36 and
@@ -557,9 +577,9 @@ feature 23394. `compare.py` sets alpha as a share of the norm and steers a rando
 beside the feature. The served model then labels each changed reply coherent or broken, and the
 run exits 0 when the feature has more coherent changed replies than the random direction at some
 alpha, and 1 when it doesn't. A judge that mislabels one of its two known replies, or gives no
-label, exits 2. The [README's Run it](../README.md#run-it) gives the rule, and
-[the Gemma 4 26B-A4B page](../models/gemma4-26b-a4b.md#the-run-it-chain) has a chip run under it
-that exits 0, on 2026-09-25.
+label, exits 2. A crash, such as a `--model-path` with no tokenizer, also exits 1, with a
+traceback. [The Gemma 4 26B-A4B page](../models/gemma4-26b-a4b.md#the-run-it-chain) has a chip
+run under that rule that exits 0, on 2026-09-25.
 
 The 2026-09-23 chain measured no HBM. `Device.memory_stats()` needs the calling process to hold
 the TPU, and the engine's scheduler child holds it for the whole run, so the parent gets nothing.

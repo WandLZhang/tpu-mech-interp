@@ -2,9 +2,9 @@
 
 `thinkingmachines/Inkling`, `thinkingmachines/Inkling-Small`
 
-**Status: captured on TPU**, `v5p-64`, 2026-09-27; every layer within the BF16 floor, one control
-under its bar; not measured. Served and captured on 32 chips, 8 hosts, in us-east5-a. Throughput
-and HBM aren't measured yet; [the roadmap](../docs/roadmap.md) has both. See
+**Status: measured on TPU**, `v5p-64`, 2026-09-29: 547.7 tokens/s with capture off and 518.0 with
+capture on. Every captured layer sits within the BF16 floor, and one control reads 2.82x, under its
+3.0x bar. Served and captured on 32 chips, 8 hosts, in us-east5-a. See
 [Measured on a v5p-64](#measured-on-a-v5p-64).
 
 | | Inkling | Inkling-Small |
@@ -119,7 +119,7 @@ less than either checkpoint, 1,773.9 GiB or 495.4 GiB, so neither can live
 there. The 8 hosts of a `v5p-64` read the checkpoint from a gcsfuse mount of the
 bucket, which `scripts/multihost_setup.sh` makes.
 
-Each host reads only the blocks its 4 chips hold, once. `load_stacked_weights`
+The loader asks each host only for the blocks its 4 chips hold, once. `load_stacked_weights`
 reads k and v, the dense MLP, the shared experts and the routed experts that
 way, one `make_array_from_callback` per tensor, and chips holding copies of one
 KV head share one read. The mapping table's tensors go through the loader's
@@ -133,7 +133,10 @@ sets.
 The experts shard over the tensor axis, so every host reads an eighth of every
 expert file. With the gcsfuse file cache pulling a whole file on any read past
 its first byte, each host pulls every file whole through a 120 GB cache, and
-host 0 took in 31 TB for the 2026-09-27 load.
+host 0 took in 31 TB for the 2026-09-27 load. With it off, a read at byte 0 still pulls the whole
+file, and the loader reads every file's header: each host took in 1.94 to 1.99 TB in the first 27
+minutes of a load, and 6.4 to 7.4 TB over the two loads of a measure (2026-09-29), 3.4 to 3.9 times
+the checkpoint. [The roadmap](../docs/roadmap.md) has the fix to try, a mount with no file cache.
 
 Confirm the chip count first, on all 8 hosts at once, as
 [gpt-oss-120b](gpt-oss-120b.md#scaling-out-to-v5p-64) describes. It reported 32 on every host on
@@ -482,18 +485,32 @@ the whole cache_loc bucket (fixed by the blockwise pass), then every layer off f
 the reference ran `embed_norm` twice. Loading takes about 2 hours per launch (about 7 minutes of
 dense weights, then the routed experts at 45 MB/s to 1.4 GB/s per host through gcsfuse).
 
-To reproduce the check, stage the checkpoint and its reference as
-[Across hosts](../README.md#across-hosts) describes, then run from the repo root:
+**Throughput and HBM**, `scripts/multihost_run.sh NODE us-east5-a inkling setup measure` on
+another `v5p-64` Spot slice in us-east5-a, 2026-09-29 06:13 to 10:29Z, 1,000 prompts at 440
+tokens. Capture on keeps slot 33 in float32:
+
+| Stage | Tokens/s | Window | Peak HBM a chip |
+|---|---|---|---|
+| Capture off | 547.7 | batches 3 to 32 of 8 prompts, 105,600 tokens in 192.79 s | 78.26 GiB |
+| Capture on | 518.0 | 429,440 tokens from 267.43 s to 1,096.43 s | 78.43 GiB |
+
+Capture costs 1.06x, and the wire carries 12,288 bytes a token at 6.4 MB/s. Each engine load took
+about 2 hours, and the whole measure 4 hours 13 minutes.
+
+Notes: peak HBM is host 0's four chips, of 95.73 GiB each, sampled every 2 seconds. A clean-context
+run took these figures from this page as written. An earlier run on 2026-09-29 read 547.5 tokens/s
+with capture off before Spot preempted its slice.
+
+To reproduce, stage the checkpoint and its reference as
+[Larger models](../README.md#larger-models) describes, then run from the repo root. `check` exits 1
+on the control above, and the runner stops at the first step that fails, so `measure` goes in a
+second command:
 
 ```bash
-BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE inkling setup check
+PROJECT=your-project BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE inkling setup check
+PROJECT=your-project BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE inkling setup measure
 ```
 
-The same command with `measure` in place of `check` takes throughput and HBM, about 4.5 hours for
-two engine loads. Nobody has run it yet.
-
-Notes: nobody has replayed the check block as written from a clean start. The run above came from
-the same script and row. `check` exits 1 on the control above, and the script stops at the first
-step that fails, so put `measure` in a run of its own. The 4.5 hours is projected from the 2-hour
-loads above.
+Notes: nobody has replayed the check line as written from a clean start; the measure line passed
+that replay on 2026-09-29.
 

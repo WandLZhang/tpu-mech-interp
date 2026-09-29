@@ -30,6 +30,10 @@
 # runs, and kills the peer's command itself by the PID it left in ~/.multihost-rank.pid. It exits
 # with rank 0's status.
 #
+# Every peer has to answer ssh before any rank starts, and a refused login gets 5 minutes of tries.
+# A peer that ends while rank 0 runs gives rank 0 MULTIHOST_GRACE seconds to end by itself, and
+# then rank 0 is stopped, so a run that can't finish fails instead of hanging.
+#
 # With MULTIHOST_COPY=1, any argument that names a file on host 0, such as a prompt file, gets
 # copied to the same path on every other host first. With --wait-all it waits for every rank to
 # exit by itself and prints each rank's log, for commands that end on every host, such as a device
@@ -42,6 +46,7 @@
 #                     SGL_* always go)
 #   SGL_DIST_PORT     coordinator port (default: a fresh one per run, so a lingering one can't
 #                     collide)
+#   MULTIHOST_GRACE   seconds rank 0 gets to end after a peer ends early (default 300)
 #   MULTIHOST_LOCAL   1 runs every rank on this host with no ssh, for a CPU test of the wrapper
 #                     and the engine across processes
 set -uo pipefail
@@ -67,6 +72,28 @@ on() { if [ "${MULTIHOST_LOCAL:-0}" = 1 ]; then bash -c "$2"; else "${SSH[@]}" "
 mkdir -p "$LOGS"
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 log() { echo "### multihost $(date -u +%H:%M:%S) $*"; }
+# on_retry HOST CMD: on, for a short command, tried again while ssh itself fails (status 255). A
+# host replacing google-guest-agent in the image's first-hour upgrade refused every login for
+# minutes (v5p-64, 2026-09-28).
+on_retry() {
+  local try rc
+  for try in $(seq 1 20); do
+    on "$1" "$2"; rc=$?
+    ((rc == 255)) || return "$rc"
+    log "ssh to $1 failed (try $try of 20); trying again in 15 s" >&2
+    sleep 15
+  done
+  return 255
+}
+# tree PID: PID and every descendant.
+tree() {
+  local all=$1 todo=$1 kids p
+  while [ -n "$todo" ]; do
+    kids=$(for p in $todo; do pgrep -P "$p"; done | tr '\n' ' ')
+    all+=" $kids"; todo=$kids
+  done
+  echo $all
+}
 
 # The same engine pattern measure_model.sh kills, plus check_capture.py.
 ENGINE='^sglang(-jax)?::'
@@ -76,18 +103,34 @@ ENGINE+='|^[^ ]*python[0-9.]* (-u )?([^ ]*/)?(serve_throughput|capture_activatio
 free_remote() {
   if [ "${MULTIHOST_LOCAL:-0}" = 1 ]; then
     local root; root=$(cat ~/.multihost-rank.pid 2>/dev/null) || return 0
-    local tree=$root todo=$root kids
-    while [ -n "$todo" ]; do
-      kids=$(for p in $todo; do pgrep -P "$p"; done | tr '\n' ' ')
-      tree+=" $kids"; todo=$kids
-    done
-    kill -9 $tree 2>/dev/null
+    kill -9 $(tree "$root") 2>/dev/null
     return 0
   fi
-  on "$1" "[ -s ~/.multihost-rank.pid ] && kill -9 \$(cat ~/.multihost-rank.pid) 2>/dev/null;
+  on_retry "$1" "[ -s ~/.multihost-rank.pid ] && kill -9 \$(cat ~/.multihost-rank.pid) 2>/dev/null;
     for p in \$(pgrep -f '$ENGINE'); do kill -9 \$p 2>/dev/null; done;
     for _ in \$(seq 1 20); do sudo fuser /dev/vfio/* >/dev/null 2>&1 || break; sleep 3; done;
-    sudo rm -f /tmp/libtpu_lockfile" >/dev/null 2>&1
+    sudo rm -f /tmp/libtpu_lockfile" >/dev/null
+}
+
+# A peer that ends while rank 0 runs left the engine or never joined it, and rank 0 can wait on it
+# forever: one refused ssh left seven ranks timing out and rank 0 hung (v5p-64, 2026-09-28). A
+# healthy run's peers also end a moment before rank 0, when its engine shuts down, so rank 0 gets
+# MULTIHOST_GRACE seconds first. The sleeps write to /dev/null: killing the watcher leaves its sleep
+# running, and one that held this script's stdout kept a caller's pipe open for the whole grace.
+watch_peers() {
+  local k r0 grace=${MULTIHOST_GRACE:-300}
+  while sleep 5 >/dev/null 2>&1; do
+    for ((k = 1; k < N; k++)); do
+      [ -e "$LOGS/rank$k-$STAMP.rc" ] || continue
+      sleep "$grace" >/dev/null 2>&1
+      r0=$(cat "$R0" 2>/dev/null) && kill -0 "$r0" 2>/dev/null || return 0
+      log "rank $k ended with status $(cat "$LOGS/rank$k-$STAMP.rc") and rank 0 still runs $grace s" \
+        "later; stopping rank 0. Rank $k's whole log, $LOGS/rank$k-$STAMP.log:"
+      cat "$LOGS/rank$k-$STAMP.log"
+      kill -9 $(tree "$r0") 2>/dev/null
+      return 0
+    done
+  done
 }
 
 # Every variable the peers need, quoted for the remote shell.
@@ -124,29 +167,44 @@ for a in "$@"; do
   done
 done
 
+for ((k = 1; k < N; k++)); do
+  on_retry "${HOSTS[$k]}" true || { log "${HOSTS[$k]} refused ssh for 5 minutes; no rank started"; exit 1; }
+done
+
+# Each peer's status lands in rank<k>-<stamp>.rc when its command ends.
 pids=()
 for ((k = 1; k < N; k++)); do
-  on "${HOSTS[$k]}" "cd $(printf %q "$PWD") && { [ -f ~/.tpu_env ] && source ~/.tpu_env; true; } &&
-    export $envs SGL_NODE_RANK=$k && echo \$\$ > ~/.multihost-rank.pid && exec $cmd" >"$LOGS/rank$k-$STAMP.log" 2>&1 &
+  { on "${HOSTS[$k]}" "cd $(printf %q "$PWD") && { [ -f ~/.tpu_env ] && source ~/.tpu_env; true; } &&
+      export $envs SGL_NODE_RANK=$k && echo \$\$ > ~/.multihost-rank.pid && exec $cmd" >"$LOGS/rank$k-$STAMP.log" 2>&1
+    echo $? >"$LOGS/rank$k-$STAMP.rc"; } &
   pids+=($!)
 done
 
-SGL_NNODES=$N SGL_NODE_RANK=0 SGL_DIST_INIT_ADDR=$ADDR "$@" 2>&1 | tee "$LOGS/rank0-$STAMP.log"
+R0=$LOGS/rank0-$STAMP.pid
+WATCH=""
+((WAIT_ALL)) || { watch_peers & WATCH=$!; }
+SGL_NNODES=$N SGL_NODE_RANK=0 SGL_DIST_INIT_ADDR=$ADDR bash -c 'echo $$ >"$0" && exec "$@"' "$R0" "$@" 2>&1 |
+  tee "$LOGS/rank0-$STAMP.log"
 rc=${PIPESTATUS[0]}
+[ -n "$WATCH" ] && kill "$WATCH" 2>/dev/null
 log "rank 0 exited $rc"
 
 if ((WAIT_ALL)); then
   for ((k = 1; k < N; k++)); do
-    wait "${pids[$((k - 1))]}"; r=$?
+    wait "${pids[$((k - 1))]}"; r=$(cat "$LOGS/rank$k-$STAMP.rc" 2>/dev/null || echo 1)
     log "rank $k exited $r; its log:"
     cat "$LOGS/rank$k-$STAMP.log"
     ((r == 0)) || rc=1
   done
 else
   frees=()
-  for ((k = 1; k < N; k++)); do free_remote "${HOSTS[$k]}" & frees+=($!); done
+  for ((k = 1; k < N; k++)); do
+    { free_remote "${HOSTS[$k]}" || log "couldn't reach ${HOSTS[$k]} to stop rank $k; it may still hold its chips"; } &
+    frees+=($!)
+  done
   wait "${frees[@]}"
   # A peer whose command isn't an engine keeps its ssh open; end the clients, not just the engines.
+  for p in "${pids[@]}"; do pkill -P "$p" 2>/dev/null; done
   kill "${pids[@]}" 2>/dev/null
   wait "${pids[@]}" 2>/dev/null
   for ((k = 1; k < N; k++)); do

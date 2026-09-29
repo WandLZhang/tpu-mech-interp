@@ -4,64 +4,35 @@ Subject: [PATCH] fix(capture): gather hidden states across hosts before
 With --nnodes above 1, logits_output.hidden_states is a global array whose
 rows can sit on devices other processes own, and the scheduler's slice for
 each request raises a ShardingTypeError. Every rank processes the same batch
-in the same order, so one process_allgather per batch puts the whole array
-on every host, cached on the output for the rest of the batch. A single-host
-engine keeps its fully addressable array unchanged.
+in the same order, so _rows_to_slice runs one process_allgather per batch and
+every request slices the host copy. A single-host engine keeps its fully
+addressable array unchanged.
 ---
- .../scheduler_output_processor_mixin.py       | 26 +++++++++++++++++--
- 1 file changed, 24 insertions(+), 2 deletions(-)
+ .../srt/managers/scheduler_output_processor_mixin.py  | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
 
 diff --git a/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py b/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
-index 69a193ca..4048bd11 100644
+index 68cfe56d..31ce3d41 100644
 --- a/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
 +++ b/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
-@@ -19,6 +19,28 @@ from sgl_jax.srt.speculative.overlap_utils import (
-     use_legacy_eagle3_non_overlap,
- )
- 
-+
-+def _hidden_rows(logits_output):
-+    """`logits_output.hidden_states` in a form any rank can slice.
-+
-+    On one host the array is fully addressable and comes back as is. Across hosts, with
-+    `--nnodes` above 1, its rows can sit on devices other processes own, and indexing it raises
-+    a sharding error. Every rank runs this in the same order, since each one processes the same
-+    batch, so one `process_allgather` per batch puts the whole array on every host. The result is
-+    cached on the output, so later requests in the batch read it without another collective.
-+    """
-+    hs = logits_output.hidden_states
-+    if hs is None or getattr(hs, "is_fully_addressable", True):
-+        return hs
-+    cached = getattr(logits_output, "_host_hidden_states", None)
-+    if cached is None:
+@@ -100,7 +100,16 @@ def _rows_to_slice(hidden_states, dp_size):
+     request, so the batch's rows come to the host once. At one rank each request slices its
+     own rows on the device, which moves no padding rows.
+     """
+-    if hidden_states is None or dp_size <= 1:
++    if hidden_states is None:
++        return None
++    if not getattr(hidden_states, "is_fully_addressable", True):
++        # With --nnodes above 1 the rows can sit on devices other processes own. Every rank
++        # processes the same batch in the same order, so one process_allgather puts the whole
++        # batch on every host.
 +        from jax.experimental import multihost_utils
 +
-+        cached = multihost_utils.process_allgather(hs, tiled=True)
-+        logits_output._host_hidden_states = cached
-+    return cached
-+
-+
- if TYPE_CHECKING:
-     from sgl_jax.srt.managers.scheduler import (
-         GenerationBatchResult,
-@@ -270,7 +292,7 @@ class SchedulerOutputProcessorMixin:
-                     )
-                 if skip < rows:
-                     hs = jax.device_get(
--                        logits_output.hidden_states[
-+                        _hidden_rows(logits_output)[
-                             hidden_state_offset + skip : hidden_state_offset + rows
-                         ]
-                     ).astype(np.float32)
-@@ -661,7 +683,7 @@ class SchedulerOutputProcessorMixin:
-                     # DP-interleaved like the raw next_token_logprobs were, so
-                     # row i is request i only at dp_size 1. check_server_args
-                     # and handle_generate_request hold hidden states there.
--                    hs = jax.device_get(logits_output.hidden_states[i]).astype(np.float32)
-+                    hs = jax.device_get(_hidden_rows(logits_output)[i]).astype(np.float32)
-                     num_layers = _captured_slots(self.server_args, self.model_config)
-                     if num_layers is not None:
-                         hs = hs.reshape(num_layers, -1)
++        return np.asarray(multihost_utils.process_allgather(hidden_states, tiled=True))
++    if dp_size <= 1:
+         return hidden_states
+     return np.asarray(jax.device_get(hidden_states))
+ 
 -- 
-2.39.5
+2.43.0
 

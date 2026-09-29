@@ -74,7 +74,7 @@ python3 -c "import jax; print(jax.device_count())"
 ```
 
 A `v5p-64` is 32 chips on 8 hosts. Gemma 4 31B hasn't run on one; six other models have, through
-[Across hosts](../README.md#across-hosts).
+[Larger models](../README.md#larger-models).
 
 ## Capture
 
@@ -159,4 +159,5 @@ Run the last command inside `tmux`. Every `RESULT` line lands in
 `~/results/gemma4-31b/results.txt`. A rerun moves the last run's files to `run-<time>/` in the
 same directory and its shard to `/dev/shm/caps-gemma4-31b-<time>`. The THP,
 unauthenticated-request, `use_fast`, `Loading MoE Weights: 0it` and `libtpu metrics unavailable`
-messages are expected, and [Run it](../README.md#run-it) says why.
+messages are expected, and [the capture guide](../docs/activation-capture.md#setting-up-a-tpu-vm)
+says why.

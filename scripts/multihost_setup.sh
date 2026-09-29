@@ -131,9 +131,10 @@ each gcsfuse "set -e
   if ! command -v gcsfuse >/dev/null; then
     echo \"deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt gcsfuse-\$(lsb_release -c -s) main\" | sudo tee /etc/apt/sources.list.d/gcsfuse.list >/dev/null
     curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo tee /usr/share/keyrings/cloud.google.asc >/dev/null
-    sudo apt-get -qq update && sudo apt-get -qq install -y gcsfuse
+    # An upgrade the image started before bootstrap stopped its timers holds dpkg's lock.
+    sudo apt-get -qq -o DPkg::Lock::Timeout=1800 update &&
+      sudo apt-get -qq -o DPkg::Lock::Timeout=1800 install -y gcsfuse
   fi
-  gcsfuse --version
   sudo mkdir -p $MOUNT && sudo chown \$USER $MOUNT
   if [ \"${REMOUNT:-0}\" = 1 ] && mountpoint -q $MOUNT; then fusermount -u $MOUNT; fi
   case $CACHE_DIR in /dev/shm/*) sudo mount -o remount,size=$((CACHE_MB / 1024 + 20))G /dev/shm ;; esac
@@ -142,15 +143,23 @@ each gcsfuse "set -e
     --cache-dir=$CACHE_DIR --file-cache-max-size-mb=$CACHE_MB --file-cache-cache-file-for-range-read=$RANGE_CACHE \\
     --file-cache-enable-parallel-downloads=true $BUCKET $MOUNT
   mkdir -p ~/weights && ln -sfn $MOUNT ~/weights/\$(basename $MOUNT)
-  ls $MOUNT | wc -l" || exit 1
+  echo \"\$(ls $MOUNT | wc -l) entries, \$(gcsfuse --version)\"" || exit 1
 # sglang-jax's loader (model_loader/loader.py _warmup_safetensors_cache) reads every safetensors
 # file whole on every host when the model path sits on a fuse mount: 1.9 TB a host for Inkling, about
 # 72 minutes, before any real read (v5p-64, 2026-09-27). It decides by the path's mount entry, so
 # ~/weights/<mount name>, a symlink on the root disk, skips it. Engine runs take that path.
-log "weights mounted at $MOUNT on $N hosts ($(cat "$OUT/gcsfuse-w0.log" | tr '\n' ' '))"
+# Each host's whole install and mount output stays in $OUT/gcsfuse-w<N>.log.
+log "weights mounted at $MOUNT on $N hosts; host 0: $(sed -n '$p' "$OUT/gcsfuse-w0.log")"
+# Host 0 also keeps measure_model.sh's capture shards in /dev/shm. GLM-5.3-Flash's 440,000 tokens at
+# 65,536 bytes a token filled the 20 GB above the cache and stopped its measure (v5p-64,
+# 2026-09-28), so host 0 gets 80 GB above it. The host has 440 GB of RAM.
+case $CACHE_DIR in
+  /dev/shm/*) on "${EXT[0]}" "sudo mount -o remount,size=$((CACHE_MB / 1024 + 80))G /dev/shm" || exit 1 ;;
+esac
 
-# 6. Every host sees the whole slice.
-on "${EXT[0]}" "cd ~/repo && source ~/.tpu_env && bash scripts/multihost_exec.sh --wait-all python3 -c \"import jax; jax.distributed.initialize(); print('DEVICES', jax.process_index(), jax.process_count(), jax.device_count(), jax.local_device_count(), flush=True)\"" \
+# 6. Every host sees the whole slice. JAX numbers the processes itself, so host 0 needn't be
+# process 0; the last field names the host.
+on "${EXT[0]}" "cd ~/repo && source ~/.tpu_env && bash scripts/multihost_exec.sh --wait-all python3 -c \"import jax, socket; jax.distributed.initialize(); print('DEVICES', jax.process_index(), jax.process_count(), jax.device_count(), jax.local_device_count(), socket.gethostname(), flush=True)\"" \
     >"$OUT/devices.log" 2>&1
 grep -h '^DEVICES' "$OUT/devices.log" | sort -k2 -n | tee "$OUT/devices.txt"
 want=$((N * $(awk 'NR==1{print $5}' "$OUT/devices.txt")))

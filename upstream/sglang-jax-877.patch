@@ -1,4 +1,4 @@
-From 2b96fbbb2abfd348a8e4f31fdd040f685ffab653 Mon Sep 17 00:00:00 2001
+From e53c6a239fd4ff1bb54304ccb0cadecee61036e1 Mon Sep 17 00:00:00 2001
 From: zhengkezhou1 <zhengke.zhou.dev@gmail.com>
 Date: Mon, 21 Sep 2026 21:34:52 -0400
 Subject: [PATCH] feat: support per-layer hidden states extraction via Engine
@@ -14,13 +14,13 @@ Changes from the original #877:
 - Host transfer used .astype(float), which is float64 in numpy and upcast bf16 4x on the prefill path. Now .astype(np.float32).
 - Dropped the unrelated device-mesh logger.info in scheduler.py and the pr-test.yml change, which main has since superseded.
 - The prefill slice read len(req.origin_input_ids) rows, and only in the pass where a request's prefill finished. A prompt split across passes lost its earlier chunks and took the next request's rows in their place, and every later request in the pass read from the wrong offset. The row count still matched, so nothing raised. Now every request advances the offset by its own extend length in every pass, a chunked prompt appends one chunk per pass, and scheduler.py collects extend_input_len_per_req for hidden states as well as logprobs.
-- With data parallelism each rank's rows sit in their own padded block, and the prefill and decode paths read the hidden states as one packed run, so a request on rank 1 or later would get other requests' rows. Until those offsets follow the ranks, check_server_args refuses --enable-return-hidden-states with --dp-size above 1, and the scheduler aborts a request that sets return_hidden_states when dp_size is above 1.
+- With data parallelism each rank's rows sit in their own padded block, in prefill and in decode, the way the input logprobs sit before _materialize_input_token_logprobs compacts them. The output processor starts each rank at its block and reads request i of rank r in decode at row per_dp_bs_size * r + i. Above one rank the rows shard over the data axis, which JAX won't slice per request, so they come to the host once per batch.
 - A request for hidden states could match a cached radix prefix. Its prefill rows then covered only the uncached tail, while prompt_tokens counted the whole prompt. adjust_max_prefix_ids now caps its prefix match at 0, the way return_logprob caps it at logprob_start_len.
 - On a model without the layers_to_capture hook, LogitsProcessor stored the final normed hidden state, and the scheduler cut it into per-layer slices that weren't layers, or killed the server when the layer count didn't divide hidden_size. _setup_hidden_states_capture now refuses to start.
 - The scheduler put entries in output_hidden_states only for requests that asked, and tokenizer_manager reads the list by position in rids. One request got another's rows, and the next index killed the server. Both hidden-state lists now hold one entry per rid, and tokenizer_manager sets meta_info["hidden_states"] only for a request that asked.
 - A request for hidden states in an extend batch turned off the padded input logprob path, and the fallback raises on jax 0.11.1, so a logprob request in the same batch stopped the scheduler. Extend batches now always take the padded path. With return_logprob on, the sampler also rebuilt the logits output without hidden_states, and capture dropped those rows with no error. tp_worker now carries them across.
 - A retracted request kept its rows, and its second prefill appended them again. Under the overlap scheduler, the in-flight prefill of a retracted request appended too. The scheduler now records where each request's rows start, and the output processor keeps only the positions a request doesn't hold yet, so a retraction leaves one row per position. The start comes from prefix_lens, the positions the forward pass runs at. With --enable-mixed-chunk under the overlap scheduler, a running request's decode step rides in another request's prefill chunk before its input token reaches output_ids, so a start read from fill_ids is one short. A pass that covers a position the request holds, outside a retraction, logs a warning.
-- check_server_args refuses the flag with --speculative-algorithm, because capture overwrites the layers EAGLE3 and DFLASH capture for their draft, and with --pd-disaggregation, whose prefill path asserts on a request for hidden states. It refuses --disaggregation-mode prefill and decode too. There the decode server takes the prompt's KV from the prefill server and runs only the last prompt position, so its reply held one prompt row while prompt_tokens counted every one. The scheduler aborts such a request under either PD mode, the way it does above --dp-size 1.
+- check_server_args refuses the flag with --speculative-algorithm, because capture overwrites the layers EAGLE3 and DFLASH capture for their draft, and with --pd-disaggregation, whose prefill path asserts on a request for hidden states. It refuses --disaggregation-mode prefill and decode too. There the decode server takes the prompt's KV from the prefill server and runs only the last prompt position, so its reply held one prompt row while prompt_tokens counted every one. The scheduler aborts such a request under either PD mode.
 - filter_batch now derives return_hidden_states again from the requests it keeps, as it does return_logprob. The running batch used to stay in capture mode after the last request that asked left, so every later decode step concatenated every layer and copied it to the host though no request read it. test_capture_mode_propagation.py checks that filter_batch derives every flag merge_batch ORs in.
 - A request that doesn't stream gets its rows once, in the output that finishes it. The scheduler forces an output every 50 tokens, and each one sent the whole list again through the detokenizer, only for the tokenizer manager to drop it. A streamed chunk still carries every row so far, the form upstream sglang streams.
 - tokenizer_manager refuses return_hidden_states on a server started without the flag, so the caller gets the error and the scheduler never sees it.
@@ -32,30 +32,30 @@ Changes from the original #877:
 
 Only gemma4, llama and qwen3 carry the layers_to_capture hook today, and qwen3_vl reaches it through its QWen3Model backbone. The flag refuses to start on any other model. Adding the hook is three lines per model.
 
-Tests: test_return_hidden_states.py checks shape and non-zero content; test_hidden_states_alignment.py and _tp.py compare every layer against a HuggingFace CPU float32 reference at tp=1 and tp=4. test_return_hidden_states_cpu.py runs the real Engine on CPU with a tiny random Qwen3: a cached prefix, a mixed batch, logprobs beside hidden states, HTTP /generate, what each output of a streamed and an unstreamed request carries, both retraction routes, decode steps inside another request's prefill chunks under the overlap scheduler, a request to a server without the flag, a model without the hook, the settings that refuse to start, and the layer filter: the reply shape, the order of slots, each refusal, and a kept slot's rows against the same slot from a server that returns every slot.
+Tests: test_return_hidden_states.py checks shape and non-zero content; test_hidden_states_alignment.py and _tp.py compare every layer against a HuggingFace CPU float32 reference at tp=1 and tp=4. test_return_hidden_states_cpu.py runs the real Engine on CPU with a tiny random Qwen3: a cached prefix, a mixed batch, logprobs beside hidden states, HTTP /generate, what each output of a streamed and an unstreamed request carries, both retraction routes, decode steps inside another request's prefill chunks under the overlap scheduler, a request to a server without the flag, a model without the hook, the settings that refuse to start, three requests pinned to two data-parallel ranks with slot 0 held to the embedding of each row's token, and the layer filter: the reply shape, the order of slots, each refusal, and a kept slot's rows against the same slot from a server that returns every slot.
 
 Co-authored-by: Willis Zhang <34315237+WandLZhang@users.noreply.github.com>
 ---
- python/sgl_jax/srt/entrypoints/engine.py      |   4 +
- python/sgl_jax/srt/entrypoints/http_server.py |   4 +-
- python/sgl_jax/srt/managers/io_struct.py      |   3 +
- python/sgl_jax/srt/managers/schedule_batch.py |  25 +-
- python/sgl_jax/srt/managers/scheduler.py      |  42 +-
- .../scheduler_output_processor_mixin.py       | 144 ++-
- .../sgl_jax/srt/managers/tokenizer_manager.py |  14 +-
- python/sgl_jax/srt/managers/tp_worker.py      |   3 +
- .../srt/model_executor/model_runner.py        |  46 +
- python/sgl_jax/srt/models/llama.py            |   7 +-
- python/sgl_jax/srt/server_args.py             |  75 ++
- python/sgl_jax/test/test_utils.py             | 163 +++
- .../disaggregation/test_pd_prefill_overlap.py |   1 +
- test/srt/run_suite.py                         |   9 +
- test/srt/test_capture_mode_propagation.py     | 225 +++++
- test/srt/test_hidden_states_alignment.py      |  32 +
- test/srt/test_hidden_states_alignment_tp.py   |  42 +
- test/srt/test_return_hidden_states.py         | 113 +++
- test/srt/test_return_hidden_states_cpu.py     | 932 ++++++++++++++++++
- 19 files changed, 1859 insertions(+), 25 deletions(-)
+ python/sgl_jax/srt/entrypoints/engine.py      |    4 +
+ python/sgl_jax/srt/entrypoints/http_server.py |    4 +-
+ python/sgl_jax/srt/managers/io_struct.py      |    3 +
+ python/sgl_jax/srt/managers/schedule_batch.py |   25 +-
+ python/sgl_jax/srt/managers/scheduler.py      |   36 +-
+ .../scheduler_output_processor_mixin.py       |  166 ++-
+ .../sgl_jax/srt/managers/tokenizer_manager.py |   14 +-
+ python/sgl_jax/srt/managers/tp_worker.py      |    3 +
+ .../srt/model_executor/model_runner.py        |   46 +
+ python/sgl_jax/srt/models/llama.py            |    7 +-
+ python/sgl_jax/srt/server_args.py             |   70 ++
+ python/sgl_jax/test/test_utils.py             |  163 +++
+ .../disaggregation/test_pd_prefill_overlap.py |    1 +
+ test/srt/run_suite.py                         |    9 +
+ test/srt/test_capture_mode_propagation.py     |  225 ++++
+ test/srt/test_hidden_states_alignment.py      |   32 +
+ test/srt/test_hidden_states_alignment_tp.py   |   42 +
+ test/srt/test_return_hidden_states.py         |  113 ++
+ test/srt/test_return_hidden_states_cpu.py     | 1044 +++++++++++++++++
+ 19 files changed, 1980 insertions(+), 27 deletions(-)
  create mode 100644 test/srt/test_capture_mode_propagation.py
  create mode 100644 test/srt/test_hidden_states_alignment.py
  create mode 100644 test/srt/test_hidden_states_alignment_tp.py
@@ -211,7 +211,7 @@ index 16a5fe5c..ae0481e8 100644
          merged_extend_input_logprob_token_ids = None
          if self.return_logprob:
 diff --git a/python/sgl_jax/srt/managers/scheduler.py b/python/sgl_jax/srt/managers/scheduler.py
-index cc9a5fbb..eca5806c 100644
+index cc9a5fbb..5d5c08ce 100644
 --- a/python/sgl_jax/srt/managers/scheduler.py
 +++ b/python/sgl_jax/srt/managers/scheduler.py
 @@ -169,6 +169,8 @@ class GenerationBatchResult:
@@ -223,16 +223,10 @@ index cc9a5fbb..eca5806c 100644
  
  
  def validate_dflash_request(req) -> str | None:
-@@ -1250,6 +1252,27 @@ class Scheduler(
+@@ -1250,6 +1252,21 @@ class Scheduler(
              self._add_request_to_queue(req)
              return
  
-+        # Hidden-state rows for DP rank 1 and later sit in their own padded blocks, which the
-+        # output processor doesn't walk, so a request there would get other requests' rows.
-+        if req.return_hidden_states and self.server_args.dp_size > 1:
-+            req.set_finish_with_abort("return_hidden_states needs --dp-size 1")
-+            self._add_request_to_queue(req)
-+            return
 +        # The Pathways prefill path asserts on such a request, which stops the server.
 +        if req.return_hidden_states and self.server_args.pd_disaggregation:
 +            req.set_finish_with_abort("return_hidden_states doesn't work with --pd-disaggregation")
@@ -251,7 +245,7 @@ index cc9a5fbb..eca5806c 100644
          if self.spec_algorithm is not None and self.spec_algorithm.is_dflash_family():
              dflash_err = validate_dflash_request(req)
              if dflash_err is not None:
-@@ -2519,8 +2542,9 @@ class Scheduler(
+@@ -2519,8 +2536,9 @@ class Scheduler(
          # These 2 values are needed for processing the output, but the values can be
          # modified by overlap schedule. So we have to copy them here so that
          # we can use the correct values in output processing.
@@ -263,7 +257,7 @@ index cc9a5fbb..eca5806c 100644
              extend_input_len_per_req = []
              for info in batch.reqs_info:
                  if info.reqs:
-@@ -2537,6 +2561,19 @@ class Scheduler(
+@@ -2537,6 +2555,19 @@ class Scheduler(
                      )
          else:
              extend_logprob_start_len_per_req = None
@@ -283,7 +277,7 @@ index cc9a5fbb..eca5806c 100644
          spec_relay_buffers = None
          prefill_relay_future_indices = None
          if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
-@@ -2563,6 +2600,7 @@ class Scheduler(
+@@ -2563,6 +2594,7 @@ class Scheduler(
              cache_miss_count=cache_miss_count,
              spec_relay_buffers=spec_relay_buffers,
              prefill_relay_future_indices=prefill_relay_future_indices,
@@ -292,10 +286,10 @@ index cc9a5fbb..eca5806c 100644
          if (
              self.spec_algorithm is not None
 diff --git a/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py b/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
-index e1574d67..69a193ca 100644
+index e1574d67..68cfe56d 100644
 --- a/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
 +++ b/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
-@@ -58,6 +58,41 @@ def _num_input_logprobs(
+@@ -58,6 +58,53 @@ def _num_input_logprobs(
      return extend_input_len_per_req[req_idx] - extend_logprob_start_len_per_req[req_idx]
  
  
@@ -334,20 +328,33 @@ index e1574d67..69a193ca 100644
 +    req.hidden_state_rows = first + hs.shape[0]
 +
 +
++def _rows_to_slice(hidden_states, dp_size):
++    """The batch's hidden states in a form each request's slice can index.
++
++    Above one DP rank the rows shard over the data axis, and JAX won't slice a sharded array per
++    request, so the batch's rows come to the host once. At one rank each request slices its
++    own rows on the device, which moves no padding rows.
++    """
++    if hidden_states is None or dp_size <= 1:
++        return hidden_states
++    return np.asarray(jax.device_get(hidden_states))
++
++
  def _input_logprob_lens_per_dp(batch: ScheduleBatch) -> list[int] | None:
      if not batch.forward_mode.is_extend():
          return None
-@@ -193,6 +228,57 @@ class SchedulerOutputProcessorMixin:
+@@ -193,6 +240,56 @@ class SchedulerOutputProcessorMixin:
              )
          hidden_state_offset = 0
          per_dp_bs_size = batch.per_dp_bs_size
 +        extend_prefix_len_per_req = getattr(result, "extend_prefix_len_per_req", None)
++        hidden_rows = _rows_to_slice(logits_output.hidden_states, batch.dp_size)
 +
-+        # Capture runs at dp_size 1: check_server_args refuses the flag above it, and
-+        # handle_generate_request aborts a request for hidden states. There every request
-+        # in the pass owns extend_input_len_per_req[req_idx] consecutive rows of
-+        # logits_output.hidden_states, in visiting order, whether its prefill finishes in this
-+        # pass, continues in the next one, or gets skipped. A running request that a mixed
++        # Each DP rank's requests own a padded block of logits_output.hidden_states, the way
++        # their input logprobs do, and the rank loop below starts each rank at its block.
++        # Inside it every request in the pass owns extend_input_len_per_req[req_idx]
++        # consecutive rows, in visiting order, whether its prefill finishes in this pass,
++        # continues in the next one, or gets skipped. A running request that a mixed
 +        # batch carries owns one row. Advance past each request's rows every time, and keep the
 +        # positions a request asked for and doesn't hold yet. A chunked prompt then appends one
 +        # chunk per pass, and every request after it still reads its own rows.
@@ -383,9 +390,7 @@ index e1574d67..69a193ca 100644
 +                    )
 +                if skip < rows:
 +                    hs = jax.device_get(
-+                        logits_output.hidden_states[
-+                            hidden_state_offset + skip : hidden_state_offset + rows
-+                        ]
++                        hidden_rows[hidden_state_offset + skip : hidden_state_offset + rows]
 +                    ).astype(np.float32)
 +                    # A server with the flag returns [rows, slots, hidden]. The multimodal
 +                    # stage asks for the flat rows on a server without it.
@@ -395,7 +400,21 @@ index e1574d67..69a193ca 100644
  
          logprob_pt = 0
          # Flat index across all DP ranks. logprob arrays in `logits_output`
-@@ -219,6 +305,10 @@ class SchedulerOutputProcessorMixin:
+@@ -207,6 +304,13 @@ class SchedulerOutputProcessorMixin:
+         for dp_rank in range(batch.dp_size):
+             info = batch.reqs_info[dp_rank]
+             reqs = info.reqs
++            if logits_output.hidden_states is not None:
++                # The hidden states keep every rank's padded block, as the input logprobs do
++                # before _materialize_input_token_logprobs compacts them, so a rank's first
++                # request starts at its block whatever the ranks before it held.
++                hidden_state_offset = dp_rank * (
++                    logits_output.hidden_states.shape[0] // batch.dp_size
++                )
+             dp_output_ids = next_token_ids[
+                 per_dp_bs_size * dp_rank : per_dp_bs_size * (dp_rank + 1)
+             ]
+@@ -219,6 +323,10 @@ class SchedulerOutputProcessorMixin:
              for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
                  if req.finished() or req.is_retracted:
                      # release_kv_cache owns over-allocated KV; freeing here would double-free.
@@ -406,7 +425,7 @@ index e1574d67..69a193ca 100644
                      req_idx += 1
                      continue
  
-@@ -265,17 +355,9 @@ class SchedulerOutputProcessorMixin:
+@@ -265,17 +373,9 @@ class SchedulerOutputProcessorMixin:
                          )
                          logprob_pt += num_input_logprobs
  
@@ -427,7 +446,7 @@ index e1574d67..69a193ca 100644
  
                      # Update grammar state after token sampling
                      if req.grammar is not None:
-@@ -295,6 +377,7 @@ class SchedulerOutputProcessorMixin:
+@@ -295,6 +395,7 @@ class SchedulerOutputProcessorMixin:
                          req.grammar.finished = req.finished()
                  else:
                      # being chunked reqs' prefill is not finished
@@ -435,17 +454,28 @@ index e1574d67..69a193ca 100644
                      req.is_chunked -= 1
                      if self._pending_chunked_abort_reqs[dp_rank] is req:
                          assert req.to_finish is not None
-@@ -575,9 +658,15 @@ class SchedulerOutputProcessorMixin:
+@@ -467,6 +568,7 @@ class SchedulerOutputProcessorMixin:
+ 
+         # Process each DP rank's requests (unified for all dp_size >= 1)
+         per_dp_bs_size = batch.per_dp_bs_size  # Padded batch size per DP rank
++        hidden_rows = _rows_to_slice(logits_output.hidden_states, batch.dp_size)
+         # Flat index across all DP ranks. logprob arrays in `logits_output`
+         # / `next_token_logprobs` have already been reordered to original-req
+         # order in tp_worker via `logits_indices_selector`. Increment for
+@@ -573,11 +675,16 @@ class SchedulerOutputProcessorMixin:
+                         self.abort_request(AbortReq(rid=req.rid))
+                     req.grammar.finished = req.finished()
                  if req.return_hidden_states and logits_output.hidden_states is not None:
-                     # NOTE: hidden_states is not yet reordered through
-                     # logits_indices_selector. Decode-mode hidden_states is
+-                    # NOTE: hidden_states is not yet reordered through
+-                    # logits_indices_selector. Decode-mode hidden_states is
 -                    # DP-interleaved like the raw next_token_logprobs were.
 -                    # Tracking as a follow-up; not in scope for this fix.
 -                    req.hidden_states.append(logits_output.hidden_states[i])
-+                    # DP-interleaved like the raw next_token_logprobs were, so
-+                    # row i is request i only at dp_size 1. check_server_args
-+                    # and handle_generate_request hold hidden states there.
-+                    hs = jax.device_get(logits_output.hidden_states[i]).astype(np.float32)
++                    # hidden_states isn't reordered through logits_indices_selector. In decode
++                    # each DP rank's rows sit in its padded block, as next_token_ids do, so
++                    # request i of this rank is row per_dp_bs_size * dp_rank + i.
++                    row = per_dp_bs_size * dp_rank + i
++                    hs = jax.device_get(hidden_rows[row]).astype(np.float32)
 +                    num_layers = _captured_slots(self.server_args, self.model_config)
 +                    if num_layers is not None:
 +                        hs = hs.reshape(num_layers, -1)
@@ -454,7 +484,7 @@ index e1574d67..69a193ca 100644
                  req_idx += 1
  
          # Collect all requests from all DP ranks for stream output
-@@ -816,6 +905,7 @@ class SchedulerOutputProcessorMixin:
+@@ -816,6 +923,7 @@ class SchedulerOutputProcessorMixin:
          spec_accepted_tokens = []
          output_hidden_states = None
          output_routed_experts = None
@@ -462,7 +492,7 @@ index e1574d67..69a193ca 100644
  
          output_hidden_states_for_mm = None
          if return_logprob:
-@@ -972,15 +1062,33 @@ class SchedulerOutputProcessorMixin:
+@@ -972,15 +1080,33 @@ class SchedulerOutputProcessorMixin:
                          )
                      if req.return_output_logprob_only:
                          req.send_output_token_logprobs_offset = len(req.output_token_logprobs_val)
@@ -636,7 +666,7 @@ index 138aa9c9..0dc6fc5b 100644
                  forward_batch.positions,
                  hidden_states,
 diff --git a/python/sgl_jax/srt/server_args.py b/python/sgl_jax/srt/server_args.py
-index 174a1cd3..ee3660b1 100644
+index 174a1cd3..ad416f66 100644
 --- a/python/sgl_jax/srt/server_args.py
 +++ b/python/sgl_jax/srt/server_args.py
 @@ -264,6 +264,9 @@ class ServerArgs:
@@ -671,7 +701,7 @@ index 174a1cd3..ee3660b1 100644
  
      @classmethod
      def from_cli_args(cls, args: argparse.Namespace):
-@@ -2004,9 +2022,66 @@ class ServerArgs:
+@@ -2004,9 +2022,61 @@ class ServerArgs:
          )
          return hf_config
  
@@ -707,11 +737,6 @@ index 174a1cd3..ee3660b1 100644
          assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
  
 +        if self.enable_return_hidden_states:
-+            # Each DP rank's rows sit in their own padded block, and the output processor reads
-+            # the hidden states as one packed run, so a request on rank 1 or later would get
-+            # rows that belong to other requests.
-+            if self.dp_size > 1:
-+                raise ValueError("--enable-return-hidden-states needs --dp-size 1")
 +            # EAGLE3 and DFLASH set layers_to_capture to the layers their draft reads. Capture
 +            # sets its own list instead, and the draft then gets a width it wasn't built for.
 +            if self.speculative_algorithm is not None:
@@ -1400,10 +1425,10 @@ index 00000000..edec8f66
 +    unittest.main()
 diff --git a/test/srt/test_return_hidden_states_cpu.py b/test/srt/test_return_hidden_states_cpu.py
 new file mode 100644
-index 00000000..51d9e77c
+index 00000000..32975ca4
 --- /dev/null
 +++ b/test/srt/test_return_hidden_states_cpu.py
-@@ -0,0 +1,932 @@
+@@ -0,0 +1,1044 @@
 +"""--enable-return-hidden-states through the real Engine, on CPU, with a tiny random model.
 +
 +    JAX_PLATFORMS=cpu python3 test/srt/test_return_hidden_states_cpu.py
@@ -1938,8 +1963,98 @@ index 00000000..51d9e77c
 +    report(case="rows", served=describe(out))
 +
 +
++DP_RANKS = [0, 1, 1]
++
++
++def scenario_dp(engine):
++    """Three requests pinned to two DP ranks, one split across prefill passes, with decode steps.
++
++    Rank 1 holds two requests of different lengths, and the longer one's 90 tokens take two
++    64-token passes. Slot 0 is the embedding output, so each row's slot 0 has to be the
++    embedding of the token at its position: the prompt, then every generated token but the
++    last, which no pass reads. That holds whatever attention computes, so a row filed under
++    another request, or a padding row, can't pass it.
++    """
++    from safetensors.numpy import load_file
++
++    from sgl_jax.srt.managers.io_struct import GenerateReqInput
++
++    embed = load_file(os.path.join(engine.server_args.model_path, "model.safetensors"))[
++        "model.embed_tokens.weight"
++    ]
++    steps = {**GREEDY, "max_new_tokens": 4}
++    prompts = [prompt_ids(21, 12), prompt_ids(22, 90), prompt_ids(23, 20)]
++    obj = GenerateReqInput(
++        input_ids=prompts,
++        sampling_params=[dict(steps) for _ in prompts],
++        return_hidden_states=True,
++        dp_rank=DP_RANKS,
++    )
++    batched = engine.loop.run_until_complete(
++        engine.tokenizer_manager.generate_request(obj, None).__anext__()
++    )
++    for prompt, out in zip(prompts, batched):
++        rows = rows_of(out)[0]
++        tokens = list(prompt) + [int(t) for t in out["output_ids"][:-1]]
++        slot0 = rows[:, 0, :] if rows.ndim == 3 else rows
++        report(
++            case="dp",
++            meta_rank=out["meta_info"].get("dp_rank"),
++            batched=describe(out),
++            slot0_rel=max_rel(slot0, embed[tokens]),
++        )
++
++
++def install_single_block_mutant():
++    """The output processor as it read before the per-rank offsets: one packed run of rows.
++
++    Prefill drops the per-rank start, and decode reads row i for request i of every rank.
++    The engine runs in one process here, so the patched methods are the ones it calls.
++    """
++    import __future__
++    import ast
++    import inspect
++    import textwrap
++
++    from sgl_jax.srt.managers import scheduler_output_processor_mixin as module
++
++    mixin = module.SchedulerOutputProcessorMixin
++    for name, rewrite in (
++        ("process_batch_result_prefill", "drop_rank_start"),
++        ("process_batch_result_decode", "row_i"),
++    ):
++        tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(mixin, name))))
++        found = 0
++        for node in ast.walk(tree):
++            if rewrite == "drop_rank_start" and isinstance(node, ast.If):
++                body = node.body
++                if (len(body) == 1 and isinstance(body[0], ast.Assign)
++                        and ast.unparse(body[0].targets[0]) == "hidden_state_offset"):
++                    node.test = ast.Constant(value=False)
++                    found += 1
++            if rewrite == "row_i" and isinstance(node, ast.Assign):
++                if ast.unparse(node.targets[0]) == "row" and "per_dp_bs_size" in ast.unparse(node):
++                    node.value = ast.Name(id="i", ctx=ast.Load())
++                    found += 1
++        if found != 1:
++            raise SystemExit(f"the mutant found {found} targets in {name}")
++        namespace = dict(vars(module))
++        # The module postpones its annotations, and `self: Scheduler` names a class it imports
++        # only for type checking, so the mutant compiles the same way.
++        code = compile(
++            ast.fix_missing_locations(tree),
++            f"<mutant {name}>",
++            "exec",
++            flags=__future__.annotations.compiler_flag,
++            dont_inherit=True,
++        )
++        exec(code, namespace)
++        setattr(mixin, name, namespace[name])
++
++
 +SCENARIOS = {
 +    "main": scenario_main,
++    "dp": scenario_dp,
 +    "retract": scenario_retract,
 +    "retract_in_flight": scenario_retract_in_flight,
 +    "mixed_chunk": scenario_mixed_chunk,
@@ -1955,6 +2070,8 @@ index 00000000..51d9e77c
 +    parser.add_argument("--engine-args", required=True)
 +    args = parser.parse_args(argv)
 +    kwargs = json.loads(args.engine_args)
++    if isinstance(kwargs, dict) and kwargs.pop("_mutant", None) == "single_block":
++        install_single_block_mutant()
 +
 +    if args.scenario == "check_args":
 +        # What Engine runs first, before it starts any process.
@@ -2227,7 +2344,6 @@ index 00000000..51d9e77c
 +            "chunked_prefill_size": 128,
 +        }
 +        for overrides, flag in (
-+            ({"dp_size": 2}, "--dp-size 1"),
 +            ({"speculative_algorithm": "EAGLE3"}, "--speculative-algorithm"),
 +            ({"pd_disaggregation": "pathways"}, "--pd-disaggregation"),
 +            ({"disaggregation_mode": "decode", **peer}, "--disaggregation-mode decode"),
@@ -2330,6 +2446,27 @@ index 00000000..51d9e77c
 +        (r,) = self.result(run, "command_line")
 +        self.assertEqual(r["error"], "argparse exited 2", r)
 +        self.assertIn("invalid int value: '0,3'", run[2])
++
++    def test_data_parallel_ranks_keep_their_rows(self):
++        # dp_size 2 at tp_size 2 needs two devices, and one process lets the control patch the
++        # scheduler the engine runs.
++        env = {"XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
++        args = engine_args(self.qwen3, tp_size=2, dp_size=2, enable_single_process=True)
++        found = self.result(run_child("dp", env=env, **args), "dp")
++        # Control: the batch spans both ranks, rank 1 holds two requests, and one of them takes
++        # two prefill passes, or nothing here reads a rank's block.
++        self.assertEqual([r["meta_rank"] for r in found], DP_RANKS, found)
++        self.assertGreater(found[1]["batched"]["prompt_tokens"], 64, found)
++        for r in found:
++            self.assertContract(r["batched"])
++            self.assertLess(r["slot0_rel"], 1e-6, r)
++        # Control: the rows read as one packed run, the way they did before the per-rank
++        # offsets. The run has to finish and misfile rank 1's requests; a crash proves nothing.
++        code, results, log = run_child("dp", env=env, _mutant="single_block", **args)
++        misfiled = [r for r in results if r.get("case") == "dp"]
++        self.assertEqual(len(misfiled), len(DP_RANKS), f"the child exited {code}:\n{log}")
++        wrong = [r["slot0_rel"] for r in misfiled if r["meta_rank"] == 1]
++        self.assertTrue(any(rel >= 1e-6 for rel in wrong), misfiled)
 +
 +
 +if __name__ == "__main__":

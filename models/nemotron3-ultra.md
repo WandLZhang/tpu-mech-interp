@@ -109,7 +109,7 @@ Notes: the table is computed from the weights and the KV and state sizes.
 The [measured `v5p-8` runs](nemotron3-super.md#measured) keep weights in `/dev/shm`, which
 defaults to half the host's RAM. That host has 440 GB of RAM, less than this 1,044.1 GiB
 checkpoint, so the weights can't live there. Each of the 8 hosts in a `v5p-64` reads it from a
-GCS bucket through gcsfuse, as [Across hosts](../README.md#across-hosts) sets up.
+GCS bucket through gcsfuse, as [Larger models](../README.md#larger-models) sets up.
 
 ```bash
 python3 -m sgl_jax.launch_server \
@@ -255,11 +255,11 @@ The extend graph precompiled in 2.4 minutes and the decode graph in 1.4.
 Capture costs 1.40x (3,095.3 over 2,218.2), and the wire carries 16,384 bytes a token (one
 8,192-wide BF16 slot) at 36.3 MB/s.
 
-To reproduce, stage the checkpoint and its reference as [Across hosts](../README.md#across-hosts)
+To reproduce, stage the checkpoint and its reference as [Larger models](../README.md#larger-models)
 describes, then run from the repo root:
 
 ```bash
-BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE nemotron3-ultra setup check measure
+PROJECT=your-project BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE nemotron3-ultra setup check measure
 ```
 
 Notes: nobody has replayed that block as written from a clean start. The runs above came from the

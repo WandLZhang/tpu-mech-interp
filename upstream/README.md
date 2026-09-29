@@ -54,11 +54,14 @@ Carries [PR #877](https://github.com/sgl-project/sglang-jax/pull/877), plus thes
   collects it for `return_hidden_states` too, because `req.extend_input_len` already holds the
   next round's value by the time the result arrives.
 - Drops an unrelated device-mesh log line and a superseded workflow edit.
-- With data parallelism each rank's rows sit in their own padded block, and the prefill and
-  decode paths read the hidden states as one packed run, so a request on rank 1 or later would
-  get other requests' rows. Until the offsets follow the ranks, `--enable-return-hidden-states`
-  refuses to start with `--dp-size` above 1, and the scheduler aborts any request that sets
-  `return_hidden_states` when `dp_size` is above 1.
+- With data parallelism each rank's rows sit in their own padded block, in prefill and in
+  decode, the way the input logprobs do. The output processor starts each rank at its block and
+  reads request `i` of rank `r` in decode at row `per_dp_bs_size * r + i`. Above one rank the
+  rows shard over the data axis, which JAX won't slice per request, so they come to the host once
+  per batch. `test_return_hidden_states_cpu.py` pins three requests to two ranks at
+  `--tp-size 2 --dp-size 2`, one of them split across prefill passes, and holds slot 0 of every
+  row, the embedding output, to the embedding of the token at its position. The same run with the
+  rows read as one packed run misfiles both rank-1 requests.
 - A request for hidden states never reuses a cached radix prefix. `adjust_max_prefix_ids` caps
   its match at 0, the way `return_logprob` caps it at `logprob_start_len`. Before, a cached
   prefix skipped its forward pass, and the reply covered the uncached tail while
@@ -222,7 +225,8 @@ layer's specs in `QuantizedLinear.__call__`, a no-op where they match, and
 `Glm5MLP.post_load_weights` places each FP8 `weight_q` where its `kernel_axes` say at load, so the
 fallback layer doesn't gather its weight every step. With the model serving at TP above 1 on one
 host, capture failed next, since a host slice of the mesh-wide hidden states lowers to a gather
-jax can't place. `_hidden_rows` copies them to the host once per batch there.
+jax can't place. `_rows_to_slice` copies them to the host once per batch there, as it does above
+one data-parallel rank and across hosts.
 
 `upstream/test_glm5_tp_sharding.py` is its gate. A tiny checkpoint in the published layout, with
 a 256-wide shared expert (2 blocks), serves on the real engine at `--tp-size` 1, 4 and 8, each at

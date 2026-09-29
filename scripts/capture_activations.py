@@ -599,8 +599,9 @@ def parse_engine_args(items: Iterable[str], reserved: dict | None = None) -> dic
 
 # Printed before an Engine loads, because the load prints two lines that look wrong and aren't.
 ENGINE_LOAD_NOTE = (
-    'loading the engine. On Gemma 4 it prints "Loading MoE Weights: 0it", because gemma4.py loads '
-    "the experts in a pass of its own after that one. On a model with an image processor, "
+    'loading the engine. Gemma 4, Kimi K3 and Inkling print "Loading MoE Weights: 0it", because '
+    "they load their routed experts in a pass of their own after that one, and that pass prints "
+    "nothing; on a v5p-64 Inkling's took about 2 hours. On a model with an image processor, "
     "transformers warns that `use_fast` is deprecated; a text prompt never reaches that processor."
 )
 

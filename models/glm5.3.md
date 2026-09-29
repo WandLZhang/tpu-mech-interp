@@ -62,7 +62,7 @@ chip.
 The [measured `v5p-8` runs](nemotron3-super.md#measured) keep weights in `/dev/shm`, which
 defaults to half the host's RAM. That host has 440 GB of RAM, less than this 703.7 GiB checkpoint,
 so the weights can't live there. Each of the 8 hosts in a `v5p-64` reads it from a GCS bucket
-through gcsfuse, as [Across hosts](../README.md#across-hosts) sets up.
+through gcsfuse, as [Larger models](../README.md#larger-models) sets up.
 
 ## Capture
 
@@ -136,11 +136,11 @@ Capture costs 1.11x (2,685.8 over 2,417.1), and the wire carries 12,288 bytes a 
 `glm5-fp8-accumulate.patch`, read 2,782.4 off and 2,487.9 on at the same peak HBM; this run reads
 3.5% and 2.8% lower.
 
-To reproduce, stage the checkpoint and its reference as [Across hosts](../README.md#across-hosts)
+To reproduce, stage the checkpoint and its reference as [Larger models](../README.md#larger-models)
 describes, then run from the repo root:
 
 ```bash
-BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE glm5.3 setup check measure
+PROJECT=your-project BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE glm5.3 setup check measure
 ```
 
 Notes: nobody has replayed that block as written from a clean start. The runs above came from the

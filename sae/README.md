@@ -88,7 +88,7 @@ Hyperparameters are the ones in the report.
 | Learning rate | 7e-5, cosine warmup from 0.1 of that over 1,000 steps |
 | Optimizer | Adam, betas (0, 0.999), eps 1e-8 |
 | Batch | 4,096 |
-| Loss | reconstruction error alone |
+| Loss | reconstruction error; `--auxk-coef` adds the AuxK term |
 | Input | scaled by one fixed scalar so `E[||x/c||^2] == 1` |
 | `W_dec` init | He-uniform, rows rescaled to unit norm |
 | `W_enc` init | the transpose of `W_dec`, untied afterward |
@@ -107,6 +107,18 @@ Raw activation norms move over orders of magnitude between layers and sites. The
 what lets one learning rate work everywhere. Training folds it back into the parameters, so what
 ships reads raw activations.
 
+BatchTopK gives a latent that never makes the selection no gradient, so once it stops firing it
+stays dead. `--auxk-coef` turns on the AuxK term (Gao et al., 2024), which counts the batches
+since each latent last fired, marks it dead after `--dead-batches`, and has the dead latents
+reconstruct what the live ones leave unexplained: their `--k-aux` largest pre-activations a token
+decode toward the residual, and that error enters the loss at the coefficient. The gradient
+reaches the dead latents and no others. The count rides in the optimizer state.
+
+It's off by default. At the BatchTopK reference implementation's settings, `--auxk-coef 0.03125
+--k-aux 512 --dead-batches 5`, the README chain's SAE on Gemma 4 26B-A4B kept 455 of 45,056
+latents live at fvu 0.4657, against 2,111 at fvu 0.4670 without it, on the same activations
+(v5litepod-8, 2026-09-29).
+
 ```bash
 python3 sae/train.py --activations 'caps/*.npy' --layer 1 --capture-layer 20 \
     --d-model 5376 --expansion-factor 16 --k 100 --steps 100000 --out sae_l20.npz
@@ -114,8 +126,8 @@ python3 sae/train.py --activations 'caps/*.npy' --layer 1 --capture-layer 20 \
 
 This recipe doesn't fit a `v5litepod-8`. At `d_model` 5,376, expansion 16, k 100 and the default
 batch of 4,096, a compile for that slice on 2026-09-25 needed 20.42 GiB of temporaries against
-15.75 GiB per chip, and failed. The [README's fit sentence](../README.md#capture) gives those
-figures and the 15.33 GiB the same step takes at `d_model` 4,096. No run here has trained this
+15.75 GiB per chip, and failed. The same step takes 15.33 GiB a chip at `d_model` 4,096, which
+fits. No run here has trained this
 recipe on any slice. The README's [Run it](../README.md#run-it) chain trains at `d_model` 2,816,
 batch 512 and k 64.
 
@@ -160,18 +172,17 @@ python3 sae/test_sae.py
 
 The data is synthetic with a known answer: a fixed dictionary of 64 atoms, three positive
 coefficients per token, and a little noise. Check 3 measures the learned dictionary against that
-generating dictionary. The SAE is `d_model=32`, `d_sae=128`, `k=3`, trained for 4,000 steps in 10
-seconds.
+generating dictionary. The SAE is `d_model=32`, `d_sae=128`, `k=3`, trained for 4,000 steps.
 
 | Check | Number | Control | Control gives |
 |---|---|---|---|
-| The documented identities hold | four allclose, each under 1.5e-6, plus an empty window | each identity with one term wrong | 0.93 to 8.5, and 12,183 occurrences in the window |
+| The documented identities hold | four allclose, each under 1.5e-6, plus an empty window | each identity with one term wrong | 0.94 to 8.6, and 12,213 occurrences in the window |
 | Training improves reconstruction | fvu 1.11 to 0.068 | the untrained SAE | fvu 1.11 |
-| JumpReLU reproduces BatchTopK | jaccard 0.984, reconstruction difference 0.043, L0 3.00 to 2.95 | thresholds permuted across latents | jaccard 0.52, difference 0.63 |
-| | | thresholds rescaled by 0.75 | jaccard 0.75, L0 3.96 |
-| | | dead latents opened to 0 | jaccard 0.65, L0 4.56 |
-| The learned dictionary recovers the atoms | best cosine mean 0.9944, min 0.9782, 64 of 64 above 0.9 | a random dictionary | mean 0.44 |
-| Sharding changes nothing | loss equal to 8 figures | shard contents rotated on the mesh | loss 25.4 against 0.94 |
+| JumpReLU reproduces BatchTopK | jaccard 0.983, reconstruction difference 0.044, L0 3.00 to 2.96 | thresholds permuted across latents | jaccard 0.49, difference 0.66 |
+| | | thresholds rescaled by 0.75 | jaccard 0.75, L0 3.97 |
+| | | dead latents opened to 0 | jaccard 0.64, L0 4.61 |
+| The learned dictionary recovers the atoms | best cosine mean 0.9944, min 0.9775, 64 of 64 above 0.9 | a random dictionary | mean 0.44 |
+| Sharding changes nothing | loss equal to 8 figures | shard contents rotated on the mesh | loss 25.3 against 0.94 |
 | The checkpoint records the capture slot, never an axis position | `--layer 1` on a 3-D shard through `--activations` records no slot | `--capture-layer 20` on that shard, `--manifest` at `--layer 20`, and `--layer 20` on a 2-D shard | slot 20 each time, and the first two train the same parameters |
 | | | `--layer 20` with `--capture-layer 21` on a 2-D shard | exit 1 |
 | `step_flops` counts the compiled step | 1.612e9 against XLA's 1.653e9, ratio 0.975 | the decoder counted as a dense matmul | ratio 1.948 |
@@ -181,6 +192,8 @@ seconds.
 | Every matmul asks for `HIGHEST` | 7 dot_generals over the training step, the threshold fit, the JumpReLU forward and the bias fold | the encoder matmul with no precision | `DEFAULT` |
 | A NaN or an infinity stops `train` | a ValueError for each of the scale sample, a training batch and a calibration batch | the same stream with none | trains, 126 live latents |
 | `train.py` counts the scale sample | `--steps 4` on 68 batches exits 1, where training reads 80 | `--steps 4` on 80 batches | trains and calibrates on 64 |
+| AuxK trains the dead latents and no others | its gradient reaches all 64 latents marked dead and none of the other 64; a first step with nothing dead equals the plain step bit for bit | every latent marked dead | the gradient reaches all 64 of the other half |
+| AuxK brings dead latents back | 32 latents shrunk until 2 fire: 500 AuxK steps bring 17 back, fvu 0.0711 against 0.0761 before the shrink | 500 plain steps | 0 fire, fvu 0.0842 |
 
 Each control has to fail. If one passes, the test fails itself.
 

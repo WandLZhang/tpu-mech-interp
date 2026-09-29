@@ -20,7 +20,9 @@ Five steps, in this order:
    move over orders of magnitude between layers and sites, so a fixed scale is what lets one
    learning rate work everywhere.
 2. Train on `x/c` with Adam, starting on those same 16 batches. The loss is reconstruction error
-   alone. After every update, project the parallel part out of the decoder gradient and
+   plus 1/32 of the AuxK term, which has the latents that haven't fired in 5 batches
+   reconstruct what the rest leave unexplained, so a latent that stops firing gets a gradient
+   back. After every update, project the parallel part out of the decoder gradient and
    renormalize the latent vectors.
 3. Fold `c` back into the parameters, so inference reads raw activations.
 4. Fold the pre-encoder bias into `b_enc`, so inference skips a subtraction.
@@ -80,9 +82,11 @@ __all__ = [
     "SCALE_BATCHES",
     "TrainConfig",
     "TrainResult",
+    "DeadLatents",
     "batches_needed",
     "warmup_schedule",
     "project_decoder_updates",
+    "track_dead_latents",
     "build_optimizer",
     "make_step",
     "make_mesh",
@@ -108,17 +112,18 @@ PEAK_BF16_FLOPS = {
 }
 
 
-def step_flops(batch_size: int, d_model: int, d_sae: int, k: int) -> int:
-    """FLOPs for one training step: the encoder matmul and the sparse decoder, both directions.
+def step_flops(batch_size: int, d_model: int, d_sae: int, k: int, k_aux: int = 0) -> int:
+    """FLOPs for one training step: the encoder matmul and the sparse decoders, both directions.
 
     The encoder is the one dense product, `[batch, d_model] x [d_model, d_sae]`, 2 * B * d * m
     forward. Its backward pass runs two more of that size: the weight gradient, and the input
     gradient that reaches `b_dec` through the pre-encoder subtraction. The decoder gathers the
     `k * B` kept rows and sums them, 2 * k * B * d forward and twice that backward, so a step is
-    6 * B * d * (m + k). The top-k, the loss and the optimizer are left out, so MFU from this
-    reads slightly low.
+    6 * B * d * (m + k). The AuxK decode adds `k_aux * B` rows the same way and reuses the
+    encoder's pre-activations. The top-k, the loss and the optimizer are left out, so MFU from
+    this reads slightly low.
     """
-    return 6 * batch_size * d_model * (d_sae + k)
+    return 6 * batch_size * d_model * (d_sae + k + k_aux)
 
 
 def peak_flops_per_chip() -> float | None:
@@ -132,7 +137,14 @@ SCALE_BATCHES = 16
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
-    """Optimizer settings. Defaults are the ones in the report."""
+    """Optimizer settings. Defaults are the ones in the report.
+
+    The AuxK settings are the BatchTopK reference implementation's: a latent is dead after
+    `dead_batches` batches without firing, the dead latents keep `k_aux` per token for the AuxK
+    decode, and the term enters the loss at `auxk_coef`. It's off by default. On the README
+    chain's Gemma 4 26B-A4B activations (v5litepod-8, 2026-09-29) `auxk_coef=1/32` left 455
+    latents of 45,056 live at fvu 0.4657, and the same 4,000 steps without it 2,111 at fvu 0.4670.
+    """
 
     steps: int = 100_000
     batch_size: int = 4_096
@@ -145,6 +157,9 @@ class TrainConfig:
     calibration_batches: int = 64
     log_every: int = 100
     seed: int = 0
+    auxk_coef: float = 0.0
+    k_aux: int = 512
+    dead_batches: int = 5
 
 
 class TrainResult(NamedTuple):
@@ -197,13 +212,39 @@ def project_decoder_updates() -> optax.GradientTransformation:
     return optax.GradientTransformation(init_fn, update_fn)
 
 
+class DeadLatents(NamedTuple):
+    """Batches since each latent last fired, `[d_sae]` int32."""
+
+    stale: jnp.ndarray
+
+
+def track_dead_latents() -> optax.GradientTransformation:
+    """Carry `DeadLatents` in the optimizer state, beside Adam's, and pass updates through.
+
+    `make_step` reads the count before the loss, to mark the dead latents AuxK trains, and writes
+    it after, from the latents the main selection kept. Keeping it in the optimizer state keeps
+    the step's signature `(params, opt_state, x)` and puts the count in any checkpoint of the
+    state.
+    """
+
+    def init_fn(params):
+        return DeadLatents(stale=jnp.zeros((params.w_enc.shape[1],), jnp.int32))
+
+    def update_fn(updates, state, params=None):
+        del params
+        return updates, state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 def build_optimizer(train_cfg: TrainConfig) -> optax.GradientTransformation:
-    """Gradient projection first, then Adam on what's left.
+    """The dead-latent count, the gradient projection, then Adam on what's left.
 
     Adam sizes its moments from the parameters, so `SAEConfig.param_dtype` sets the precision of
     the second moment. Keep it at float32. `cfg.dtype` still picks the forward-pass precision.
     """
     return optax.chain(
+        track_dead_latents(),
         project_decoder_updates(),
         optax.adam(
             learning_rate=warmup_schedule(
@@ -217,7 +258,10 @@ def build_optimizer(train_cfg: TrainConfig) -> optax.GradientTransformation:
 
 
 def make_step(
-    cfg: SAEConfig, optimizer: optax.GradientTransformation, mesh: Mesh | None = None
+    cfg: SAEConfig,
+    optimizer: optax.GradientTransformation,
+    mesh: Mesh | None = None,
+    train_cfg: TrainConfig | None = None,
 ) -> Callable:
     """Build the jitted update. Returns `(params, opt_state, metrics)`.
 
@@ -227,13 +271,31 @@ def make_step(
     all-reduces a `[batch, d_model]` partial sum. The backward pass all-reduces the `[k * batch]`
     gradient of the kept values and the `[batch, d_model]` input gradient that reaches `b_dec`.
     Without the mesh the decode all-reduces every gathered row, `[k * batch, d_model]`.
+
+    With a `train_cfg` whose `auxk_coef` is above 0, the loss adds the AuxK term. The step reads
+    `DeadLatents` from the first entry of the optimizer state, which `build_optimizer` puts there,
+    marks a latent dead after `dead_batches` batches without firing, and counts the batch after
+    the loss. Without it the loss is reconstruction error alone and the count stays at zero.
     """
+    auxk = train_cfg is not None and train_cfg.auxk_coef > 0
 
     def step(params, opt_state, x):
-        (loss, metrics), grads = jax.value_and_grad(
-            sae_lib.reconstruction_loss, has_aux=True
-        )(params, cfg, x, mesh=mesh)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
+        if not auxk:
+            (loss, metrics), grads = jax.value_and_grad(
+                sae_lib.reconstruction_loss, has_aux=True
+            )(params, cfg, x, mesh=mesh)
+            updates, opt_state = optimizer.update(grads, opt_state, params)
+        else:
+            stale = opt_state[0].stale
+            (loss, (metrics, fired)), grads = jax.value_and_grad(
+                sae_lib.training_loss, has_aux=True
+            )(
+                params, cfg, x, stale >= train_cfg.dead_batches, train_cfg.k_aux,
+                train_cfg.auxk_coef, mesh=mesh,
+            )
+            updates, opt_state = optimizer.update(grads, opt_state, params)
+            counted = DeadLatents(stale=jnp.where(fired, 0, stale + 1))
+            opt_state = (counted, *opt_state[1:])
         params = optax.apply_updates(params, updates)
         params = sae_lib.normalize_decoder(params)
         metrics = dict(metrics, loss=loss)
@@ -338,7 +400,7 @@ def train(
     params = sae_lib.shard_params(sae_lib.init_params(key, cfg), mesh)
     optimizer = build_optimizer(train_cfg)
     opt_state = optimizer.init(params)
-    step_fn = make_step(cfg, optimizer, mesh)
+    step_fn = make_step(cfg, optimizer, mesh, train_cfg)
 
     history = []
     completed = 0
@@ -346,7 +408,8 @@ def train(
     # MFU covers the steps between two log lines, so the first step's compile stays out of it.
     peak = peak_flops_per_chip()
     chips = mesh.devices.size
-    flops = step_flops(train_cfg.batch_size, cfg.d_model, cfg.d_sae, cfg.k)
+    k_aux = train_cfg.k_aux if train_cfg.auxk_coef > 0 else 0
+    flops = step_flops(train_cfg.batch_size, cfg.d_model, cfg.d_sae, cfg.k, k_aux)
     last_log = None
     scaled = (
         jnp.asarray(x, cfg.param_dtype) / scale for x in itertools.chain(scale_sample, stream)
@@ -628,6 +691,25 @@ def main(argv=None) -> int:
     ap.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
     ap.add_argument("--learning-rate", type=float, default=TrainConfig.learning_rate)
     ap.add_argument("--warmup-steps", type=int, default=TrainConfig.warmup_steps)
+    ap.add_argument(
+        "--auxk-coef",
+        type=float,
+        default=TrainConfig.auxk_coef,
+        help="weight of the AuxK term that trains dead latents (default 0: reconstruction alone; "
+        "the BatchTopK reference uses 1/32)",
+    )
+    ap.add_argument(
+        "--k-aux",
+        type=int,
+        default=TrainConfig.k_aux,
+        help="dead latents the AuxK term keeps per token",
+    )
+    ap.add_argument(
+        "--dead-batches",
+        type=int,
+        default=TrainConfig.dead_batches,
+        help="batches without firing after which a latent counts as dead",
+    )
     ap.add_argument("--passes", type=int, default=1, help="walks over the shard list")
     ap.add_argument(
         "--shuffle-bytes",
@@ -685,6 +767,9 @@ def main(argv=None) -> int:
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps,
         seed=args.seed,
+        auxk_coef=args.auxk_coef,
+        k_aux=args.k_aux,
+        dead_batches=args.dead_batches,
     )
     # A batch too wide for one BatchTopK selection fails at the first step's trace. Say so before
     # reading a single shard.

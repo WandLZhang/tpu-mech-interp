@@ -23,14 +23,14 @@ down_proj doesn't gather its weight on every forward.
 
 With the model serving at TP above 1 on one host, capture fails next:
 the hidden states span the mesh, and a host slice of them lowers to a
-gather jax refuses to place under Explicit axes. _hidden_rows copies
-them to the host once per batch there, as it already gathers them once
-per batch across hosts.
+gather jax refuses to place under Explicit axes. _rows_to_slice copies
+them to the host once per batch there, as it already does above one DP
+rank and across hosts.
 ---
- python/sgl_jax/srt/layers/linear.py                | 12 +++++++++++-
- .../managers/scheduler_output_processor_mixin.py   | 18 ++++++++++++++----
- python/sgl_jax/srt/models/glm5_moe.py              | 11 +++++++++++
- 3 files changed, 36 insertions(+), 5 deletions(-)
+ python/sgl_jax/srt/layers/linear.py                  | 12 +++++++++++-
+ .../srt/managers/scheduler_output_processor_mixin.py |  5 ++++-
+ python/sgl_jax/srt/models/glm5_moe.py                | 11 +++++++++++
+ 3 files changed, 26 insertions(+), 2 deletions(-)
 
 diff --git a/python/sgl_jax/srt/layers/linear.py b/python/sgl_jax/srt/layers/linear.py
 index 52068e92..1f2c72c6 100644
@@ -63,44 +63,20 @@ index 52068e92..1f2c72c6 100644
          # Reshape back to original batch dimensions.
          if x.ndim > 2:
 diff --git a/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py b/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
-index 4048bd11..63760720 100644
+index 31ce3d41..8c1b5d58 100644
 --- a/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
 +++ b/python/sgl_jax/srt/managers/scheduler_output_processor_mixin.py
-@@ -23,21 +23,31 @@ from sgl_jax.srt.speculative.overlap_utils import (
- def _hidden_rows(logits_output):
-     """`logits_output.hidden_states` in a form any rank can slice.
- 
--    On one host the array is fully addressable and comes back as is. Across hosts, with
-+    On one device the array comes back as is, and on one host a single device_get copies it to
-+    the host. Across hosts, with
-     `--nnodes` above 1, its rows can sit on devices other processes own, and indexing it raises
-     a sharding error. Every rank runs this in the same order, since each one processes the same
-     batch, so one `process_allgather` per batch puts the whole array on every host. The result is
-     cached on the output, so later requests in the batch read it without another collective.
-     """
-     hs = logits_output.hidden_states
--    if hs is None or getattr(hs, "is_fully_addressable", True):
-+    if hs is None:
-         return hs
-     cached = getattr(logits_output, "_host_hidden_states", None)
--    if cached is None:
-+    if cached is not None:
-+        return cached
-+    if getattr(hs, "is_fully_addressable", True):
-+        # On one host at --tp-size above 1 the array spans the mesh's devices, and under
-+        # Explicit mesh axes a host slice of it lowers to a gather jax refuses to place. One
-+        # device_get per batch copies it to the host instead.
-+        if len(getattr(getattr(hs, "sharding", None), "device_set", ())) <= 1:
-+            return hs
-+        cached = jax.device_get(hs)
-+    else:
+@@ -109,7 +109,10 @@ def _rows_to_slice(hidden_states, dp_size):
          from jax.experimental import multihost_utils
  
-         cached = multihost_utils.process_allgather(hs, tiled=True)
--        logits_output._host_hidden_states = cached
-+    logits_output._host_hidden_states = cached
-     return cached
- 
+         return np.asarray(multihost_utils.process_allgather(hidden_states, tiled=True))
+-    if dp_size <= 1:
++    # On one host at --tp-size above 1 the rows can span the mesh's devices, and under Explicit
++    # mesh axes a host slice of them lowers to a gather jax refuses to place.
++    devices = getattr(getattr(hidden_states, "sharding", None), "device_set", ())
++    if dp_size <= 1 and len(devices) <= 1:
+         return hidden_states
+     return np.asarray(jax.device_get(hidden_states))
  
 diff --git a/python/sgl_jax/srt/models/glm5_moe.py b/python/sgl_jax/srt/models/glm5_moe.py
 index 21e4fba5..2d112823 100644

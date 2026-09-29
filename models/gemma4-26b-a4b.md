@@ -46,7 +46,7 @@ python3 -c "import jax; print(jax.device_count())"
 ```
 
 A `v5p-64` is 32 chips on 8 hosts. Gemma 4 26B-A4B hasn't run on one; six other models have,
-through [Across hosts](../README.md#across-hosts). The grouped matmul flattens (batch, sequence).
+through [Larger models](../README.md#larger-models). The grouped matmul flattens (batch, sequence).
 Check that sequence sharding survives it by diffing the XLA buffer assignment between `ctx=1` and
 `ctx=2`.
 
@@ -116,7 +116,8 @@ The same slice on 2026-09-25, with the layer filter, the README's commands as wr
 
 Step 4 steers the picked latent at a fraction of the stream's RMS norm, 107.49 at slot 15, beside
 a random unit direction at the same length. The served model then judges each changed reply
-coherent or broken, and [Run it](../README.md#run-it) gives the rule. Each cell counts prompts,
+coherent or broken, and [the capture guide](../docs/activation-capture.md#the-whole-chain-measured)
+gives the rule. Each cell counts prompts,
 of 4:
 
 | Fraction of the norm | Feature changed | Feature coherent | Random changed | Random coherent |
@@ -137,6 +138,18 @@ old exit rule, which counted changed prompts. The random direction changed at le
 as the feature at every fraction, so both exited 1. They picked latents 1859 and 7987, second and
 fifth in this run's ranking.
 
+The chain ran again on 2026-09-29, on a `v5litepod-8` Spot slice in us-east1-c, in 39 minutes, 8
+of them the fetch. Both capture checks passed, and `compare.py` exited 0 with the same counts as
+the table above, on latent 20883. The SAE ran with AuxK at `--auxk-coef 0.03125`, the default that
+day:
+
+| SAE, 4,000 steps on the same activations | Live latents of 45,056 | fvu | Time |
+|---|---|---|---|
+| AuxK at 1/32 | 455 | 0.4657 | 876 s |
+| No AuxK, the default since | 2,111 | 0.4670 | 337 s |
+
+[Roadmap item 3](../docs/roadmap.md#3-keep-sae-latents-alive) holds the dead latents.
+
 ### Reproduce
 
 On a `v5litepod-8`, from the repo root. `sglang-jax` serves Gemma 4 as is, so the capture patch
@@ -154,4 +167,5 @@ Run the last command inside `tmux`. Every `RESULT` line lands in
 `~/results/gemma4-26b-a4b/results.txt`. A rerun moves the last run's files to `run-<time>/` in
 the same directory and its shard to `/dev/shm/caps-gemma4-26b-a4b-<time>`. The THP,
 unauthenticated-request, `use_fast`, `Loading MoE Weights: 0it` and `libtpu metrics unavailable`
-messages are expected, and [Run it](../README.md#run-it) says why.
+messages are expected, and [the capture guide](../docs/activation-capture.md#setting-up-a-tpu-vm)
+says why.

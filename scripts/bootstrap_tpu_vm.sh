@@ -112,6 +112,13 @@ if ((!TREE_ONLY)); then
     echo 0 | sudo tee "/sys/block/$ROOTDEV/queue/wbt_lat_usec" >/dev/null &&
       log "writeback throttle off on $ROOTDEV"
   fi
+  # The image upgrades its packages in the first hour after boot. While a host replaced
+  # google-guest-agent, sshd refused every login for minutes, and a restarted logind let RemoveIPC
+  # delete everything this user kept in /dev/shm: the weights cache, HF_HOME and the compile cache
+  # (v5p-64, 2026-09-28). Linger keeps the user's files. The timers stay off until the next boot;
+  # an upgrade that already started runs to its end.
+  sudo loginctl enable-linger "$USER" && sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer &&
+    log "linger on for $USER, apt's daily timers off"
 fi
 
 # A tree counts as built only when this stamp names the commit and the SHA-256 of each patch it

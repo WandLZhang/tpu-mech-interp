@@ -2,11 +2,10 @@
 
 `moonshotai/Kimi-K3`
 
-**Status: captured on TPU**, `v5p-64`, 2026-09-27; the capture check passes, prefill runs at 0.6
-tokens/s; not measured. The runs kept the routed experts MXFP4 on the chip at
+**Status: measured on TPU**, `v5p-64`, 2026-09-29: 1,010 tokens/s with capture off and on, and the
+capture check passes. The runs kept the routed experts MXFP4 on the chip at
 `--tp-size 32 --dp-size 1 --ep-size 32`, on a Spot slice in us-east5-a. See
-[Measured on a v5p-64](#measured-on-a-v5p-64). Throughput and HBM wait on the prefill work in
-[the roadmap](../docs/roadmap.md).
+[Measured on a v5p-64](#measured-on-a-v5p-64).
 
 | | |
 |---|---|
@@ -42,7 +41,7 @@ Prefill picks one of two Pallas kernels from `SGLANG_JAX_KDA_PREFILL_KERNEL`,
 `mega` by default or `chunked`, and from how many requests share each 64-token
 tile. Decode runs `naive_recurrent_kda`, a plain JAX recurrence, on every TPU
 generation. Every run on the `v5p-64` [below](#measured-on-a-v5p-64) took the
-default, and nobody has timed the two prefill kernels apart yet.
+default, and `mega` beat `chunked` in [a `v5p-8` trace](#where-the-time-went-a-v5p-8-trace).
 
 ```bash
 python3 -m sgl_jax.launch_server \
@@ -58,10 +57,11 @@ python3 -m sgl_jax.launch_server \
 
 Untested: no run here has started this line or used a `v6e-256`.
 
-Capture needs `--dp-size 1`: with more than one data-parallel rank the capture patch would hand a
-request other requests' rows, so it refuses to start. The head axis below forces data parallel at
-256 chips. One `v5p-64` with the routed experts resident in MXFP4 runs at `--dp-size 1`, so that's
-the slice to capture from:
+The head axis below forces data parallel at 256 chips. The capture patch handles `--dp-size`
+above 1, in CPU tests and in Qwen3-8B's capture check at 2 on a `v5litepod-8`, but no Kimi K3 run
+has captured that way. One `v5p-64` with
+the routed experts resident in MXFP4 runs at `--dp-size 1`, the slice every capture here came
+from:
 
 ```bash
 python3 -m sgl_jax.launch_server \
@@ -204,7 +204,7 @@ host has 440 GB of RAM. `/dev/shm` takes half of it by default. So the
 checkpoint can't sit in `/dev/shm` the way the
 [measured runs](nemotron3-super.md#measured) keep their weights. Every host of
 the slice reads it from a GCS bucket through gcsfuse at load, as
-[Across hosts](../README.md#across-hosts) sets up.
+[Larger models](../README.md#larger-models) sets up.
 
 ## Architecture
 
@@ -382,12 +382,17 @@ uint8 `[experts, in / 32, out]`. Each takes the sharding of its BF16 twin over
 the expert and tensor axes. `wo`'s scales stay whole on the tensor axis,
 because a tensor shard of `wo`'s packed axis needn't end on a 32-element group.
 The callback cuts each device's rectangle off the file and transposes it,
-without decoding. Inside the MoE forward, each device decodes its own shard of
-one stack to the serving dtype with `dequantize_mxfp4_jax` just before that
-stack's `gmm`. An optimization barrier ties each decode, codes and scales both,
-to the activation its `gmm` reads, so XLA can't decode every layer up front, and
-only one decoded stack is live at a time. The E8M0 lookup makes one factor per
-32-element group and broadcasts it over the group.
+without decoding. When a device's packed rows fill whole 32-element groups, the
+callback also reorders them with `pack_planar`, so byte `j` holds element `j`
+and element `j + rows` in place of the checkpoint's `2j` and `2j + 1`. Inside
+the MoE forward, each device decodes its own shard of one stack to the serving
+dtype with `dequantize_mxfp4_jax` just before that stack's `gmm`: it builds
+each E2M1 value and E8M0 scale from its bit fields, joins the two nibble planes
+along the rows, and scales the stack in one bfloat16 multiply, which is exact
+for every E2M1 value and E8M0 scale. An optimization barrier ties each decode,
+codes and scales both, to the activation its `gmm` reads, so XLA can't decode
+every layer up front, and only one decoded stack is live at a time. The E8M0
+decode makes one factor per 32-element group and broadcasts it over the group.
 
 **Decoded at load.** `--json-model-override-args '{"mxfp4_resident_experts":
 false}'` selects it. The callback decodes each device's rectangle on the host
@@ -588,14 +593,19 @@ process, because every launch keeps its compiled code mapped and a few more
 capture launches in one process pass the default `vm.max_map_count`.
 
 Check 9 loads the resident arrays at `--ep-size` 1, 2 and 8. They have to equal
-the file's codes and scales, every callback has to return one device's shard
-and no more, and their device decode has to equal the decode-at-load stack bit
-for bit. Check 2 holds `dequantize_mxfp4_jax` to `dequantize_mxfp4` for all 256
-byte values under all 256 E8M0 codes, in float32 and BF16. It also traces
-`EPMoE._decode_mxfp4`: the first reader of the scales has to be the barrier
-that takes the anchor, and the E8M0 lookup has to make 1/32 as many values as
-the decode. Two source mutants, the scales moved back outside the barrier and a
-per-element factor, each have to fail it.
+the file's codes and scales, reordered by `pack_planar` block by block where a
+device's block fills whole scale groups, every callback has to return one
+device's shard and no more, and their device decode has to equal the
+decode-at-load stack bit for bit. The tiny model's expert widths are 64, so
+`wi_0` and `wi_1` take the planar order at every width and `wo` at
+`--ep-size 8` only. Check 2 holds `dequantize_mxfp4_jax` to `dequantize_mxfp4`
+for all 256 byte values under all 256 E8M0 codes, in float32 and BF16, in both
+orders, and holds `pack_planar` to its definition. It also traces
+`EPMoE._decode_mxfp4` at a planar shape and a checkpoint-order shape: the first
+reader of the scales has to be the barrier that takes the anchor, and the E8M0
+decode has to make 1/32 as many values as the decode. Two source mutants, the
+scales moved back outside the barrier and a per-element factor, each have to
+fail it at both shapes.
 
 Check 12 builds the full model at `--tp-size 32` on 32 simulated devices, in a
 child process, and reports one chip's weights and the decoded-layer temporary.
@@ -626,82 +636,72 @@ and every request check 10 sends.
 
 ## Measured on a v5p-64
 
-A `v5p-64` Spot slice (32 chips, 8 hosts) in us-east5-a, 2026-09-27. sglang-jax eb061d8 with
-`sglang-jax-877.patch`, the steering patches, `multihost-hidden-states.patch` and
-`models/kimi-k3-model.patch` (MXFP4-resident experts, scales barriered with the codes), built by
-the `kimi-k3` row of `scripts/multihost_run.sh`: engine args `page_size=128
-disable_radix_cache=True ep_size=32 watchdog_timeout=3600`, `mem_fraction_static=0.8`,
-`--tp-size 32`. Every host read the weights from a GCS bucket in us-east5 through gcsfuse.
+A `v5p-64` Spot slice (32 chips, 8 hosts) in us-east5-a, 2026-09-28 and 29. sglang-jax eb061d8
+with `sglang-jax-877.patch`, the steering patches, `multihost-hidden-states.patch` and
+`models/kimi-k3-model.patch` (MXFP4-resident experts in the planar order), built by the `kimi-k3`
+row of `scripts/multihost_run.sh`: engine args `page_size=128 disable_radix_cache=True ep_size=32
+watchdog_timeout=3600`, `mem_fraction_static=0.8`, `--tp-size 32`. Every host read the weights
+from a GCS bucket in us-east5 through gcsfuse.
 
 **Capture check**, `scripts/check_capture.py --trust-remote-code` against the float32 CPU
 reference `refs/ref-kimi-k3.npz` (built from the checkpoint's own modeling code with the pure-torch
-`fla` stand-in), 21:48 to 22:59Z:
+`fla` stand-in), 2026-09-28 22:54 to 23:46Z:
 
 | Prompt | Layers | Worst ratio to the BF16 floor | Worst Pearson | Control |
 |---|---|---|---|---|
-| 441 tokens | 93, all pass | 1.39 (layer 1) | 0.9816 (layer 84) | 6.58x, detected |
-| 1,322 tokens, split across prefill passes | 93, all pass | 1.38 (layer 1) | 0.8859 (layer 92; the BF16 floor's own Pearson there is 0.9257) | 5.73x, detected |
+| 441 tokens | 93, all pass | 1.39 (layer 1) | 0.9370 (layer 92; the floor's own 0.9839) | 7.40x, detected |
+| 1,322 tokens, split across prefill passes | 93, all pass | 1.38 (layer 1) | 0.8035 (layer 92; the floor's own 0.9257) | 5.67x, detected |
 
-The extend graph precompiled in 10.5 minutes and the decode graph in 8; the first capture request
-compiled past sglang-jax's 300 s step watchdog on the first attempt, so the runner now passes
-`watchdog_timeout=3600`. Two earlier launches failed: 196 GB of HLO temporaries from the MXFP4
-scale expansion held for every layer (fixed by barriering the scales with the codes), then that
-watchdog.
+**Throughput and HBM**, `scripts/multihost_run.sh NODE us-east5-a kimi-k3 measure`, 2026-09-29
+00:13 to 01:29Z, 1,000 prompts at 440 tokens. Capture on keeps slot 46 in float32:
 
-### Throughput on the `v5p-64`: 0.6 tokens a second
+| Stage | Tokens/s | Window | Peak HBM a chip |
+|---|---|---|---|
+| Capture off | 1,010.2 | batches 3 to 32 of 8 prompts, 105,600 tokens in 104.53 s | 79.85 GiB |
+| Capture on | 1,010.3 | 422,400 tokens from 422.35 s to 840.46 s | 80.48 GiB |
 
-`scripts/multihost_run.sh NODE us-east5-a kimi-k3 measure` ran twice on the same slice and never
-printed a capture-off RESULT line. Capture off prefills 2 warmup and 30 timed batches of 8 prompts
-at 440 tokens, one output token each, so 112,640 tokens, and `serve_throughput.py` prints only
-after the last batch.
+Capture on moved 14,336 bytes a token, 14.5 MB/s. The extend graph precompiled in 4.2 minutes
+and the decode graph in 1.9.
 
-| Run | Engine settings beyond the row | Precompile done | Stopped |
-| --- | --- | --- | --- |
-| 2026-09-27 | none | 00:08:37Z on 09-28 | 01:41Z, 93 min later |
-| 2026-09-28 | `disable_overlap_schedule=True` | 02:34:47Z | 02:53Z, 18 min later |
+Notes: peak HBM is host 0's four chips, of 95.73 GiB each, sampled every 2 seconds.
 
-In the first run all 8 hosts kept their engine processes (checked at 01:29Z). In both runs the
-scheduler on host 0 sat in `device_get` on the batch result: in `resolve_last_batch_result` with
-the overlap scheduler, in `run_batch` without it. `tpu-info` on host 0 read 100% duty cycle and
-8.23% TensorCore use on every chip the whole time, with 81.83 of 95.73 GiB of HBM in use a chip.
-The scheduler used 12 minutes of CPU in 2 hours 12 minutes, so the host wasn't compiling. The slow
-part ran on the chips.
+### Where the time went: a `v5p-8` trace
 
-The capture check fits that. Its two requests were 441 and 1,322 tokens, the second split over two
-1,024-token passes. Engine start at 21:48:46Z to exit at 22:59:21Z took 70.6 minutes. The precompile
-took 18.5 of them, and loading took about 20 on earlier launches (not timed on this one), which
-leaves about 30 minutes for 1,763 tokens. That's about 1 token a second, and at that rate
-capture off alone needs about 31 hours, which fits both stopped runs. The suspects are the MXFP4
-expert decode inside every MoE forward and the `mega` KDA prefill kernel the runs took by default.
-Neither has been profiled. The standard `measure_model.sh` run would take over a day at that rate,
-so a short run below stands in for it. HBM in use while serving, 81.83 GiB a chip at
-`mem_fraction_static=0.8`, is from `tpu-info`, not the peak sampler.
+Before the planar order, the same `v5p-64` prefilled 0.6 tokens/s: 880 tokens in 1,507.55 s at
+batch 1, 2026-09-28, with `tpu-info` reading 100% duty cycle and 8.23% TensorCore use on every
+chip. A `v5p-8` Spot slice (4 chips) in europe-west4-b, 2026-09-28, then served the first 4 of the
+93 layers from 5 of the checkpoint's 96 shards in `/dev/shm`: `--tp-size 4 --ep-size 4`, 224
+experts a chip, `page_size=128`, one 440-token prompt a batch, two warmup batches, one batch
+traced with `serve_throughput.py --profile-dir`, then 8 timed (2 for the tables).
 
-A short run then measured the rate directly, 2026-09-28 03:21 to 04:44Z, same slice and engine
-settings as the check, capture off, `serve_throughput.py --batch-size 1 --warmup-batches 1
---batches 2`:
+| Expert decode | KDA prefill | Tokens/s | Device time a prompt | Peak HBM a chip |
+|---|---|---|---|---|
+| tables, as the `v5p-64` ran | `mega` | 80.0 | 7.31 s | 86.94 GiB |
+| bit fields | `mega` | 517.1 | 0.898 s | 62.08 GiB |
+| bit fields | `chunked` | 510.9 | 0.906 s | 62.04 GiB |
+| decoded at load | `mega` | 8,777.9 | 0.041 s | 69.47 GiB |
+| decoded at load | `chunked` | 7,482.0 | 0.050 s | 69.40 GiB |
 
-```
-RESULT {"stage": "capture_off", "tp_size": 32, "batches": 2, "tokens": 880, "secs": 1507.55, "tokens_per_s": 0.6, "window": "batches 2 to 3, first 1 discarded"}
-```
+With the tables, the E8M0 lookup's gather took 85.6% of device time and the E2M1 lookup 7.8%, and
+`tpu-info` read 92.5% duty cycle and 8.6% TensorCore use, what the `v5p-64` read. The bit fields
+take the gather out. The decode then spent 95% of device time relaying out an f32 array the size of
+each stack, because the checkpoint packs elements 2j and 2j + 1 in one byte. The planar order the
+patch keeps now removes that relayout. `mega` beat `chunked` on both paths. Each prompt ran two
+forwards, an extend and one decode step, and each forward decodes every local expert.
 
-That's 0.6 tokens a second, one 440-token prompt every 12.6 minutes, against 2,685.8 for GLM-5.3
-on the same slice. The extend graph precompiled in 9.2 minutes and the decode graph in 8.4. Capture
-on wasn't measured. At this rate the model can't serve a workload until the prefill is fixed.
+Notes: `mem_fraction_static` was 0.4 on the resident rows and 0.72 decoded at load, which gives both
+about 25 GiB of pools. Device time is one traced prompt, read with xprof. Scaled by experts a chip
+and layers, the tables' 7.31 s comes to about 28 s a prompt at the `v5p-64`'s layout, against the
+753.8 s a prompt it read; the rest of that gap is unexplained. The 0.6 tokens/s run discarded one
+warmup batch, where the other measured rates discard two.
 
-Next step: take one xprof trace of a single 440-token prefill at batch 1, and split the time between
-the MXFP4 decode, the grouped matmul and the KDA kernel before choosing a fix.
-`scripts/serve_throughput.py --profile-dir DIR` takes that trace. [The roadmap](../docs/roadmap.md)
-has the plan.
-
-To reproduce the check, stage the checkpoint and its reference as
-[Across hosts](../README.md#across-hosts) describes, then run from the repo root:
+To reproduce the check and the measure, stage the checkpoint and its reference as
+[Larger models](../README.md#larger-models) describes, then run from the repo root:
 
 ```bash
-BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE kimi-k3 setup check
+PROJECT=your-project BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE kimi-k3 setup check measure
 ```
 
 Notes: nobody has replayed that block as written from a clean start. The runs above came from the
-same script and row. The batch-1 run discarded one warmup batch, where the other measured rates
-discard two.
+same script and row.
 

@@ -1358,6 +1358,7 @@ ENGINE_TESTS = [
     "test_layer_filter_returns_the_named_slots",
     "test_layer_filter_refuses_bad_slot_lists",
     "test_layer_filter_command_line",
+    "test_data_parallel_ranks_keep_their_rows",
     HOOKLESS_TEST,
 ]
 

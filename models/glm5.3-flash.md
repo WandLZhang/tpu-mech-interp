@@ -41,7 +41,7 @@ bash scripts/bootstrap_tpu_vm.sh --model glm5-next
 ```
 
 `scripts/multihost_run.sh` carries the row, `glm5.3-flash`, with capture slot 22, and
-[Across hosts](../README.md#across-hosts) covers the setup. The runs below took this tree and these
+[Larger models](../README.md#larger-models) covers the setup. The runs below took this tree and these
 engine arguments through that row, on a `v5p-64` in us-east5-a on 2026-09-28. The row also applies
 `multihost-hidden-states.patch` and `glm5-next-probe.patch`.
 
@@ -155,16 +155,16 @@ tokens with `OSError: [Errno 28] No space left on device` while writing capture 
 `/dev/shm`, which also holds the gcsfuse file cache (the split between the two wasn't read), so
 `measure_model.sh` exited 1. The steady window closed before that.
 
-To reproduce, stage the checkpoint and its reference as [Across hosts](../README.md#across-hosts)
+To reproduce, stage the checkpoint and its reference as [Larger models](../README.md#larger-models)
 describes, then run from the repo root:
 
 ```bash
-BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE glm5.3-flash setup check measure
+PROJECT=your-project BUCKET=gs://YOUR_BUCKET bash scripts/multihost_run.sh NODE ZONE glm5.3-flash setup check measure
 ```
 
 Notes: nobody has replayed that block as written from a clean start. The runs above came from the
-same script and row. Give host 0's `/dev/shm` room for the capture shards beside the gcsfuse
-cache, or `measure` can stop the way it did here.
+same script and row. Since 2026-09-29 `setup` leaves host 0's `/dev/shm` 80 GB above the gcsfuse
+cache for the capture shards; this run had 20 GB.
 
 ## Notes
 

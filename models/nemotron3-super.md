@@ -172,7 +172,7 @@ per sequence, and 10.3 MiB over 16. Capture buffers come out of the same free sp
 
 A `v5p-64` is 32 chips on 8 hosts. Super hasn't run there. Ultra has, through the same model file
 ([nemotron3-ultra.md](nemotron3-ultra.md#capture-check-on-a-v5p-64)), and
-[Across hosts](../README.md#across-hosts) gives the recipe. There the launch line takes
+[Larger models](../README.md#larger-models) gives the recipe. There the launch line takes
 `--tp-size 32`.
 
 Two counts don't divide over 32 chips. Each chip stores one of the 2 KV heads. The 8 Mamba-2
